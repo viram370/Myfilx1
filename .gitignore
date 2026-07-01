@@ -1,0 +1,9 @@
+node_modules/
+backend/.env
+*.env
+!*.env.example
+.firebase/
+*.log
+.DS_Store
+.vscode/
+.idea/

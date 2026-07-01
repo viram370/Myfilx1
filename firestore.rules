@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // All reads/writes happen through the backend (Firebase Admin SDK),
+    // which bypasses these rules entirely. Direct client access is denied.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
