@@ -6,7 +6,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const { initializeApp } = require("firebase/app");
 const {
-  getFirestore, doc, setDoc, getDoc, collection, addDoc,  
+  getFirestore, doc, setDoc, getDoc, collection,
   getDocs, deleteDoc, updateDoc, runTransaction, writeBatch
 } = require("firebase/firestore");
 
@@ -48,10 +48,10 @@ bot.setWebHook(`${RENDER_URL}/bot${token}`);
 
 app.use(express.json());
 
-// --- IN-MEMORY FALLBACKS ---
+// --- IN-MEMORY STATE ---
 let redeemMode = {};
+const adminBuffer = {}; // Temporary buffer for admin video uploads
 const ADMIN_IDS = [6097315530];
-const SESSION_TIMEOUT_MS = 1000 * 60 * 60; // 1 Hour TTL for uploads
 
 // ==========================================
 // UTILITY FUNCTIONS & LOGGING
@@ -66,333 +66,172 @@ function verifyAdmin(msg) {
   return true;
 }
 
-// Strict HTML Escaping to prevent Telegram 400 Errors
 const esc = (str) => String(str || '').replace(/[&<>"']/g, match => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[match]));
 const cleanId = (text) => text.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
 
-function logInfo(action, data) { console.log(`[INFO] [${new Date().toISOString()}] [${action}]`, data ? JSON.stringify(data) : ''); }
 function logError(action, error) { console.error(`[ERROR] [${new Date().toISOString()}] [${action}]`, error.stack || error); }
 
 // ==========================================
-// PERSISTENT ADMIN UPLOAD STATE MANAGER
+// BUFFER-BASED VIDEO UPLOAD SYSTEM
 // ==========================================
-async function getAdminState(chatId) {
-  try {
-    const snap = await getDoc(doc(db, "admin_sessions", String(chatId)));
-    if (!snap.exists()) return null;
-    const state = snap.data();
-    
-    // TTL Garbage Collection Check
-    if (Date.now() - state.updatedAt > SESSION_TIMEOUT_MS) {
-      await saveAdminState(chatId, null);
-      return null;
-    }
-    return state;
-  } catch (err) { logError("getAdminState", err); return null; }
-}
 
-async function saveAdminState(chatId, state) {
-  try {
-    if (state === null) {
-      await deleteDoc(doc(db, "admin_sessions", String(chatId)));
-    } else {
-      state.updatedAt = Date.now();
-      await setDoc(doc(db, "admin_sessions", String(chatId)), state);
-    }
-  } catch (err) { logError("saveAdminState", err); }
-}
-
-// ==========================================
-// DUPLICATE PREVENTION ENGINE
-// ==========================================
-async function isDuplicateVideo(fileUniqueId) {
-  if (!fileUniqueId) return false;
-  try {
-    const snap = await getDoc(doc(db, "all_videos", fileUniqueId));
-    return snap.exists();
-  } catch (err) { logError("isDuplicateVideo", err); return false; }
-}
-
-// ==========================================
-// INTERACTIVE MULTI-STEP UPLOAD WIZARD
-// ==========================================
-bot.on('video', (msg) => handleMediaUpload(msg, msg.video));
+bot.on('video', (msg) => handleVideoBuffer(msg, msg.video));
 bot.on('document', (msg) => {
   if (msg.document && msg.document.mime_type && msg.document.mime_type.startsWith('video/')) {
-    handleMediaUpload(msg, msg.document);
+    handleVideoBuffer(msg, msg.document);
   }
 });
 
-async function handleMediaUpload(msg, mediaObj) {
+async function handleVideoBuffer(msg, mediaObj) {
   const chatId = msg.chat.id;
   if (!isAdmin(chatId)) return;
 
-  try {
-    const isDup = await isDuplicateVideo(mediaObj.file_unique_id);
-    if (isDup) return bot.sendMessage(chatId, "❌ <b>Duplicate Detected:</b> This exact video file already exists.", { parse_mode: 'HTML' });
+  if (!adminBuffer[chatId]) {
+    adminBuffer[chatId] = [];
+  }
 
-    let state = await getAdminState(chatId);
+  adminBuffer[chatId].push({
+    file_id: mediaObj.file_id,
+    file_unique_id: mediaObj.file_unique_id
+  });
 
-    // Bulk Episode Uploading (Transaction Safe Buffering)
-    if (state && state.step === 'UPLOAD_VIDEOS') {
-      state.videos.push({ file_id: mediaObj.file_id, file_unique_id: mediaObj.file_unique_id });
-      await saveAdminState(chatId, state);
-      return bot.sendMessage(chatId, `⏳ <b>Buffer Updated:</b> ${state.videos.length} episode(s) ready.\n<i>Send the next episode, or type /finish to proceed.</i>`, { parse_mode: 'HTML' });
-    }
-
-    // Initialize New Wizard Session
-    state = {
-      step: 'CHOOSE_TYPE',
-      videos: [{ file_id: mediaObj.file_id, file_unique_id: mediaObj.file_unique_id }],
-      meta: {},
-      uploaderId: msg.from.id,
-      createdAt: Date.now(),
-      updatedAt: Date.now()
-    };
-    await saveAdminState(chatId, state);
-
-    bot.sendMessage(chatId, "🎌 <b>New Upload Started! Choose Content Type:</b>", {
-      parse_mode: 'HTML',
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "🎌 Anime", callback_data: "type_anime" }, { text: "🎥 Anime Movie", callback_data: "type_animemovie" }],
-          [{ text: "🎬 Movie", callback_data: "type_movie" }, { text: "📺 Web Series", callback_data: "type_webseries" }],
-          [{ text: "🎨 Cartoon", callback_data: "type_cartoon" }],
-          [{ text: "❌ Cancel Upload", callback_data: "cancel_upload" }]
-        ]
-      }
-    });
-  } catch (err) { logError("handleMediaUpload", err); bot.sendMessage(chatId, "❌ Internal error parsing media upload."); }
+  bot.sendMessage(chatId, `✅ Episode buffered (${adminBuffer[chatId].length})`);
 }
 
-bot.on('callback_query', async (query) => {
-  const chatId = query.message.chat.id;
-  const data = query.data;
+// ==========================================
+// NEW ADMIN UPLOAD COMMANDS
+// ==========================================
+
+bot.onText(/^\/status$/, (msg) => {
+  if (!verifyAdmin(msg)) return;
+  const count = adminBuffer[msg.chat.id]?.length || 0;
+  bot.sendMessage(msg.chat.id, `ℹ️ <b>Upload Buffer Status:</b>\nCurrently holding ${count} video(s).`, { parse_mode: 'HTML' });
+});
+
+bot.onText(/^\/clearbuffer$/, (msg) => {
+  if (!verifyAdmin(msg)) return;
+  adminBuffer[msg.chat.id] = [];
+  bot.sendMessage(msg.chat.id, `🗑 <b>Buffer cleared successfully.</b>`, { parse_mode: 'HTML' });
+});
+
+bot.onText(/^\/preview$/, (msg) => {
+  if (!verifyAdmin(msg)) return;
+  const buf = adminBuffer[msg.chat.id] || [];
+  if (buf.length === 0) return bot.sendMessage(msg.chat.id, "❌ Buffer is empty.");
   
-  try {
-    // Acknowledge immediately
-    bot.answerCallbackQuery(query.id).catch(() => {});
+  let txt = "📋 <b>Buffered Episodes:</b>\n\n";
+  buf.forEach((v, i) => {
+    txt += `<b>${i + 1}.</b> <code>${v.file_unique_id}</code>\n`;
+  });
+  bot.sendMessage(msg.chat.id, txt, { parse_mode: 'HTML' });
+});
 
-    if (data === "cancel_upload") {
-      await saveAdminState(chatId, null);
-      return bot.editMessageText("❌ <b>Upload Wizard Cancelled.</b>", { chat_id: chatId, message_id: query.message.message_id, parse_mode: 'HTML' });
-    }
-
-    // 1. Wizard Type Selection
-    if (data.startsWith("type_")) {
-      let state = await getAdminState(chatId);
-      if (!state) return bot.sendMessage(chatId, "❌ Session expired or invalid. Please send the video again.");
-      
-      state.type = data.replace("type_", "");
-      
-      if (state.type === 'animemovie') {
-        state.step = 'ENTER_PARENT_NAME';
-        await saveAdminState(chatId, state);
-        return bot.sendMessage(chatId, "📝 <b>Step 1: Enter Parent Anime Name:</b>\n<i>(e.g., Jujutsu Kaisen)</i>", { parse_mode: 'HTML' });
-      } else {
-        state.step = 'ENTER_NAME';
-        await saveAdminState(chatId, state);
-        return bot.sendMessage(chatId, "📝 <b>Step 1: Enter Title/Name:</b>", { parse_mode: 'HTML' });
-      }
-    }
-
-    // 2. Publish Decision
-    if (data.startsWith("commit_")) {
-      let state = await getAdminState(chatId);
-      if (!state) return bot.sendMessage(chatId, "❌ Upload session expired.");
-      
-      const isPublish = data === "commit_publish";
-      bot.sendMessage(chatId, "⏳ <b>Locking transactions and executing batch writes...</b>", { parse_mode: 'HTML' });
-      
-      await commitUploadToFirestore(chatId, state, isPublish);
-      await saveAdminState(chatId, null);
-      return bot.sendMessage(chatId, "✅ <b>Saved Successfully!</b>", { parse_mode: 'HTML' });
-    }
-
-    // 3. User Payment Callbacks
-    if (["pay20", "pay50", "pay100"].includes(data)) {
-      let cap = "", photoId = "";
-      if (data === "pay20") {
-        photoId = "AgACAgUAAxkBAAICJWn_BX9bvt0HOVooXrS_Y7VwpOngAAIQEGsbf1P4V02Yna5OBauhAQADAgADeAADOwQ";
-        cap = `🍿 ₹20 Anime Basic Plan\n✅ Anime Access\n✅ Hindi Dubbed\n✅ 480p Quality\n\n📩 Send payment screenshot to @MyflixO`;
-      } else if (data === "pay50") {
-        photoId = "AgACAgUAAxkBAAICJGn_BUqfwwN0FHe7EzRRfhGHb8n2AAIPEGsbf1P4V4ijMEK46jkNAQADAgADeAADOwQ";
-        cap = `🎬 ₹50 Anime + WebSeries Plan\n✅ Anime Access\n✅ WebSeries Access\n✅ 720p HD Quality\n\n📩 Send payment screenshot to @MyflixO`;
-      } else if (data === "pay100") {
-        photoId = "AgACAgUAAxkBAAICI2n_BMY4S8rRS53FvZ9B71iSeybAAAIOEGsbf1P4V3jkTRZMtrsZAQADAgADeAADOwQ";
-        cap = `🔥 ₹100 Premium HD Plan\n✅ Access to All Content\n✅ Premium HD Streaming\n\n📩 Send payment screenshot to @MyflixO`;
-      }
-      return bot.sendPhoto(chatId, photoId, { caption: cap });
-    }
-  } catch (err) {
-    logError("callback_query", err);
-    bot.sendMessage(chatId, `❌ Callback execution failed: ${esc(err.message)}`, { parse_mode: 'HTML' });
+bot.onText(/^\/remove (\d+)$/, (msg, match) => {
+  if (!verifyAdmin(msg)) return;
+  const idx = parseInt(match[1]) - 1;
+  const buf = adminBuffer[msg.chat.id] || [];
+  
+  if (idx >= 0 && idx < buf.length) {
+    buf.splice(idx, 1);
+    bot.sendMessage(msg.chat.id, `✅ <b>Removed episode ${idx + 1}.</b>\nCurrent buffer count: ${buf.length}`, { parse_mode: 'HTML' });
+  } else {
+    bot.sendMessage(msg.chat.id, "❌ Invalid episode number.");
   }
 });
 
-// WIZARD TEXT INPUT PROCESSOR
-async function processWizardInput(chatId, text, state) {
+bot.onText(/^\/saveanime (.+)$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!verifyAdmin(msg)) return;
+
+  const buf = adminBuffer[chatId] || [];
+  if (buf.length === 0) return bot.sendMessage(chatId, "❌ Buffer is empty. Forward some videos first.");
+
+  const args = match[1].split('|').map(s => s.trim());
+  if (args.length < 3) return bot.sendMessage(chatId, "❌ <b>Format:</b>\n/saveanime Anime Name | Season 1 | Hindi", { parse_mode: 'HTML' });
+
+  const [animeName, seasonRaw, languageRaw] = args;
+  const animeId = cleanId(animeName);
+  const seasonId = cleanId(seasonRaw); 
+  const language = languageRaw.toLowerCase();
+
+  bot.sendMessage(chatId, "⏳ <b>Locking transactions and saving episodes...</b>", { parse_mode: 'HTML' });
+
+  let savedCount = 0;
+  let duplicateCount = 0;
+
   try {
-    switch (state.step) {
-      case 'ENTER_PARENT_NAME':
-        state.meta.parentAnime = text;
-        state.step = 'ENTER_NAME';
-        bot.sendMessage(chatId, "📝 <b>Step 2: Enter Movie Name:</b>", { parse_mode: 'HTML' });
-        break;
-      case 'ENTER_NAME':
-        state.meta.name = text;
-        if (['anime', 'webseries'].includes(state.type)) {
-          state.step = 'ENTER_SEASON';
-          bot.sendMessage(chatId, "🔢 <b>Step 2: Enter Season Number:</b>\n<i>(e.g., 1 or 2)</i>", { parse_mode: 'HTML' });
-        } else {
-          state.step = 'ENTER_LANGUAGE';
-          bot.sendMessage(chatId, "🌐 <b>Step 2: Enter Language:</b>", { parse_mode: 'HTML' });
-        }
-        break;
-      case 'ENTER_SEASON':
-        state.meta.season = "season" + text.replace(/\s+/g, '');
-        state.step = 'ENTER_LANGUAGE';
-        bot.sendMessage(chatId, "🌐 <b>Step 3: Enter Language:</b>", { parse_mode: 'HTML' });
-        break;
-      case 'ENTER_LANGUAGE':
-        state.meta.language = text.toLowerCase();
-        state.step = 'ENTER_QUALITY';
-        bot.sendMessage(chatId, "📀 <b>Step 4: Enter Quality:</b>\n<i>(e.g., 1080p, 720p)</i>", { parse_mode: 'HTML' });
-        break;
-      case 'ENTER_QUALITY':
-        state.meta.quality = text;
-        if (['anime', 'webseries'].includes(state.type)) {
-          state.step = 'UPLOAD_VIDEOS';
-          bot.sendMessage(chatId, "📥 <b>Step 5: Bulk Episode Upload:</b>\n<i>Continuously forward the remaining episodes for this season. Type /finish when done.</i>", { parse_mode: 'HTML' });
-        } else {
-          state.step = 'ENTER_POSTER';
-          bot.sendMessage(chatId, "🖼 <b>Step 5: Enter Poster Image URL:</b>", { parse_mode: 'HTML' });
-        }
-        break;
-      case 'ENTER_POSTER':
-        state.meta.poster = text;
-        state.step = 'ENTER_BANNER';
-        bot.sendMessage(chatId, "📐 <b>Step 6: Enter Banner Image URL:</b>", { parse_mode: 'HTML' });
-        break;
-      case 'ENTER_BANNER':
-        state.meta.banner = text;
-        state.step = 'ENTER_DESCRIPTION';
-        bot.sendMessage(chatId, "📝 <b>Step 7: Enter Description:</b>", { parse_mode: 'HTML' });
-        break;
-      case 'ENTER_DESCRIPTION':
-        state.meta.description = text;
-        state.step = 'ENTER_GENRES';
-        bot.sendMessage(chatId, "🎨 <b>Step 8: Enter Genres:</b>\n<i>(Comma separated)</i>", { parse_mode: 'HTML' });
-        break;
-      case 'ENTER_GENRES':
-        state.meta.genres = text.split(',').map(s => s.trim()).filter(Boolean);
-        state.step = 'ENTER_YEAR';
-        bot.sendMessage(chatId, "📅 <b>Step 9: Enter Release Year:</b>", { parse_mode: 'HTML' });
-        break;
-      case 'ENTER_YEAR':
-        state.meta.year = text;
-        state.step = 'ENTER_RATING';
-        bot.sendMessage(chatId, "⭐ <b>Step 10: Enter Rating:</b>\n<i>(e.g., 8.5)</i>", { parse_mode: 'HTML' });
-        break;
-      case 'ENTER_RATING':
-        state.meta.rating = text;
-        state.step = 'DECIDE_PUBLISH';
-        bot.sendMessage(chatId, "❓ <b>Final Step: Publish Visibility</b>", {
-          parse_mode: 'HTML',
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: "🚀 Publish Live", callback_data: "commit_publish" }],
-              [{ text: "📝 Save as Draft", callback_data: "commit_draft" }]
-            ]
-          }
-        });
-        break;
-    }
-    await saveAdminState(chatId, state);
-  } catch (err) { logError("processWizardInput", err); }
-}
+    // 1. Update/Create Parent Anime Metadata
+    await setDoc(doc(db, 'anime', animeId), {
+      title: animeName,
+      searchId: animeId,
+      updatedAt: Date.now()
+    }, { merge: true });
 
-// ==========================================
-// FIRESTORE ATOMIC UPLOAD TRANSACTIONS
-// ==========================================
-async function commitUploadToFirestore(chatId, state, isPublish) {
-  const meta = state.meta;
-  const rootPayload = {
-    title: meta.name,
-    searchId: cleanId(meta.name),
-    poster: meta.poster,
-    banner: meta.banner,
-    description: meta.description,
-    genres: meta.genres,
-    year: meta.year,
-    rating: meta.rating,
-    published: isPublish,
-    uploaderId: state.uploaderId,
-    updatedAt: Date.now()
-  };
+    const seasonRef = doc(db, 'anime', animeId, 'seasons', seasonId);
 
-  const filePayload = {
-    language: meta.language,
-    quality: meta.quality,
-    published: isPublish,
-    createdAt: Date.now()
-  };
-
-  // 1. Anime & Web Series (Transaction-Safe Bulk Upload)
-  if (['anime', 'webseries'].includes(state.type)) {
-    const rootCol = state.type;
-    const seriesId = cleanId(meta.name);
-    
-    // Save metadata once at series level
-    await setDoc(doc(db, rootCol, seriesId), rootPayload, { merge: true });
-
+    // 2. Transaction Safe Write
     await runTransaction(db, async (t) => {
-      const seasonRef = doc(db, rootCol, seriesId, "seasons", meta.season);
       const seasonDoc = await t.get(seasonRef);
-      
       let nextEp = 1;
+      
       if (seasonDoc.exists() && seasonDoc.data().lastEpisodeNumber) {
         nextEp = seasonDoc.data().lastEpisodeNumber + 1;
       }
 
-      for (const vid of state.videos) {
-        const epRef = doc(db, rootCol, seriesId, "seasons", meta.season, "episodes", `ep${nextEp}`);
-        t.set(epRef, { ...filePayload, episodeNumber: nextEp, file_id: vid.file_id, file_unique_id: vid.file_unique_id });
-        t.set(doc(db, "all_videos", vid.file_unique_id), { type: state.type, path: epRef.path });
-        nextEp++;
+      // PRE-READ: Firestore transactions require ALL reads before ANY writes.
+      const dupChecks = [];
+      for (const vid of buf) {
+        const dupRef = doc(db, 'all_videos', vid.file_unique_id);
+        dupChecks.push({
+          vid,
+          dupRef,
+          dupDoc: await t.get(dupRef)
+        });
       }
-      
+
+      // POST-WRITE: Now execute writes based on the earlier reads.
+      for (const item of dupChecks) {
+        if (item.dupDoc.exists()) {
+          duplicateCount++;
+          continue; // Skip Duplicate
+        }
+
+        const epId = `ep${nextEp}`;
+        const epRef = doc(db, 'anime', animeId, 'seasons', seasonId, 'episodes', epId);
+        
+        t.set(epRef, {
+          file_id: item.vid.file_id,
+          file_unique_id: item.vid.file_unique_id,
+          episodeNumber: nextEp,
+          language: language,
+          quality: "720p",
+          published: true,
+          createdAt: Date.now()
+        });
+
+        t.set(item.dupRef, { type: 'anime', path: epRef.path });
+        
+        nextEp++;
+        savedCount++;
+      }
+
+      // Update Season Tracker
       t.set(seasonRef, { lastEpisodeNumber: nextEp - 1, updatedAt: Date.now() }, { merge: true });
     });
-  } 
-  
-  // 2. Anime Movies (Saved beneath Anime Parent)
-  else if (state.type === 'animemovie') {
-    const parentId = cleanId(meta.parentAnime);
-    const movieId = cleanId(meta.name);
-    
-    await setDoc(doc(db, "anime", parentId), { title: meta.parentAnime, searchId: parentId, updatedAt: Date.now() }, { merge: true });
-    
-    const movieRef = doc(db, "anime", parentId, "movies", movieId);
-    const vid = state.videos[0];
-    await setDoc(movieRef, { ...rootPayload, ...filePayload, file_id: vid.file_id, file_unique_id: vid.file_unique_id });
-    await setDoc(doc(db, "all_videos", vid.file_unique_id), { type: state.type, path: movieRef.path });
-  }
 
-  // 3. Movies & Cartoons (Flat Level)
-  else {
-    const rootCol = state.type === 'movie' ? 'movies' : 'cartoons';
-    const docId = cleanId(meta.name);
-    const docRef = doc(db, rootCol, docId);
-    const vid = state.videos[0];
-    
-    await setDoc(docRef, { ...rootPayload, ...filePayload, file_id: vid.file_id, file_unique_id: vid.file_unique_id });
-    await setDoc(doc(db, "all_videos", vid.file_unique_id), { type: state.type, path: docRef.path });
+    // 3. Clear buffer on success
+    adminBuffer[chatId] = [];
+
+    bot.sendMessage(chatId, `✅ <b>Save Complete!</b>\n\nEpisodes Saved: ${savedCount}\nDuplicates Skipped: ${duplicateCount}`, { parse_mode: 'HTML' });
+
+  } catch (err) {
+    logError("saveanime", err);
+    bot.sendMessage(chatId, `❌ <b>Error saving anime:</b>\n${esc(err.message)}`, { parse_mode: 'HTML' });
   }
-}
+});
 
 // ==========================================
-// CENTRAL MESSAGE CONTROLLER
+// CENTRAL MESSAGE CONTROLLER & USER COMMANDS
 // ==========================================
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
@@ -400,29 +239,7 @@ bot.on('message', async (msg) => {
   if (!text) return;
 
   try {
-    // 1. Intercept Admin Wizard Flow
-    if (isAdmin(chatId)) {
-      const state = await getAdminState(chatId);
-      if (state) {
-        if (text === '/cancel') {
-          await saveAdminState(chatId, null);
-          return bot.sendMessage(chatId, "❌ <b>Upload Wizard Cancelled.</b>", { parse_mode: 'HTML' });
-        }
-        if (text === '/status') {
-          return bot.sendMessage(chatId, `ℹ️ <b>Upload Status:</b>\nStep: ${state.step}\nType: ${state.type}\nBuffered Videos: ${state.videos.length}`, { parse_mode: 'HTML' });
-        }
-        if (text === '/finish' && state.step === 'UPLOAD_VIDEOS') {
-          state.step = 'ENTER_POSTER';
-          await saveAdminState(chatId, state);
-          return bot.sendMessage(chatId, "🖼 <b>Step 5: Enter Poster Image URL:</b>", { parse_mode: 'HTML' });
-        }
-        if (!text.startsWith('/')) {
-          return await processWizardInput(chatId, text, state);
-        }
-      }
-    }
-
-    // 2. Base Command Check
+    // Admin Execution Guards
     if (text.startsWith('/')) {
       const cmd = text.split(' ')[0].toLowerCase();
       const adminCmds = ['/delete', '/publish', '/unpublish', '/edit', '/stats', '/users', '/list', '/creategift', '/deletegift', '/setplan'];
@@ -432,7 +249,7 @@ bot.on('message', async (msg) => {
     await ensureUser(chatId);
     await checkExpiry(chatId);
 
-    // 3. Admin Command Execution
+    // Legacy Admin Command Routing
     if (text.startsWith('/delete ')) return executeDelete(chatId, text);
     if (text.startsWith('/publish ')) return cascadePublish(chatId, text, true);
     if (text.startsWith('/unpublish ')) return cascadePublish(chatId, text, false);
@@ -444,7 +261,7 @@ bot.on('message', async (msg) => {
     if (text.startsWith('/deletegift ')) return deleteGift(chatId, text);
     if (text.startsWith('/setplan ')) return setPlan(chatId, text);
 
-    // 4. User System Commands
+    // User System Routing
     if (text === "🔍 Search") {
       return bot.sendMessage(chatId, "🔍 <b>Search Catalog</b>\n\n🎌 <b>Anime:</b> /anime [name]\n🎬 <b>Movies:</b> /movie [name]\n📺 <b>Web Series:</b> /webseries [name]\n🎨 <b>Cartoons:</b> /cartoon [name]", { parse_mode: 'HTML' });
     }
@@ -471,7 +288,7 @@ bot.on('message', async (msg) => {
       return bot.sendMessage(chatId, "🎬 <b>Main Menu</b>", { parse_mode: 'HTML', reply_markup: { keyboard: [["🔍 Search", "👤 Account"], ["📝 Waitlist", "🆘 Support"], ["📜 Terms & Privacy"]], resize_keyboard: true } });
     }
     
-    // Gift Code System
+    // Gift Code Support
     if (text === "🎁 Gift Code") {
       redeemMode[chatId] = true;
       return bot.sendMessage(chatId, "🎁 <b>Enter Gift Code:</b>", { parse_mode: 'HTML' });
@@ -481,7 +298,7 @@ bot.on('message', async (msg) => {
       return processGiftCode(chatId, text);
     }
 
-    // 5. Smart Search Routing
+    // Smart Search Engine
     if (text.toLowerCase().startsWith('/anime ')) return executeSearch(chatId, text, 'anime');
     if (text.toLowerCase().startsWith('/movie ')) return executeSearch(chatId, text, 'movies');
     if (text.toLowerCase().startsWith('/webseries ')) return executeSearch(chatId, text, 'webseries');
@@ -491,6 +308,30 @@ bot.on('message', async (msg) => {
     logError("MessageRouter", err);
     bot.sendMessage(chatId, "❌ An internal server error occurred while routing the command.");
   }
+});
+
+// User Payment Callback Handling
+bot.on('callback_query', async (query) => {
+  const chatId = query.message.chat.id;
+  const data = query.data;
+  
+  try {
+    bot.answerCallbackQuery(query.id).catch(() => {});
+    if (["pay20", "pay50", "pay100"].includes(data)) {
+      let cap = "", photoId = "";
+      if (data === "pay20") {
+        photoId = "AgACAgUAAxkBAAICJWn_BX9bvt0HOVooXrS_Y7VwpOngAAIQEGsbf1P4V02Yna5OBauhAQADAgADeAADOwQ";
+        cap = `🍿 ₹20 Anime Basic Plan\n✅ Anime Access\n✅ Hindi Dubbed\n✅ 480p Quality\n\n📩 Send payment screenshot to @MyflixO`;
+      } else if (data === "pay50") {
+        photoId = "AgACAgUAAxkBAAICJGn_BUqfwwN0FHe7EzRRfhGHb8n2AAIPEGsbf1P4V4ijMEK46jkNAQADAgADeAADOwQ";
+        cap = `🎬 ₹50 Anime + WebSeries Plan\n✅ Anime Access\n✅ WebSeries Access\n✅ 720p HD Quality\n\n📩 Send payment screenshot to @MyflixO`;
+      } else if (data === "pay100") {
+        photoId = "AgACAgUAAxkBAAICI2n_BMY4S8rRS53FvZ9B71iSeybAAAIOEGsbf1P4V3jkTRZMtrsZAQADAgADeAADOwQ";
+        cap = `🔥 ₹100 Premium HD Plan\n✅ Access to All Content\n✅ Premium HD Streaming\n\n📩 Send payment screenshot to @MyflixO`;
+      }
+      return bot.sendPhoto(chatId, photoId, { caption: cap });
+    }
+  } catch (err) { logError("callback_query", err); }
 });
 
 // ==========================================
@@ -522,9 +363,9 @@ async function executeSearch(chatId, commandText, collectionName) {
       }
     });
 
+    // Check publication statuses natively
     if (!matchedDoc || (matchedDoc.published === false)) return bot.sendMessage(chatId, `❌ <b>No published ${typeMap[collectionName]} found matching your query.</b>`, { parse_mode: 'HTML' });
 
-    // Handle Flat Collections
     if (['movies', 'cartoons'].includes(collectionName)) {
       return bot.sendVideo(chatId, matchedDoc.file_id, {
         caption: `🎬 <b>${esc(matchedDoc.title)}</b>\n⭐ Rating: ${esc(matchedDoc.rating)}\n📅 Year: ${esc(matchedDoc.year)}\n\n📝 ${esc(matchedDoc.description)}`,
@@ -532,7 +373,6 @@ async function executeSearch(chatId, commandText, collectionName) {
       });
     }
 
-    // Handle Episodic Collections (Anime / Web Series)
     if (['anime', 'webseries'].includes(collectionName)) {
       const seasonsSnap = await getDocs(collection(db, collectionName, matchedId, "seasons"));
       if (seasonsSnap.empty) return bot.sendMessage(chatId, "❌ No episodes uploaded yet.");
@@ -547,7 +387,7 @@ async function executeSearch(chatId, commandText, collectionName) {
       bot.sendMessage(chatId, `🎌 <b>Found: ${esc(matchedDoc.title)} (${latestSeason.id})</b>\n<i>Sending episodes...</i>`, { parse_mode: 'HTML' });
       for (const ep of episodes) {
         await bot.sendVideo(chatId, ep.file_id, { caption: `🎌 <b>${esc(matchedDoc.title)}</b>\n🎬 Episode ${ep.episodeNumber}`, parse_mode: 'HTML' });
-        await new Promise(r => setTimeout(r, 1200)); // Rate limit safety
+        await new Promise(r => setTimeout(r, 1200)); 
       }
     }
   } catch (err) { logError("executeSearch", err); bot.sendMessage(chatId, "❌ Search query failed."); }
@@ -570,7 +410,6 @@ async function executeDelete(chatId, text) {
       if (snap.exists()) {
         const batch = writeBatch(db);
         
-        // Target nested subcollections for Episodic content
         if (['anime', 'webseries'].includes(col)) {
           const seasonsSnap = await getDocs(collection(db, col, targetId, "seasons"));
           for (const season of seasonsSnap.docs) {
@@ -717,7 +556,7 @@ async function setPlan(chatId, text) {
 }
 
 // ==========================================
-// CORE USER UTILITIES & ACCOUNT LOGIC
+// CORE USER ACCOUNT LOGIC & GIFT CODES
 // ==========================================
 async function processGiftCode(chatId, text) {
   try {
@@ -768,7 +607,6 @@ async function checkExpiry(chatId) {
 // RENDER COMPATIBILITY & WEBHOOK ENDPOINTS
 // ==========================================
 app.post(`/bot${token}`, (req, res) => {
-  // Acknowledge immediately to prevent Webhook Flooding/Timeouts
   res.sendStatus(200); 
   try { bot.processUpdate(req.body); } 
   catch (err) { logError("WebhookUpdate", err); }
