@@ -1,8 +1,5 @@
 /**
- * GET /api/videos
- * Returns all published videos (optionally filtered by category),
- * grouped so multi-episode entries become single series cards with
- * a `seasons` array — matching the frontend's DEMO_* shape.
+ * GET /api/videos - FIXED
  */
 const express = require('express');
 const router = express.Router();
@@ -16,15 +13,18 @@ router.get('/', softAuth, async (req, res) => {
     const filters = [['published', '==', true]];
     if (category && category !== 'all') filters.push(['category', '==', category]);
 
-    const docs = await queryDocs('videos', filters, ['createdAt', 'desc'], parseInt(limit));
+    let docs = await queryDocs('videos', filters, ['createdAt', 'desc'], parseInt(limit));
 
-    // Group by seriesTitle (or title, if season is set) to build episode lists
+    // Fallback client-side sort (handles number timestamps from bot)
+    docs.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+    // Grouping fix
     const standalone = [];
     const seriesMap = new Map();
 
     for (const doc of docs) {
-      if (doc.season) {
-        const key = doc.seriesTitle || doc.title;
+      if (doc.season != null) {  // stricter check
+        const key = doc.seriesTitle || doc.title || 'Unknown';
         if (!seriesMap.has(key)) seriesMap.set(key, []);
         seriesMap.get(key).push(doc);
       } else {
@@ -32,9 +32,6 @@ router.get('/', softAuth, async (req, res) => {
       }
     }
 
-    // Standalone (movies, one-offs) and series representative cards are each
-    // independent — resolve them concurrently instead of one-by-one, since
-    // serializeVideo() may make a network call to Telegram on a cache miss.
     const [standaloneResults, seriesResults] = await Promise.all([
       Promise.all(standalone.map(doc => serializeVideo(doc, { withImage: true }))),
       Promise.all(Array.from(seriesMap.entries()).map(async ([seriesTitle, episodes]) => {
@@ -50,8 +47,8 @@ router.get('/', softAuth, async (req, res) => {
 
     res.json({ videos: results, total: results.length });
   } catch (err) {
-    console.error('[videos] list error:', err.message);
-    res.status(500).json({ error: 'Failed to fetch videos' });
+    console.error('[videos] list error:', err.message, err.stack);
+    res.status(500).json({ error: 'Failed to fetch videos', details: err.message });
   }
 });
 
