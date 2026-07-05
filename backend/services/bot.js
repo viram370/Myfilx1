@@ -4,6 +4,7 @@
 // ==========================================
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
+const { getDB } = require('./firebase');
 const express = require('express');
 const { initializeApp } = require("firebase/app");
 const {
@@ -64,6 +65,21 @@ app.use(express.json());
 // ==========================================
 // 5. GLOBAL STATE & CONFIG
 // ==========================================
+function initBot() {
+  try {
+    db = getDB();  // Now safe
+    // ... webhook code ...
+    console.log(`🚀 Telegram Bot Started with ${ADMIN_IDS.length} admins`);
+  } catch (err) {
+    console.error('❌ Bot init failed:', err.message);
+  }
+}
+
+module.exports = {
+  initBot,
+  isAdmin,
+  processUpdate: (update) => bot.processUpdate(update),
+};
 let redeemMode = {};
 const adminBuffer = {}; 
 const ADMIN_IDS = [6097315530];
