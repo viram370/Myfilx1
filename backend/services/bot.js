@@ -659,7 +659,33 @@ async function checkExpiry(chatId) {
     if (user.expiry && Date.now() > user.expiry) await updateDoc(doc(db, "users", String(chatId)), { plan: "Free", expiry: null });
   } catch(err) {}
 }
+// ==========================================
+// 14. PUBLIC MODULE INTERFACE
+// ==========================================
+function initBot() {
+  db = getDB();
 
+  if (!BASE_URL) {
+    console.error('❌ FATAL: Missing webhook URL');
+    return;
+  }
+
+  const webhookUrl = `${BASE_URL.replace(/\/+$/, '')}/webhook`;
+  bot.setWebHook(webhookUrl, {
+    secret_token: process.env.WEBHOOK_SECRET,
+    drop_pending_updates: true,
+  })
+    .then(() => console.log(`✅ Webhook registered at: ${webhookUrl}`))
+    .catch(err => console.error('❌ Webhook Failed:', err.message));
+
+  console.log(`🚀 Telegram Bot Started | ${ADMIN_IDS.length} admins`);
+}
+
+module.exports = {
+  initBot,
+  isAdmin,
+  processUpdate: (update) => bot.processUpdate(update),
+};
 // ==========================================
 // 14. EXPRESS & WEBHOOK INFRASTRUCTURE
 // ==========================================
