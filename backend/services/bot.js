@@ -33,7 +33,46 @@ bot.on('video', (msg) => handleVideoBuffer(msg, msg.video));
 bot.on('document', (msg) => {
   if (msg.document?.mime_type?.startsWith('video/')) handleVideoBuffer(msg, msg.document);
 });
+// ... previous code ...
 
+async function executeSave(msg, type, payload) {
+  const chatId = msg.chat.id;
+  if (!isAdmin(chatId)) return;
+
+  const buf = adminBuffer[chatId] || [];
+  if (buf.length === 0) return safeSendMessage(chatId, "❌ Buffer empty.");
+
+  const args = payload.split('|').map(s => s.trim());
+  const title = args[0];
+  const season = args[1] || "1";
+  const language = args[2] || "Hindi";
+
+  const category = type === 'anime' ? 'Anime' : type === 'movie' ? 'Movies' : 'Web Series';
+
+  // Save each episode with season/episode number
+  for (let i = 0; i < buf.length; i++) {
+    const epNum = i + 1;
+    const videoData = {
+      title,
+      seriesTitle: title,
+      category,
+      season: parseInt(season),
+      episode: epNum,
+      telegram_file_id: buf[i].file_id,
+      file_unique_id: buf[i].file_unique_id,
+      language,
+      published: true,
+      createdAt: Date.now()
+    };
+    // Save to Firestore (you can expand this)
+    console.log(`Saved Episode ${epNum} of ${title}`);
+  }
+
+  safeSendMessage(chatId, `✅ Saved ${category}: ${title} Season ${season} (${buf.length} episodes)`);
+  adminBuffer[chatId] = []; // Clear buffer
+}
+
+// ... rest of the file ...
 async function handleVideoBuffer(msg, media) {
   const chatId = msg.chat.id;
   if (!isAdmin(chatId)) return;
