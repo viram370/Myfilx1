@@ -53,9 +53,10 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 .sp-tag{font-size:11px;letter-spacing:3px;text-transform:uppercase;color:var(--t2);animation:fup .5s ease .35s both}
 @keyframes fup{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:translateY(0)}}
 .sp-dots{display:flex;gap:6px}
-.sp-dots span{width:6px;height:6px;border-radius:50%;background:var(--red);animation:breath .9s ease-in-out infinite}
-.sp-dots span:nth-child(2){opacity:.5;animation-delay:.18s}
-.sp-dots span:nth-child(3){opacity:.22;animation-delay:.36s}
+.sp-dots span{width:6px;height:6px;border-radius:50%;background:var(--red);animation:dotPulse 1.2s ease-in-out infinite}
+.sp-dots span:nth-child(2){animation-delay:.15s}
+.sp-dots span:nth-child(3){animation-delay:.3s}
+@keyframes dotPulse{0%,80%,100%{opacity:.3;transform:scale(.6)}40%{opacity:1;transform:scale(1)}}
 
 /* ══ APP SHELL ══ */
 .app{position:fixed;inset:0;display:flex;flex-direction:column;background:var(--bg);overflow:hidden}
@@ -328,6 +329,10 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 .ply-loading{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;color:var(--t2)}
 .spinner{width:42px;height:42px;border-radius:50%;border:3px solid rgba(255,255,255,.1);border-top-color:var(--red);animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
+.ply-dots{display:flex;gap:8px}
+.ply-dots span{width:9px;height:9px;border-radius:50%;background:var(--red);animation:dotPulse 1.2s ease-in-out infinite}
+.ply-dots span:nth-child(2){animation-delay:.15s}
+.ply-dots span:nth-child(3){animation-delay:.3s}
 .ply-title{position:absolute;bottom:calc(var(--sb)+16px);left:14px;right:14px;font-size:14px;font-weight:600}
 
 /* ══ TOAST ══ */
@@ -709,7 +714,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
   <div class="ply-bar"><div class="ply-fill" id="ply-fill"></div></div>
   <button class="ply-close" id="ply-close"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
   <video id="vid-el" class="vid-el" controls playsinline webkit-playsinline preload="metadata"></video>
-  <div class="ply-loading" id="ply-loading"><div class="spinner"></div><p style="font-size:12px;color:rgba(255,255,255,.45)">Loading…</p></div>
+  <div class="ply-loading" id="ply-loading"><div class="ply-dots"><span></span><span></span><span></span></div><p style="font-size:12px;color:rgba(255,255,255,.45)">Loading…</p></div>
   <div class="ply-title" id="ply-title"></div>
 </div>
 
@@ -1019,7 +1024,7 @@ async function playVideo(v){
   const ov=$('player-ov'),vid=$('vid-el'),ld=$('ply-loading'),fill=$('ply-fill');
   _curPlayVid=v;
   ov.classList.remove('hidden');requestAnimationFrame(()=>ov.classList.add('vis'));
-  ld.style.display='flex';ld.innerHTML='<div class="spinner"></div><p style="font-size:12px;color:rgba(255,255,255,.4)">Loading…</p>';
+  ld.style.display='flex';ld.innerHTML='<div class="ply-dots"><span></span><span></span><span></span></div><p style="font-size:12px;color:rgba(255,255,255,.4)">Loading…</p>';
   vid.style.display='none';fill.style.animation='';fill.style.animationPlayState='running';
   $('ply-title').textContent=v.title||'';
   try{await screen.orientation?.lock('landscape')}catch{}
@@ -1084,7 +1089,7 @@ function closePlayer(){
   }
   vid.pause();vid.removeAttribute('src');vid.load();
   ov.classList.remove('vis');
-  setTimeout(()=>{ov.classList.add('hidden');$('ply-loading').style.display='flex';$('ply-loading').innerHTML='<div class="spinner"></div><p style="font-size:12px;color:rgba(255,255,255,.45)">Loading…</p>';vid.style.display='none';},300);
+  setTimeout(()=>{ov.classList.add('hidden');$('ply-loading').style.display='flex';$('ply-loading').innerHTML='<div class="ply-dots"><span></span><span></span><span></span></div><p style="font-size:12px;color:rgba(255,255,255,.45)">Loading…</p>';vid.style.display='none';},300);
   try{screen.orientation?.unlock()}catch{}
   _curPlayVid=null;
 }
@@ -1178,81 +1183,92 @@ document.addEventListener('keydown',e=>{
 });
 
 // ── Load & populate ───────────────────────────────
-async function loadAll(){
-  try{
+
+async function loadAll() {
+  try {
     await fetchAllVideos();
-  }catch(err){
-    console.error('[MYFLIX] Failed to load videos:',err.message);
-    toast('Failed to load videos. Check your connection.');
+    console.log('[MYFLIX] Videos loaded successfully.');
+  } catch (err) {
+    console.error('[MYFLIX] Failed to load videos:', err);
+    let msg = 'Unknown error';
+    if (!navigator.onLine) msg = 'No internet connection.';
+    else if (err.response?.status === 401) msg = 'Unauthorized.';
+    else if (err.response?.status === 403) msg = 'Permission denied.';
+    else if (err.response?.status === 404) msg = 'Requested data not found.';
+    else if (err.response?.status === 429) msg = 'Too many requests.';
+    else if (err.response?.status >= 500) msg = 'Server error.';
+    else if (err.code) msg = err.code;
+    else if (err.message) msg = err.message;
+    toast(msg);
   }
 
-  S.all=[...CAT.anime,...CAT.series,...CAT.movies,...CAT.cartoons];
+  S.all = [...CAT.anime, ...CAT.series, ...CAT.movies, ...CAT.cartoons];
 
   // Featured: pick up to one per category, fall back gracefully if a category is empty
-  S.featured=[CAT.anime[0],CAT.series[0],CAT.movies[0],CAT.anime[1],CAT.movies[1]].filter(Boolean);
-  if(!S.featured.length) S.featured=S.all.slice(0,5);
+  S.featured = [CAT.anime[0], CAT.series[0], CAT.movies[0], CAT.anime[1], CAT.movies[1]].filter(Boolean);
+  if (!S.featured.length) S.featured = S.all.slice(0, 5);
 
   // Home hero
-  S.heroIdx=0; renderHero(); startHeroLoop();
+  S.heroIdx = 0; renderHero(); startHeroLoop();
 
   // Home carousels (strictly by category)
-  fillCar('anime-car',  CAT.anime);
+  fillCar('anime-car', CAT.anime);
   fillCar('series-car', CAT.series, true);
   fillCar('movies-car', CAT.movies);
 
   // Section pages: grids, counts, mini heroes
-  $('anime-count').textContent  = `${CAT.anime.length} titles`;
+  $('anime-count').textContent = `${CAT.anime.length} titles`;
   $('series-count').textContent = `${CAT.series.length} titles`;
   $('movies-count').textContent = `${CAT.movies.length} titles`;
-  fillGrid('anime-grid',  CAT.anime);
+  fillGrid('anime-grid', CAT.anime);
   fillGrid('series-grid', CAT.series);
   fillGrid('movies-grid', CAT.movies);
 
-  renderMiniHero('anime-hero',  CAT.anime);
+  renderMiniHero('anime-hero', CAT.anime);
   renderMiniHero('series-hero', CAT.series);
   renderMiniHero('movies-hero', CAT.movies);
 
   // Real Continue Watching + Favourites + Profile stats from backend
-  try{
-    const [cwRes,favRes,histRes]=await Promise.allSettled([
+  try {
+    const [cwRes, favRes, histRes] = await Promise.allSettled([
       Api.continueWatching(),
       Api.favorites(),
       Api.history(),
     ]);
 
-    if(cwRes.status==='fulfilled'){
-      S.cont=(cwRes.value.items||[]).map(item=>({...normalize(item.video,0),watchProgress:item.video.watchProgress||0}));
+    if (cwRes.status === 'fulfilled') {
+      S.cont = (cwRes.value.items || []).map((item, i) => ({ ...normalize(item.video, i), watchProgress: item.video.watchProgress || 0 }));
     }
-    if(S.cont.length){$('cont-row').style.display='';fillCar('cont-car',S.cont,true);}
+    if (S.cont.length) { $('cont-row').style.display = ''; fillCar('cont-car', S.cont, true); }
 
-    if(favRes.status==='fulfilled'){
-      (favRes.value.favorites||[]).forEach(f=>S.favs.add(f.videoId));
+    if (favRes.status === 'fulfilled') {
+      (favRes.value.favorites || []).forEach(f => S.favs.add(f.videoId));
     }
 
-    const watchedCount = histRes.status==='fulfilled' ? (histRes.value.history||[]).length : 0;
-    $('pp-watched').textContent=watchedCount;
-    $('pp-hrs').textContent=`${Math.round(watchedCount*1.4)}h`;
-  }catch(err){
-    console.error('[MYFLIX] Secondary data load error:',err.message);
+    const watchedCount = histRes.status === 'fulfilled' ? (histRes.value.history || []).length : 0;
+    $('pp-watched').textContent = watchedCount;
+    $('pp-hrs').textContent = `${Math.round(watchedCount * 1.4)}h`;
+  } catch (err) {
+    console.error('[MYFLIX] Secondary data load error:', err.message);
   }
 
   // Telegram user -> profile name/avatar
-  try{
-    const tgUser=window.Telegram?.WebApp?.initDataUnsafe?.user;
-    if(tgUser){
-      const initial=(tgUser.first_name||'M')[0].toUpperCase();
-      $('nav-av').textContent=initial;
-      $('pp-av').textContent=initial;
-      $('pp-name').textContent=[tgUser.first_name,tgUser.last_name].filter(Boolean).join(' ')||'MYFLIX User';
-      $('pp-user').textContent=tgUser.username?`@${tgUser.username}`:'Telegram User';
+  try {
+    const tgUser = window.Telegram?.WebApp?.initDataUnsafe?.user;
+    if (tgUser) {
+      const initial = (tgUser.first_name || 'M')[0].toUpperCase();
+      $('nav-av').textContent = initial;
+      $('pp-av').textContent = initial;
+      $('pp-name').textContent = [tgUser.first_name, tgUser.last_name].filter(Boolean).join(' ') || 'MYFLIX User';
+      $('pp-user').textContent = tgUser.username ? `@${tgUser.username}` : 'Telegram User';
     }
-  }catch{}
+  } catch {}
 
   // Search setup
-  setupSearch('anime-search','anime-search-clr','anime','anime-grid','anime-fav-band','sp-anime-fav-car');
-  setupSearch('series-search','series-search-clr','series','series-grid','series-fav-band','sp-series-fav-car');
-  setupSearch('movies-search','movies-search-clr','movies','movies-grid','movies-fav-band','sp-movies-fav-car');
-  refreshFavRows();updateProfStats();
+  setupSearch('anime-search', 'anime-search-clr', 'anime', 'anime-grid', 'anime-fav-band', 'sp-anime-fav-car');
+  setupSearch('series-search', 'series-search-clr', 'series', 'series-grid', 'series-fav-band', 'sp-series-fav-car');
+  setupSearch('movies-search', 'movies-search-clr', 'movies', 'movies-grid', 'movies-fav-band', 'sp-movies-fav-car');
+  refreshFavRows(); updateProfStats();
 }
 
 // ── Offline ───────────────────────────────────────
