@@ -36,24 +36,51 @@ function validateTelegramAuth(initData) {
     return null;
   }
 }
-
 async function requireAuth(req, res, next) {
   try {
-    const initData = req.headers['x-telegram-init-data'] || req.query.initData;
-    if (!initData) return res.status(401).json({ error: 'Missing authentication' });
+    const initData =
+      req.headers["x-telegram-init-data"] || req.query.initData;
+
+    // Allow localhost without Telegram authentication
+    if (!initData) {
+      if (process.env.NODE_ENV !== "production") {
+        req.telegramUser = {
+          id: "dev-user",
+          first_name: "Developer"
+        };
+        req.telegramUserId = "dev-user";
+        return next();
+      }
+
+      return res.status(401).json({
+        error: "Missing authentication"
+      });
+    }
 
     const user = validateTelegramAuth(initData);
-    if (!user) return res.status(401).json({ error: 'Invalid authentication' });
+
+    if (!user) {
+      return res.status(401).json({
+        error: "Invalid authentication"
+      });
+    }
 
     req.telegramUser = user;
     req.telegramUserId = String(user.id);
+
     await upsertUser(user);
+
     next();
+
   } catch (err) {
-    console.error('[AUTH] middleware error:', err.message);
-    res.status(500).json({ error: 'Authentication failed' });
+    console.error("[AUTH]", err);
+
+    res.status(500).json({
+      error: "Authentication failed"
+    });
   }
 }
+
 
 async function requireAdmin(req, res, next) {
   try {
