@@ -12,25 +12,55 @@ const axios = require('axios');
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const fileUrlCache = new Map();
-
 async function resolveFileUrl(fileId) {
-  if (!fileId) return null;
+  if (!fileId) throw new Error("telegram_file_id is missing");
+
   const cached = fileUrlCache.get(fileId);
-  if (cached && cached.expiresAt > Date.now()) return cached.url;
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.url;
+  }
 
   try {
-    const { data } = await axios.get(`https://api.telegram.org/bot${BOT_TOKEN}/getFile`, {
-      params: { file_id: fileId },
+    const response = await axios.get(
+      `https://api.telegram.org/bot${BOT_TOKEN}/getFile`,
+      {
+        params: { file_id: fileId }
+      }
+    );
+
+    console.log("Telegram getFile:", response.data);
+
+    if (!response.data.ok) {
+      throw new Error(response.data.description);
+    }
+
+    const filePath = response.data.result.file_path;
+
+    if (!filePath) {
+      throw new Error("Telegram did not return file_path");
+    }
+
+    const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+
+    fileUrlCache.set(fileId, {
+      url,
+      expiresAt: Date.now() + 50 * 60 * 1000
     });
-    if (!data.ok) return null;
-    const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${data.result.file_path}`;
-    fileUrlCache.set(fileId, { url, expiresAt: Date.now() + 50 * 60 * 1000 });
+
     return url;
+
   } catch (err) {
-    console.error('[serializer] resolveFileUrl error:', err.message);
-    return null;
+    console.error("========== TELEGRAM ERROR ==========");
+    console.error("File ID:", fileId);
+    console.error("Token exists:", !!BOT_TOKEN);
+    console.error("Telegram Response:", err.response?.data);
+    console.error("Message:", err.message);
+    console.error("====================================");
+
+    throw err;
   }
 }
+
 
 async function serializeVideo(doc, { withImage = true } = {}) {
   if (!doc) return null;
