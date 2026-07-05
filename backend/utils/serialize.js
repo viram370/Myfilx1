@@ -13,7 +13,7 @@ const axios = require('axios');
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const fileUrlCache = new Map();
 async function resolveFileUrl(fileId) {
-  if (!fileId) throw new Error("telegram_file_id is missing");
+  if (!fileId) return null;
 
   const cached = fileUrlCache.get(fileId);
   if (cached && cached.expiresAt > Date.now()) {
@@ -21,26 +21,18 @@ async function resolveFileUrl(fileId) {
   }
 
   try {
-    const response = await axios.get(
+    const { data } = await axios.get(
       `https://api.telegram.org/bot${BOT_TOKEN}/getFile`,
       {
         params: { file_id: fileId }
       }
     );
 
-    console.log("Telegram getFile:", response.data);
-
-    if (!response.data.ok) {
-      throw new Error(response.data.description);
+    if (!data.ok) {
+      throw new Error(data.description);
     }
 
-    const filePath = response.data.result.file_path;
-
-    if (!filePath) {
-      throw new Error("Telegram did not return file_path");
-    }
-
-    const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+    const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${data.result.file_path}`;
 
     fileUrlCache.set(fileId, {
       url,
@@ -50,73 +42,64 @@ async function resolveFileUrl(fileId) {
     return url;
 
   } catch (err) {
-    console.error("========== TELEGRAM ERROR ==========");
-    console.error("File ID:", fileId);
-    console.error("Token exists:", !!BOT_TOKEN);
-    console.error("Telegram Response:", err.response?.data);
-    console.error("Message:", err.message);
-    console.error("====================================");
-
-    throw err;
+    console.error("[resolveFileUrl]", err.response?.data || err.message);
+    return null;
   }
 }
-
 
 async function serializeVideo(doc, { withImage = true } = {}) {
   if (!doc) return null;
 
   let thumbnail = doc.thumbnail || null;
+
   if (withImage && !thumbnail) {
-    const imageFileId = doc.bannerFileId || doc.thumbFileId || null;
-    thumbnail = await resolveFileUrl(imageFileId);
+    const imageFileId = doc.bannerFileId || doc.thumbFileId;
+
+    if (imageFileId) {
+      thumbnail = await resolveFileUrl(imageFileId);
+    }
   }
 
   return {
     id: doc.id,
-    category: doc.category || 'Uncategorized',
-    title: doc.title || 'Untitled',
-    year: doc.uploadDate ? new Date(doc.uploadDate).getFullYear().toString() : '',
+
+    category: doc.category || "Uncategorized",
+
+    title: doc.title || "Untitled",
+
+    year: doc.uploadDate
+      ? new Date(doc.uploadDate).getFullYear().toString()
+      : "",
+
     rating: doc.rating || null,
-    genre: doc.genre || doc.category || '',
-    description: doc.description || '',
+
+    genre: doc.genre || doc.category || "",
+
+    description: doc.description || "",
+
     duration: doc.duration || 0,
+
     thumbnail,
     poster: thumbnail,
     banner: thumbnail,
+
     season: doc.season || null,
     episode: doc.episode || null,
-    seriesTitle: doc.seriesTitle || (doc.season ? doc.title : null),
+
+    seriesTitle: doc.seriesTitle || null,
+
     views: doc.views || 0,
+
     likes: doc.likes || 0,
+
     published: !!doc.published,
-    createdAt: doc.createdAt?.toDate ? doc.createdAt.toDate().toISOString() : doc.createdAt,
+
+    createdAt:
+      doc.createdAt?.toDate
+        ? doc.createdAt.toDate().toISOString()
+        : doc.createdAt
   };
 }
 
-async function serializeVideos(docs, opts) {
-  return Promise.all(docs.map(d => serializeVideo(d, opts)));
-}
-
-function groupIntoSeasons(episodes) {
-  const bySeasonNum = {};
-  for (const ep of episodes) {
-    const s = ep.season || 1;
-    if (!bySeasonNum[s]) bySeasonNum[s] = [];
-    bySeasonNum[s].push({
-      ep: ep.episode || 1,
-      title: ep.title,
-      duration: ep.duration || 0,
-      prog: ep.progressPercent || 0,
-      videoId: ep.id,
-      thumbnail: ep.thumbnail || null,
-    });
-  }
-  return Object.keys(bySeasonNum)
-    .sort((a, b) => Number(a) - Number(b))
-    .map(num => ({
-      num: Number(num),
-      eps: bySeasonNum[num].sort((a, b) => a.ep - b.ep),
-    }));
-}
 
 module.exports = { resolveFileUrl, serializeVideo, serializeVideos, groupIntoSeasons };
