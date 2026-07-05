@@ -9,7 +9,7 @@ const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 
 const { initFirebase } = require('./services/firebase');
-const { initBot } = require('./services/bot');
+const botService = require('./services/bot'); // Fixed import
 
 const videosRoutes = require('./routes/videos');
 const videoRoutes = require('./routes/video');
@@ -26,7 +26,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 initFirebase();
-initBot();
+botService.initBot(); // Fixed call
 
 app.use(helmet({ crossOriginEmbedderPolicy: false }));
 app.use(cors({
@@ -43,9 +43,8 @@ app.use(cors({
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 300,
-  standardHeaders: true,
-  legacyHeaders: false,
 });
+
 const streamLimiter = rateLimit({ windowMs: 60 * 1000, max: 40 });
 
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev', {
@@ -56,9 +55,8 @@ app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// ── Routes ─────────────────────────────
+// Routes
 app.use('/webhook', webhookRoutes);
-
 app.use('/api/videos', apiLimiter, videosRoutes);
 app.use('/api/video', apiLimiter, videoRoutes);
 app.use('/api/categories', apiLimiter, categoriesRoutes);
@@ -69,23 +67,18 @@ app.use('/api/stream', streamLimiter, streamRoutes);
 app.use('/api/users', apiLimiter, usersRoutes);
 app.use('/api/admin', apiLimiter, adminRoutes);
 
-// Health check (important for Render)
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
-// 404 fallback
 app.use((req, res) => res.status(404).json({ error: 'Route not found' }));
 
-// Global error handler
 app.use((err, req, res, next) => {
   console.error('[ERROR]', err.stack);
-  res.status(err.status || 500).json({
-    error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message,
-  });
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 app.listen(PORT, () => {
   console.log(`✅ MYFLIX backend running on port ${PORT}`);
-  console.log(`📱 Mini App: ${process.env.MINI_APP_URL || 'Not set'}`);
+  console.log(`📱 Mini App URL: ${process.env.MINI_APP_URL || 'Not configured'}`);
 });
 
 module.exports = app;
