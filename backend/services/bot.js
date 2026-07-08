@@ -123,9 +123,15 @@ await db.collection('videos').doc(videoId).set({
   published: true,
   createdAt: Date.now()
 });
-    
+    console.log("✅ Saved:", videoId);
+  savedCount++;
     savedCount++;
-  }
+  }catch (err) {
+  console.error("❌ Firestore Save Error:", err);
+  return safeSendMessage(chatId, `❌ Save failed:\n${err.message}`);
+}
+
+  
 
   safeSendMessage(chatId, `✅ Saved ${category}: ${title} Season ${season} (${savedCount} episodes)`);
   adminBuffer[chatId] = [];
