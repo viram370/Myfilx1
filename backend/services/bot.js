@@ -48,7 +48,32 @@ async function handleVideoBuffer(msg, media) {
 
   safeSendMessage(chatId, `✅ Buffered (${adminBuffer[chatId].length})`);
 }
+bot.onText(/^\/start$/, async (msg) => {
+  const chatId = msg.chat.id;
 
+  await bot.sendMessage(
+    chatId,
+    `🎬 Welcome to MYFLIX
+
+Choose an option:
+
+/help - Commands
+/list - Saved videos`
+  );
+});
+bot.onText(/^\/help$/, async (msg) => {
+  const chatId = msg.chat.id;
+
+  await bot.sendMessage(chatId,
+`📚 MYFLIX Commands
+
+/saveanime Title|Season|Language
+/savemovie Title|Season|Language
+/savewebseries Title|Season|Language
+
+/clearbuffer
+/list`);
+});
 // Save Commands
 bot.onText(/^\/saveanime (.+)/, async (msg, match) => executeSave(msg, 'anime', match[1]));
 bot.onText(/^\/savemovie (.+)/, async (msg, match) => executeSave(msg, 'movie', match[1]));
