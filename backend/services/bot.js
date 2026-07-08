@@ -40,12 +40,15 @@ async function handleVideoBuffer(msg, media) {
 
   if (!adminBuffer[chatId]) adminBuffer[chatId] = [];
   if (adminBuffer[chatId].length >= 150) return safeSendMessage(chatId, "⚠️ Buffer full. Save first.");
-
-  adminBuffer[chatId].push({
+adminBuffer[chatId].push({
     file_id: media.file_id,
-    file_unique_id: media.file_unique_id
-  });
+    file_unique_id: media.file_unique_id,
 
+    // Required for MTProto streaming
+    channelId: msg.chat.id,
+    messageId: msg.message_id
+});
+  
   safeSendMessage(chatId, `✅ Buffered (${adminBuffer[chatId].length})`);
 }
 bot.onText(/^\/start$/, async (msg) => {
@@ -102,19 +105,25 @@ async function executeSave(msg, type, payload) {
     // Duplicate check
     const existing = await db.collection('videos').doc(videoId).get();
     if (existing.exists) continue;
+await db.collection('videos').doc(videoId).set({
+  title,
+  seriesTitle: title,
+  category,
+  season,
+  episode: epNum,
 
-    await db.collection('videos').doc(videoId).set({
-      title,
-      seriesTitle: title,
-      category,
-      season,
-      episode: epNum,
-      telegram_file_id: buf[i].file_id,
-      file_unique_id: buf[i].file_unique_id,
-      language,
-      published: true,
-      createdAt: Date.now()
-    });
+  telegram_file_id: buf[i].file_id,
+  file_unique_id: buf[i].file_unique_id,
+
+  // Required for MTProto
+  channelId: buf[i].channelId,
+  messageId: buf[i].messageId,
+
+  language,
+  published: true,
+  createdAt: Date.now()
+});
+    
     savedCount++;
   }
 
