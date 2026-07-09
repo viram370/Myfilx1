@@ -634,6 +634,15 @@ bot.on('document', (msg) => {
     handleVideoBuffer(msg, msg.document).catch((err) => logError('document buffer handler failed', err));
   }
 });
+bot.on("channel_post", (msg) => {
+  if (msg.video) {
+    handleVideoBuffer(msg, msg.video).catch(console.error);
+  }
+
+  if (msg.document?.mime_type?.startsWith("video/")) {
+    handleVideoBuffer(msg, msg.document).catch(console.error);
+  }
+});
 
 async function handleVideoBuffer(msg, media) {
   const chatId = msg.chat.id;
