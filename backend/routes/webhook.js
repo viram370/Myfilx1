@@ -19,6 +19,8 @@ router.post('/', (req, res) => {
     } catch { update = req.body; }
 
     setImmediate(() => {
+      console.log("Telegram Update:");
+console.log(JSON.stringify(update, null, 2));
       try { processUpdate(update); }
       catch (err) { console.error('[webhook] process error:', err.message); }
     });
