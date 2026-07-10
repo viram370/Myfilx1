@@ -40,6 +40,8 @@
 const crypto = require('crypto');
 const TelegramBot = require('node-telegram-bot-api');
 const { getDB, getAdmin } = require('./firebase');
+const { parseMediaInfo } = require('./parser');
+const mtproto = require('./mtproto');
 
 // ============================================================================
 // SECTION 1 — CONFIG & CONSTANTS
@@ -529,7 +531,7 @@ function videoDocId(type, title, season, episode) {
   return `${type}_${slugify(title)}_s${season}_ep${episode}`;
 }
 
-function buildVideoData({ title, category, season, episode, fileId, fileUniqueId, channelId, messageId, language, fileSizeBytes }) {
+function buildVideoData({ title, category, season, episode, fileId, fileUniqueId, channelId, messageId, language, fileSizeBytes, quality }) {
   const admin = getAdmin();
   const data = {
     title,
@@ -549,6 +551,7 @@ function buildVideoData({ title, category, season, episode, fileId, fileUniqueId
   // Ignore undefined values explicitly (belt-and-braces on top of
   // db.settings({ ignoreUndefinedProperties: true }) in firebase.js).
   if (fileSizeBytes !== undefined && fileSizeBytes !== null) data.fileSizeBytes = fileSizeBytes;
+  if (quality) data.quality = quality;
   return data;
 }
 
@@ -634,15 +637,6 @@ bot.on('document', (msg) => {
     handleVideoBuffer(msg, msg.document).catch((err) => logError('document buffer handler failed', err));
   }
 });
-bot.on("channel_post", (msg) => {
-  if (msg.video) {
-    handleVideoBuffer(msg, msg.video).catch(console.error);
-  }
-
-  if (msg.document?.mime_type?.startsWith("video/")) {
-    handleVideoBuffer(msg, msg.document).catch(console.error);
-  }
-});
 
 async function handleVideoBuffer(msg, media) {
   const chatId = msg.chat.id;
@@ -660,6 +654,9 @@ async function handleVideoBuffer(msg, media) {
     return safeSendMessage(chatId, '⚠️ Duplicate video skipped (already in buffer).');
   }
 
+  const rawText = msg.caption || media.file_name || '';
+  const detected = parseMediaInfo(rawText);
+
   bufferSeenIds[chatId].add(media.file_unique_id);
   adminBuffer[chatId].push({
     file_id: media.file_id,
@@ -668,10 +665,15 @@ async function handleVideoBuffer(msg, media) {
     messageId: msg.message_id,
     fileSizeBytes: media.file_size,
     addedAt: Date.now(),
+    detected,
   });
 
-  logInfo('Video buffered', { ...userMeta(msg), bufferCount: adminBuffer[chatId].length });
-  safeSendMessage(chatId, `✅ Buffered (${adminBuffer[chatId].length}/${max})`);
+  logInfo('Video buffered', { ...userMeta(msg), bufferCount: adminBuffer[chatId].length, detectedTitle: detected.title, detectedS: detected.season, detectedE: detected.episode });
+
+  const detectedLine = detected.title
+    ? `\n🔎 Detected: ${detected.title}${detected.season != null ? ` S${detected.season}` : ''}${detected.episode != null ? `E${detected.episode}` : ''}${detected.language ? ` · ${detected.language}` : ''}${detected.quality ? ` · ${detected.quality}` : ''}`
+    : '';
+  safeSendMessage(chatId, `✅ Buffered (${adminBuffer[chatId].length}/${max})${detectedLine}`);
 }
 
 // ============================================================================
@@ -696,7 +698,8 @@ registerCommand('help', async (msg) => {
     '/saveanime Title|Season|Language|StartEp',
     '/savemovie Title|Season|Language|StartEp',
     '/savewebseries Title|Season|Language|StartEp',
-    '<i>(Language and StartEp are optional; forward videos first to fill the buffer.)</i>',
+    '/autosave Title|Season|Language|StartEp — category auto-detected too',
+    '<i>Any field may be blank or "auto" to use what was detected from the caption/filename (e.g. "Demon Slayer S02E04 Hindi 720p").</i>',
     '',
     '<b>Buffer</b>',
     '/showbuffer — view current buffer',
@@ -731,21 +734,38 @@ registerCommand('help', async (msg) => {
 // SECTION 12 — COMMANDS: save (Requirement 3 & 5)
 // ============================================================================
 
+const AUTO_TOKEN = /^(auto|)$/i;
+
+/**
+ * @param {object} msg
+ * @param {'anime'|'movie'|'webseries'|null} type null => category is
+ *        auto-detected per batch from the first buffered item's caption.
+ * @param {string} argString "Title|Season|Language|StartEpisode", any
+ *        segment may be blank or "auto" to fall back to what the parser
+ *        detected from Telegram captions/filenames.
+ */
 async function executeSave(msg, type, argString) {
   const chatId = msg.chat.id;
-  const category = TYPE_CATEGORY[type];
   const start = Date.now();
-
-  assertValid(argString, 'Usage: /save' + type + ' Title|Season|Language|StartEpisode');
 
   const buf = adminBuffer[chatId] || [];
   assertValid(buf.length > 0, 'Buffer is empty. Forward videos to the bot first.');
 
-  const parts = argString.split('|').map((s) => s.trim());
-  const title = validateTitle(parts[0]);
-  const season = validateSeason(parts[1] || 1);
-  const language = validateLanguage(parts[2] || 'Hindi');
-  const startEpisode = parts[3] ? validateEpisode(parts[3]) : 1;
+  const parts = (argString || '').split('|').map((s) => s.trim());
+  const first = buf[0].detected || {};
+
+  const category = type ? TYPE_CATEGORY[type] : normalizeCategory(first.category || 'Movies');
+  const resolvedType = type || typeForCategory(category);
+
+  const titleRaw = AUTO_TOKEN.test(parts[0]) ? first.title : parts[0];
+  assertValid(titleRaw, 'Could not detect a title automatically — usage: /save' + resolvedType + ' Title|Season|Language|StartEpisode');
+  const title = validateTitle(titleRaw);
+
+  const explicitSeason = parts[1] && !AUTO_TOKEN.test(parts[1]) ? validateSeason(parts[1]) : null;
+  const explicitLanguage = parts[2] && !AUTO_TOKEN.test(parts[2]) ? validateLanguage(parts[2]) : null;
+  const startEpisode = parts[3] && !AUTO_TOKEN.test(parts[3]) ? validateEpisode(parts[3]) : 1;
+
+  const language = explicitLanguage || (first.language ? validateLanguage(first.language) : null) || 'Hindi';
 
   // Validate every buffered item before touching Firestore.
   const validatedBuf = buf.map((item) => ({
@@ -754,32 +774,51 @@ async function executeSave(msg, type, argString) {
     channelId: validateChannelId(item.channelId),
     messageId: validateMessageId(item.messageId),
     fileSizeBytes: item.fileSizeBytes,
+    detected: item.detected || {},
   }));
 
   // Cross-title duplicate prevention: has this exact Telegram file already been saved?
   const alreadySaved = await findExistingFileUniqueIds(validatedBuf.map((v) => v.fileUniqueId));
 
+  // Best-effort MTProto verification that each source message still exists
+  // and actually carries video/document media before we write anything.
+  const verification = new Map();
+  if (mtproto.isEnabled()) {
+    const CONCURRENCY = 5;
+    for (let i = 0; i < validatedBuf.length; i += CONCURRENCY) {
+      const slice = validatedBuf.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(slice.map((item) => mtproto.verifyMessage(item.channelId, item.messageId)));
+      slice.forEach((item, idx) => verification.set(item.fileUniqueId, results[idx]));
+    }
+  }
+
   const candidates = [];
-  validatedBuf.forEach((item, i) => {
+  let skippedInvalidSource = 0;
+  let autoIndex = 0;
+  validatedBuf.forEach((item) => {
     if (alreadySaved.has(item.fileUniqueId)) return;
-    const episode = startEpisode + i;
-    validateEpisode(episode);
-    const id = videoDocId(type, title, season, episode);
+    const v = verification.get(item.fileUniqueId);
+    if (v && v.ok === false) {
+      skippedInvalidSource++;
+      logWarn('Skipped invalid source before save', { fileUniqueId: item.fileUniqueId, channelId: item.channelId, messageId: item.messageId, reason: v.reason });
+      return;
+    }
+
+    const season = explicitSeason ?? (item.detected.season != null ? validateSeason(item.detected.season) : 1);
+    const episode = item.detected.episode != null ? validateEpisode(item.detected.episode) : validateEpisode(startEpisode + autoIndex++);
+    const quality = item.detected.quality || null;
+
+    const id = videoDocId(resolvedType, title, season, episode);
     candidates.push({
       id,
       ref: db.collection(VIDEOS_COLLECTION).doc(id),
       data: buildVideoData({
-        title,
-        category,
-        season,
-        episode,
-        fileId: item.fileId,
-        fileUniqueId: item.fileUniqueId,
-        channelId: item.channelId,
-        messageId: item.messageId,
-        language,
-        fileSizeBytes: item.fileSizeBytes,
+        title, category, season, episode,
+        fileId: item.fileId, fileUniqueId: item.fileUniqueId,
+        channelId: item.channelId, messageId: item.messageId,
+        language, fileSizeBytes: item.fileSizeBytes, quality,
       }),
+      season,
     });
   });
 
@@ -788,7 +827,7 @@ async function executeSave(msg, type, argString) {
   const existingIds = new Set(existingDocs.filter((d) => d.exists).map((d) => d.id));
   const toWrite = candidates.filter((c) => !existingIds.has(c.id));
 
-  const skippedDuplicateFile = validatedBuf.length - candidates.length;
+  const skippedDuplicateFile = validatedBuf.length - candidates.length - skippedInvalidSource;
   const skippedExistingDoc = candidates.length - toWrite.length;
 
   const savedCount = await batchedSet(toWrite);
@@ -801,24 +840,24 @@ async function executeSave(msg, type, argString) {
   logSuccess(`Saved ${category}`, {
     ...userMeta(msg),
     title,
-    season,
     saved: savedCount,
     skippedDup: skippedDuplicateFile + skippedExistingDoc,
+    skippedInvalidSource,
     firestoreLatency: formatDuration(elapsed),
   });
 
+  const seasonsUsed = [...new Set(toWrite.map((c) => c.season))].sort((a, b) => a - b);
   const lines = [
     `✅ <b>${category === CATEGORIES.WEBSERIES ? 'Web Series' : category.replace(/s$/, '')} Saved</b>`,
     '',
     `Title: ${title}`,
-    `Season: ${season}`,
+    `Season: ${seasonsUsed.join(', ') || '—'}`,
     `Episodes Saved: ${savedCount}`,
     `Language: ${language}`,
   ];
-  if (skippedDuplicateFile + skippedExistingDoc > 0) {
-    lines.push(`Skipped Duplicates: ${skippedDuplicateFile + skippedExistingDoc}`);
-  }
-  lines.push('', `Firestore ID: <code>${toWrite[0]?.id || videoDocId(type, title, season, startEpisode)}</code>`, '', `Time: ${formatDuration(elapsed)}`);
+  if (skippedDuplicateFile + skippedExistingDoc > 0) lines.push(`Skipped Duplicates: ${skippedDuplicateFile + skippedExistingDoc}`);
+  if (skippedInvalidSource > 0) lines.push(`Skipped Invalid Source: ${skippedInvalidSource}`);
+  lines.push('', `Firestore ID: <code>${toWrite[0]?.id || '—'}</code>`, '', `Time: ${formatDuration(elapsed)}`);
 
   await safeSendMessage(chatId, lines.join('\n'), {});
 }
@@ -826,6 +865,7 @@ async function executeSave(msg, type, argString) {
 registerCommand('saveanime', (msg, arg) => executeSave(msg, 'anime', arg));
 registerCommand('savemovie', (msg, arg) => executeSave(msg, 'movie', arg));
 registerCommand('savewebseries', (msg, arg) => executeSave(msg, 'webseries', arg));
+registerCommand('autosave', (msg, arg) => executeSave(msg, null, arg));
 
 // ============================================================================
 // SECTION 13 — COMMANDS: buffer utilities
@@ -1414,7 +1454,7 @@ registerCommand('find', async (msg, arg) => {
 
 bot.onText(/^\/(\w+)/, async (msg, match) => {
   const known = new Set([
-    'start', 'help', 'saveanime', 'savemovie', 'savewebseries',
+    'start', 'help', 'saveanime', 'savemovie', 'savewebseries', 'autosave',
     'deleteanime', 'deletemovie', 'deletewebseries', 'deleteseason', 'deleteepisode',
     'deletetitle', 'deletelanguage', 'deleteallanime', 'deleteallmovies', 'deleteallwebseries',
     'listanime', 'listmovies', 'listwebseries', 'stats', 'storage', 'health', 'logs', 'ping',
