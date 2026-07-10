@@ -54,6 +54,13 @@ const ADMIN_IDS = (process.env.ADMIN_USER_IDS || '')
   .map((s) => Number(String(s).trim()))
   .filter((n) => Number.isFinite(n) && n !== 0);
 
+// Optional: restrict auto-buffering to one specific storage channel. If unset,
+// any channel_post the bot receives is trusted (Telegram only delivers
+// channel_post updates for channels the bot is an administrator of).
+const STORAGE_CHANNEL_ID = process.env.STORAGE_CHANNEL_ID
+  ? Number(process.env.STORAGE_CHANNEL_ID)
+  : null;
+
 const CATEGORIES = Object.freeze({
   ANIME: 'Anime',
   MOVIES: 'Movies',
@@ -298,7 +305,7 @@ function typeForCategory(category) {
 // SECTION 5 — RUNTIME STATE
 // ============================================================================
 
-/** @type {Record<number, Array<{file_id:string,file_unique_id:string,channelId:number,messageId:number,fileSizeBytes?:number,addedAt:number}>>} */
+/** @type {Record<number, Array<{file_id:string,file_unique_id:string,channelId:number,messageId:number,fileSizeBytes?:number,mimeType?:string|null,addedAt:number}>>} */
 const adminBuffer = {};
 /** @type {Record<number, Set<string>>} */
 const bufferSeenIds = {};
@@ -626,54 +633,157 @@ async function findExistingFileUniqueIds(uniqueIds) {
 // ============================================================================
 // SECTION 10 — BUFFER MANAGEMENT (Requirement 6)
 // ============================================================================
+// Buffering works identically whether a video arrives as:
+//   (a) a message sent directly to the bot by an admin, or
+//   (b) a channel_post / edited_channel_post from the storage channel the
+//       bot is an administrator of.
+// Both paths funnel through bufferVideoItem() so /saveanime, /savemovie,
+// /savewebseries, /showbuffer and /clearbuffer keep working completely
+// unmodified regardless of where the video came from.
 
 function getMaxBuffer(chatId) {
   return maxBufferByChat[chatId] || DEFAULT_MAX_BUFFER;
 }
 
-bot.on('video', (msg) => handleVideoBuffer(msg, msg.video).catch((err) => logError('video buffer handler failed', err)));
-bot.on('document', (msg) => {
-  if (msg.document?.mime_type?.startsWith('video/')) {
-    handleVideoBuffer(msg, msg.document).catch((err) => logError('document buffer handler failed', err));
+function isStorageChannel(chatId) {
+  if (STORAGE_CHANNEL_ID) return Number(chatId) === STORAGE_CHANNEL_ID;
+  // No specific channel configured — trust any channel_post the bot receives,
+  // since Telegram only delivers those updates for channels the bot admins.
+  return true;
+}
+
+function extractVideoMedia(msg) {
+  if (msg.video) return msg.video;
+  if (msg.document?.mime_type?.startsWith('video/')) return msg.document;
+  return null;
+}
+
+function formatDetectedLine(detected) {
+  if (!detected || !detected.title) return '';
+  return `\n🔎 Detected: ${detected.title}${detected.season != null ? ` S${detected.season}` : ''}${detected.episode != null ? `E${detected.episode}` : ''}${detected.language ? ` · ${detected.language}` : ''}${detected.quality ? ` · ${detected.quality}` : ''}`;
+}
+
+/**
+ * Buffers a single video into a specific admin's buffer (keyed by bufferChatId).
+ * Used by both the direct-to-bot path and the channel_post path.
+ * Never throws — returns a status object instead.
+ */
+async function bufferVideoItem(bufferChatId, media, msg, source) {
+  if (!adminBuffer[bufferChatId]) adminBuffer[bufferChatId] = [];
+  if (!bufferSeenIds[bufferChatId]) bufferSeenIds[bufferChatId] = new Set();
+
+  const channelId = msg.chat.id;
+  const messageId = msg.message_id;
+  const max = getMaxBuffer(bufferChatId);
+
+  if (adminBuffer[bufferChatId].length >= max) {
+    logWarn('Buffer full — video dropped', { source, bufferChatId, channelId, messageId, max });
+    return { status: 'full', max };
   }
-});
 
-async function handleVideoBuffer(msg, media) {
-  const chatId = msg.chat.id;
-  if (!isAdmin(chatId)) return;
-
-  if (!adminBuffer[chatId]) adminBuffer[chatId] = [];
-  if (!bufferSeenIds[chatId]) bufferSeenIds[chatId] = new Set();
-
-  const max = getMaxBuffer(chatId);
-  if (adminBuffer[chatId].length >= max) {
-    return safeSendMessage(chatId, `⚠️ Buffer full (${max}). Save it with /saveanime, /savemovie or /savewebseries first, or /clearbuffer.`);
-  }
-
-  if (bufferSeenIds[chatId].has(media.file_unique_id)) {
-    return safeSendMessage(chatId, '⚠️ Duplicate video skipped (already in buffer).');
+  if (bufferSeenIds[bufferChatId].has(media.file_unique_id)) {
+    // Requirement 6 — ignore duplicate videos using file_unique_id.
+    logInfo('Duplicate video ignored', { source, bufferChatId, channelId, messageId, fileUniqueId: media.file_unique_id });
+    return { status: 'duplicate' };
   }
 
   const rawText = msg.caption || media.file_name || '';
   const detected = parseMediaInfo(rawText);
 
-  bufferSeenIds[chatId].add(media.file_unique_id);
-  adminBuffer[chatId].push({
+  bufferSeenIds[bufferChatId].add(media.file_unique_id);
+  adminBuffer[bufferChatId].push({
     file_id: media.file_id,
     file_unique_id: media.file_unique_id,
-    channelId: msg.chat.id,
-    messageId: msg.message_id,
+    channelId,
+    messageId,
     fileSizeBytes: media.file_size,
+    mimeType: media.mime_type || null,
     addedAt: Date.now(),
     detected,
   });
 
-  logInfo('Video buffered', { ...userMeta(msg), bufferCount: adminBuffer[chatId].length, detectedTitle: detected.title, detectedS: detected.season, detectedE: detected.episode });
+  const count = adminBuffer[bufferChatId].length;
 
-  const detectedLine = detected.title
-    ? `\n🔎 Detected: ${detected.title}${detected.season != null ? ` S${detected.season}` : ''}${detected.episode != null ? `E${detected.episode}` : ''}${detected.language ? ` · ${detected.language}` : ''}${detected.quality ? ` · ${detected.quality}` : ''}`
-    : '';
-  safeSendMessage(chatId, `✅ Buffered (${adminBuffer[chatId].length}/${max})${detectedLine}`);
+  // Requirement 9 — detailed console logging.
+  logInfo('Video buffered', {
+    source,
+    bufferChatId,
+    channelId,
+    messageId,
+    fileId: media.file_id,
+    fileUniqueId: media.file_unique_id,
+    bufferCount: count,
+    detectedTitle: detected.title,
+    detectedS: detected.season,
+    detectedE: detected.episode,
+  });
+
+  return { status: 'ok', count, max, detected };
+}
+
+// ---- (a) videos sent directly to the bot ------------------------------------
+
+bot.on('video', (msg) => handleDirectVideo(msg, msg.video).catch((err) => logError('video buffer handler failed', err)));
+bot.on('document', (msg) => {
+  const media = extractVideoMedia(msg);
+  if (media) handleDirectVideo(msg, media).catch((err) => logError('document buffer handler failed', err));
+});
+
+async function handleDirectVideo(msg, media) {
+  const chatId = msg.chat.id;
+  if (!isAdmin(chatId)) return;
+
+  const result = await bufferVideoItem(chatId, media, msg, 'direct');
+
+  if (result.status === 'full') {
+    return safeSendMessage(chatId, `⚠️ Buffer full (${result.max}). Save it with /saveanime, /savemovie or /savewebseries first, or /clearbuffer.`);
+  }
+  if (result.status === 'duplicate') {
+    return safeSendMessage(chatId, '⚠️ Duplicate video skipped (already in buffer).');
+  }
+
+  safeSendMessage(chatId, `✅ Buffered (${result.count}/${result.max})${formatDetectedLine(result.detected)}`);
+}
+
+// ---- (b) videos posted in the storage channel --------------------------------
+// node-telegram-bot-api emits 'channel_post' / 'edited_channel_post' as their
+// own top-level events carrying the full message object — it does NOT also
+// emit 'video'/'document' sub-events for them (those only fire for regular
+// 'message' updates), so channel uploads must be handled separately here.
+
+bot.on('channel_post', (msg) => handleChannelVideo(msg, 'channel_post').catch((err) => logError('channel_post buffer handler failed', err)));
+bot.on('edited_channel_post', (msg) => handleChannelVideo(msg, 'edited_channel_post').catch((err) => logError('edited_channel_post buffer handler failed', err)));
+
+async function handleChannelVideo(msg, source) {
+  const channelId = msg.chat.id;
+  if (!isStorageChannel(channelId)) return;
+
+  const media = extractVideoMedia(msg);
+  if (!media) return;
+
+  if (ADMIN_IDS.length === 0) {
+    logWarn('Channel video received but no ADMIN_USER_IDS configured — nothing buffered', { channelId, messageId: msg.message_id });
+    return;
+  }
+
+  // Buffer the video into every admin's personal buffer so whichever admin
+  // later runs /saveanime, /savemovie, /savewebseries, /showbuffer or
+  // /clearbuffer sees it — those commands remain untouched.
+  let primaryResult = null;
+  for (const adminId of ADMIN_IDS) {
+    const result = await bufferVideoItem(adminId, media, msg, source);
+    if (adminId === ADMIN_IDS[0]) primaryResult = result;
+  }
+  if (!primaryResult) return;
+
+  if (primaryResult.status === 'full') {
+    return safeSendMessage(channelId, `⚠️ Buffer full (${primaryResult.max}). Save it with /saveanime, /savemovie or /savewebseries first, or /clearbuffer.`);
+  }
+  if (primaryResult.status === 'duplicate') {
+    return safeSendMessage(channelId, '⚠️ Duplicate video skipped (already in buffer).');
+  }
+
+  safeSendMessage(channelId, `✅ Buffered (${primaryResult.count}/${primaryResult.max})${formatDetectedLine(primaryResult.detected)}`);
 }
 
 // ============================================================================
@@ -858,6 +968,7 @@ async function executeSave(msg, type, argString) {
   if (skippedDuplicateFile + skippedExistingDoc > 0) lines.push(`Skipped Duplicates: ${skippedDuplicateFile + skippedExistingDoc}`);
   if (skippedInvalidSource > 0) lines.push(`Skipped Invalid Source: ${skippedInvalidSource}`);
   lines.push('', `Firestore ID: <code>${toWrite[0]?.id || '—'}</code>`, '', `Time: ${formatDuration(elapsed)}`);
+  lines.push('', '✅ Buffer cleared.');
 
   await safeSendMessage(chatId, lines.join('\n'), {});
 }
