@@ -817,12 +817,13 @@ registerCommand('help', async (msg) => {
     '/clearbuffer — empty the buffer',
     '',
     '<b>Deleting</b> (all ask for confirmation)',
-    '/deleteanime Title',
-    '/devletewebseries Title'.replace('devlete', 'delete'),
-    '/deletemovie Title',
-    '/deleteseason category|Title|Season',
-    '/deleteepisode category|Title|Season|Episode',
-    '/deletetitle docId  <i>or</i>  category|Title',
+    '/deleteanime &lt;docId&gt; — delete whole anime (all seasons)',
+    '/deleteanime season &lt;N&gt; &lt;docId&gt; — delete one season',
+    '/deleteanime episode &lt;S&gt; &lt;E&gt; &lt;docId&gt; — delete one episode',
+    '/deletemovie &lt;docId&gt; — delete that movie',
+    '/deleteseries &lt;docId&gt; — delete whole web series (all seasons)',
+    '/deleteseries season &lt;N&gt; &lt;docId&gt;',
+    '/deleteseries episode &lt;S&gt; &lt;E&gt; &lt;docId&gt;',
     '/deletelanguage category|Language',
     '/deleteallanime',
     '/deleteallmovies',
@@ -1027,7 +1028,7 @@ async function requestConfirmation(chatId, userId, promptText, kind, payload) {
   const sent = await safeSendMessage(chatId, `⚠️ ${promptText}\n\nAre you sure?`, {
     reply_markup: {
       inline_keyboard: [[
-        { text: '✅ Yes', callback_data: `cy:${tok}` },
+        { text: '✅ Delete', callback_data: `cy:${tok}` },
         { text: '❌ Cancel', callback_data: `cn:${tok}` },
       ]],
     },
@@ -1072,7 +1073,7 @@ bot.on('callback_query', async (query) => {
       const elapsed = Date.now() - start;
 
       logSuccess('Delete executed', { userId, chatId, kind: pending.kind, deleteTime: formatDuration(elapsed), removed: result.count });
-      await safeEditMessageText(result.message + `\n\nTime: ${formatDuration(elapsed)}`, {
+      await safeEditMessageText(result.message + `\nExecution Time: ${formatDuration(elapsed)}`, {
         chat_id: chatId,
         message_id: query.message.message_id,
       });
@@ -1103,53 +1104,127 @@ bot.on('callback_query', async (query) => {
 });
 
 // ============================================================================
-// SECTION 15 — DELETE LOGIC (Requirement 4)
 // ============================================================================
+// SECTION 15 — DELETE LOGIC — UNIFIED DELETE SYSTEM
+// ============================================================================
+// One command per category instead of many separate delete commands:
+//   /deleteanime   <docId>                       — whole anime (all seasons)
+//   /deleteanime   season <N> <docId>            — one season
+//   /deleteanime   episode <S> <E> <docId>        — one episode
+//   /deletemovie   <docId>                       — that movie only
+//   /deleteseries  <docId>                       — whole web series
+//   /deleteseries  season <N> <docId>
+//   /deleteseries  episode <S> <E> <docId>
+//
+// The actual Firestore delete operations (batchedDelete / deleteByQuery /
+// invalidateCategoryCaches) are unchanged from before — only how a command
+// resolves category+title (by looking the docId up in Firestore first, then
+// validating it) and routes into those operations is new.
 
 function pluralCategory(category) {
   return category === CATEGORIES.WEBSERIES ? 'Web Series' : category;
 }
 
+const DOC_ID_RE = /^[A-Za-z0-9_-]{3,200}$/;
+
+/** Looks up a document by ID and returns { ref, data }. Friendly 404 error otherwise. */
+async function loadDocForDelete(docId) {
+  assertValid(docId && DOC_ID_RE.test(docId), `That does not look like a valid Firestore document ID: <code>${docId || ''}</code>`);
+  const ref = db.collection(VIDEOS_COLLECTION).doc(docId);
+  const snap = await withRetry(() => ref.get(), { label: 'loadDocForDelete' });
+  assertValid(snap.exists, `Document not found: <code>${docId}</code>. It may have already been deleted.`);
+  return { ref, data: snap.data() || {} };
+}
+
+/** Confirms the looked-up document actually belongs to the category the command targets. */
+function assertCategoryMatches(data, expectedCategory, command) {
+  assertValid(
+    data.category === expectedCategory,
+    `Wrong category — that document is stored as "${data.category || 'unknown'}", but /${command} only deletes ${pluralCategory(expectedCategory)}. Use the matching delete command instead.`
+  );
+}
+
+async function assertSeasonExists(category, title, season) {
+  const snap = await withRetry(
+    () => db.collection(VIDEOS_COLLECTION).where('category', '==', category).where('title', '==', title).where('season', '==', season).limit(1).get(),
+    { label: 'assertSeasonExists' }
+  );
+  assertValid(!snap.empty, `Season not found: "${title}" has no Season ${season}.`);
+}
+
+async function assertEpisodeExists(category, title, season, episode) {
+  const snap = await withRetry(
+    () => db.collection(VIDEOS_COLLECTION)
+      .where('category', '==', category).where('title', '==', title)
+      .where('season', '==', season).where('episode', '==', episode)
+      .limit(1).get(),
+    { label: 'assertEpisodeExists' }
+  );
+  assertValid(!snap.empty, `Episode not found: "${title}" S${season}E${episode} does not exist.`);
+}
+
+/** Builds the standard post-delete summary: Title / Season / Episode / Deleted count / Firestore time. */
+function formatDeleteSummary({ title, category, season, episode, count, firestoreMs, docId, alreadyDeleted }) {
+  const lines = [alreadyDeleted ? '⚠️ <b>Already Deleted</b>' : '🗑 <b>Deleted</b>', ''];
+  lines.push(`Title: ${title || '—'}`);
+  if (category) lines.push(`Category: ${pluralCategory(category)}`);
+  lines.push(`Season: ${season != null ? season : '—'}`);
+  lines.push(`Episode: ${episode != null ? episode : '—'}`);
+  if (docId) lines.push(`Source Doc: <code>${docId}</code>`);
+  lines.push(`Deleted Count: ${count}`);
+  lines.push(`Firestore Time: ${formatDuration(firestoreMs)}`);
+  if (alreadyDeleted) lines.push('', 'Nothing was removed — it looks like this was already deleted.');
+  return lines.join('\n');
+}
+
 async function runDeleteAction(kind, payload) {
+  const fsStart = Date.now();
   switch (kind) {
     case 'deleteEntireTitle': {
-      const { category, title } = payload;
+      const { category, title, docId } = payload;
       const refsByTitle = await withRetry(() => db.collection(VIDEOS_COLLECTION).where('category', '==', category).where('title', '==', title).get());
       const refsBySeriesTitle = await withRetry(() => db.collection(VIDEOS_COLLECTION).where('category', '==', category).where('seriesTitle', '==', title).get());
       const map = new Map();
       refsByTitle.forEach((d) => map.set(d.id, d.ref));
       refsBySeriesTitle.forEach((d) => map.set(d.id, d.ref));
       const count = await batchedDelete([...map.values()]);
+      const firestoreMs = Date.now() - fsStart;
       invalidateCategoryCaches(category);
-      return { count, message: `🗑 <b>Deleted</b>\n\nCategory: ${pluralCategory(category)}\nTitle: ${title}\nEpisodes Removed: ${count}` };
+      return { count, message: formatDeleteSummary({ title, category, season: null, episode: null, count, firestoreMs, docId, alreadyDeleted: count === 0 }) };
     }
     case 'deleteSeason': {
-      const { category, title, season } = payload;
+      const { category, title, season, docId } = payload;
       const count = await deleteByQuery(() =>
         db.collection(VIDEOS_COLLECTION).where('category', '==', category).where('title', '==', title).where('season', '==', season)
       );
+      const firestoreMs = Date.now() - fsStart;
       invalidateCategoryCaches(category);
-      return { count, message: `🗑 <b>Deleted</b>\n\nCategory: ${pluralCategory(category)}\nTitle: ${title}\nSeason: ${season}\nEpisodes Removed: ${count}` };
+      return { count, message: formatDeleteSummary({ title, category, season, episode: null, count, firestoreMs, docId, alreadyDeleted: count === 0 }) };
     }
     case 'deleteEpisode': {
-      const { category, title, season, episode } = payload;
+      const { category, title, season, episode, docId } = payload;
       const count = await deleteByQuery(() =>
         db.collection(VIDEOS_COLLECTION)
           .where('category', '==', category).where('title', '==', title)
           .where('season', '==', season).where('episode', '==', episode)
       );
+      const firestoreMs = Date.now() - fsStart;
       invalidateCategoryCaches(category);
-      return { count, message: `🗑 <b>Deleted</b>\n\nCategory: ${pluralCategory(category)}\nTitle: ${title}\nSeason: ${season}\nEpisode: ${episode}\nRemoved: ${count}` };
+      return { count, message: formatDeleteSummary({ title, category, season, episode, count, firestoreMs, docId, alreadyDeleted: count === 0 }) };
     }
     case 'deleteDoc': {
       const { docId } = payload;
       const ref = db.collection(VIDEOS_COLLECTION).doc(docId);
       const snap = await ref.get();
-      if (!snap.exists) return { count: 0, message: `⚠️ Document <code>${docId}</code> does not exist (already deleted?).` };
+      const firestoreMsMiss = Date.now() - fsStart;
+      if (!snap.exists) {
+        return { count: 0, message: formatDeleteSummary({ title: null, category: null, season: null, episode: null, count: 0, firestoreMs: firestoreMsMiss, docId, alreadyDeleted: true }) };
+      }
       const data = snap.data();
       await ref.delete();
+      const firestoreMs = Date.now() - fsStart;
       invalidateCategoryCaches(data.category);
-      return { count: 1, message: `🗑 <b>Deleted</b>\n\nDocument ID: <code>${docId}</code>\nTitle: ${data.title || '—'}\nCategory: ${data.category || '—'}` };
+      return { count: 1, message: formatDeleteSummary({ title: data.title, category: data.category, season: data.season, episode: data.episode, count: 1, firestoreMs, docId }) };
     }
     case 'deleteLanguage': {
       const { category, language } = payload;
@@ -1170,65 +1245,103 @@ async function runDeleteAction(kind, payload) {
   }
 }
 
-function registerEntireTitleDelete(command, category) {
-  registerCommand(command, async (msg, arg) => {
-    assertValid(arg, `Usage: /${command} Title`);
-    const title = validateTitle(arg);
-    await requestConfirmation(
-      msg.chat.id, msg.from.id,
-      `Delete <b>ALL</b> seasons/episodes of "${title}" in ${pluralCategory(category)}?`,
-      'deleteEntireTitle', { category, title }
-    );
+function unifiedDeleteUsage(command, category) {
+  if (category === CATEGORIES.MOVIES) {
+    return `Usage:\n/${command} &lt;FirestoreDocumentID&gt;`;
+  }
+  return [
+    'Usage:',
+    `/${command} &lt;FirestoreDocumentID&gt; — delete the whole title (all seasons)`,
+    `/${command} season &lt;SeasonNumber&gt; &lt;FirestoreDocumentID&gt;`,
+    `/${command} episode &lt;Season&gt; &lt;Episode&gt; &lt;FirestoreDocumentID&gt;`,
+  ].join('\n');
+}
+
+/**
+ * Registers one unified delete command for a category. Every path validates
+ * the document exists, the category matches, and (for season/episode) that
+ * the season/episode actually exists — before ever asking for confirmation.
+ */
+function registerUnifiedDelete(command, category) {
+  registerCommand(command, async (msg, argString) => {
+    const parts = argString.split(/\s+/).filter(Boolean);
+    assertValid(parts.length > 0, unifiedDeleteUsage(command, category));
+
+    const sub = parts[0].toLowerCase();
+
+    if (sub === 'season') {
+      assertValid(category !== CATEGORIES.MOVIES, `Movies don't have seasons. Usage: /${command} <FirestoreDocumentID>`);
+      assertValid(parts.length === 3, `Usage: /${command} season <SeasonNumber> <FirestoreDocumentID>`);
+      const season = validateSeason(parts[1]);
+      const docId = parts[2];
+
+      const { data } = await loadDocForDelete(docId);
+      assertCategoryMatches(data, category, command);
+      const title = data.title;
+      assertValid(title, `Document <code>${docId}</code> has no title on record.`);
+      await assertSeasonExists(category, title, season);
+
+      await requestConfirmation(
+        msg.chat.id, msg.from.id,
+        `Delete <b>Season ${season}</b> of "${title}" (${pluralCategory(category)})?\n\nSource Doc: <code>${docId}</code>`,
+        'deleteSeason', { category, title, season, docId }
+      );
+      return;
+    }
+
+    if (sub === 'episode') {
+      assertValid(category !== CATEGORIES.MOVIES, `Movies don't have episodes. Usage: /${command} <FirestoreDocumentID>`);
+      assertValid(parts.length === 4, `Usage: /${command} episode <Season> <Episode> <FirestoreDocumentID>`);
+      const season = validateSeason(parts[1]);
+      const episode = validateEpisode(parts[2]);
+      const docId = parts[3];
+
+      const { data } = await loadDocForDelete(docId);
+      assertCategoryMatches(data, category, command);
+      const title = data.title;
+      assertValid(title, `Document <code>${docId}</code> has no title on record.`);
+      await assertSeasonExists(category, title, season);
+      await assertEpisodeExists(category, title, season, episode);
+
+      await requestConfirmation(
+        msg.chat.id, msg.from.id,
+        `Delete <b>S${season}E${episode}</b> of "${title}" (${pluralCategory(category)})?\n\nSource Doc: <code>${docId}</code>`,
+        'deleteEpisode', { category, title, season, episode, docId }
+      );
+      return;
+    }
+
+    // Whole-title mode (anime/webseries) or single-movie mode.
+    assertValid(parts.length === 1, unifiedDeleteUsage(command, category));
+    const docId = parts[0];
+
+    const { data } = await loadDocForDelete(docId);
+    assertCategoryMatches(data, category, command);
+    const title = data.title;
+    assertValid(title, `Document <code>${docId}</code> has no title on record.`);
+
+    if (category === CATEGORIES.MOVIES) {
+      await requestConfirmation(
+        msg.chat.id, msg.from.id,
+        `Delete this movie — "${title}"?\n\nSource Doc: <code>${docId}</code>`,
+        'deleteDoc', { docId }
+      );
+    } else {
+      await requestConfirmation(
+        msg.chat.id, msg.from.id,
+        `Delete <b>ALL</b> seasons/episodes of "${title}" (${pluralCategory(category)})?\n\nSource Doc: <code>${docId}</code>`,
+        'deleteEntireTitle', { category, title, docId }
+      );
+    }
   });
 }
-registerEntireTitleDelete('deleteanime', CATEGORIES.ANIME);
-registerEntireTitleDelete('deletemovie', CATEGORIES.MOVIES);
-registerEntireTitleDelete('deletewebseries', CATEGORIES.WEBSERIES);
 
-registerCommand('deleteseason', async (msg, arg) => {
-  assertValid(arg, 'Usage: /deleteseason category|Title|Season');
-  const [catRaw, titleRaw, seasonRaw] = arg.split('|').map((s) => s.trim());
-  const category = normalizeCategory(catRaw);
-  const title = validateTitle(titleRaw);
-  const season = validateSeason(seasonRaw);
-  await requestConfirmation(
-    msg.chat.id, msg.from.id,
-    `Delete Season ${season} of "${title}" (${pluralCategory(category)})?`,
-    'deleteSeason', { category, title, season }
-  );
-});
+registerUnifiedDelete('deleteanime', CATEGORIES.ANIME);
+registerUnifiedDelete('deletemovie', CATEGORIES.MOVIES);
+registerUnifiedDelete('deleteseries', CATEGORIES.WEBSERIES);
 
-registerCommand('deleteepisode', async (msg, arg) => {
-  assertValid(arg, 'Usage: /deleteepisode category|Title|Season|Episode');
-  const [catRaw, titleRaw, seasonRaw, episodeRaw] = arg.split('|').map((s) => s.trim());
-  const category = normalizeCategory(catRaw);
-  const title = validateTitle(titleRaw);
-  const season = validateSeason(seasonRaw);
-  const episode = validateEpisode(episodeRaw);
-  await requestConfirmation(
-    msg.chat.id, msg.from.id,
-    `Delete S${season}E${episode} of "${title}" (${pluralCategory(category)})?`,
-    'deleteEpisode', { category, title, season, episode }
-  );
-});
-
-registerCommand('deletetitle', async (msg, arg) => {
-  assertValid(arg, 'Usage: /deletetitle docId  OR  /deletetitle category|Title');
-  if (!arg.includes('|')) {
-    const docId = arg.trim();
-    assertValid(/^[A-Za-z0-9_-]{3,200}$/.test(docId), 'That does not look like a valid document ID.');
-    await requestConfirmation(msg.chat.id, msg.from.id, `Delete document <code>${docId}</code>?`, 'deleteDoc', { docId });
-    return;
-  }
-  const [catRaw, titleRaw] = arg.split('|').map((s) => s.trim());
-  const category = normalizeCategory(catRaw);
-  const title = validateTitle(titleRaw);
-  await requestConfirmation(
-    msg.chat.id, msg.from.id,
-    `Delete <b>ALL</b> seasons/episodes of "${title}" in ${pluralCategory(category)}?`,
-    'deleteEntireTitle', { category, title }
-  );
-});
+// ---- untouched: bulk delete-by-language / delete-entire-category ----------
+// (not part of the unified redesign — kept exactly as before)
 
 registerCommand('deletelanguage', async (msg, arg) => {
   assertValid(arg, 'Usage: /deletelanguage category|Language');
@@ -1566,8 +1679,8 @@ registerCommand('find', async (msg, arg) => {
 bot.onText(/^\/(\w+)/, async (msg, match) => {
   const known = new Set([
     'start', 'help', 'saveanime', 'savemovie', 'savewebseries', 'autosave',
-    'deleteanime', 'deletemovie', 'deletewebseries', 'deleteseason', 'deleteepisode',
-    'deletetitle', 'deletelanguage', 'deleteallanime', 'deleteallmovies', 'deleteallwebseries',
+    'deleteanime', 'deletemovie', 'deleteseries',
+    'deletelanguage', 'deleteallanime', 'deleteallmovies', 'deleteallwebseries',
     'listanime', 'listmovies', 'listwebseries', 'stats', 'storage', 'health', 'logs', 'ping',
     'maxbuffer', 'showbuffer', 'clearbuffer', 'find',
   ]);
