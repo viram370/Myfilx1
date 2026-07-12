@@ -5,7 +5,6 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const TelegramBot = require('node-telegram-bot-api');
-const { default: PQueue } = require('p-queue');
 const { getDB, getAdmin } = require('./firebase');
 
 // ============================================================================
@@ -39,10 +38,54 @@ const CONVERT_DIR = path.resolve(__dirname, '../converted');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 if (!fs.existsSync(CONVERT_DIR)) fs.mkdirSync(CONVERT_DIR, { recursive: true });
 
+// ============================================================================
+// LIGHTWEIGHT ZERO-DEPENDENCY CONCURRENT QUEUE MANAGEMENT CLASS
+// ============================================================================
+class TaskQueue {
+  constructor(concurrency) {
+    this.concurrency = concurrency;
+    this.running = 0;
+    this.queue = [];
+  }
+
+  add(fn) {
+    return new Promise((resolve, reject) => {
+      this.queue.push({ fn, resolve, reject });
+      this.next();
+    });
+  }
+
+  next() {
+    while (this.running < this.concurrency && this.queue.length > 0) {
+      const { fn, resolve, reject } = this.queue.shift();
+      this.running++;
+      fn()
+        .then(resolve)
+        .catch(reject)
+        .finally(() => {
+          this.running--;
+          this.next();
+        });
+    }
+  }
+
+  clear() {
+    this.queue = [];
+  }
+
+  get size() {
+    return this.queue.length;
+  }
+
+  get pending() {
+    return this.running;
+  }
+}
+
 // Background Infrastructure Concurrency Pools
-const downloadQueue = new PQueue({ concurrency: 5 });
-const compressionQueue = new PQueue({ concurrency: 2 });
-const uploadQueue = new PQueue({ concurrency: 1 }); // Sequential Upload Order Preservation Guarantee
+const downloadQueue = new TaskQueue(5);
+const compressionQueue = new TaskQueue(2);
+const uploadQueue = new TaskQueue(1); // Sequential Upload Order Preservation Guarantee
 
 let db;
 let botUsername = '';
@@ -98,7 +141,6 @@ async function recoverPendingQueue() {
         const data = doc.data();
         diagLog('queue', `Orphan task matched! Re-routing to background pipeline worker`, { docId: doc.id, step: data.status });
         
-        // Dynamic re-routing entry matrix based on legacy state markers
         if (data.status === 'pending_processing' || data.status === 'downloading') {
           downloadQueue.add(() => managedTaskRetry(() => downloadTaskWorker(doc.id, data, colName), 'download', doc.id, colName));
         } else if (data.status === 'compressing') {
@@ -226,7 +268,6 @@ async function compressionTaskWorker(docId, data, collection, sourcePath) {
   } catch (e) {}
 
   return new Promise((resolve, reject) => {
-    // Replaced exec() shell execution completely with spawn() to protect context bounds and handle memory leaks
     const ffmpegArgs = [
       '-y', '-i', sourcePath,
       '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-profile:v', 'main', '-level', '3.1',
@@ -244,7 +285,6 @@ async function compressionTaskWorker(docId, data, collection, sourcePath) {
     child.stderr.on('data', (buffer) => {
       const dataStr = buffer.toString();
       
-      // Parse dynamic duration data mappings directly from output context if not explicitly passed earlier
       if (!duration) {
         const durMatch = dataStr.match(/Duration:\s*(\d+):(\d+):(\d+)/);
         if (durMatch) {
@@ -265,7 +305,7 @@ async function compressionTaskWorker(docId, data, collection, sourcePath) {
     });
 
     child.on('close', (code) => {
-      cleanFileNode(sourcePath); // Always clean up temporary input immediately following computation closure
+      cleanFileNode(sourcePath);
       if (progressMessageId) bot.deleteMessage(ADMIN_ID, progressMessageId).catch(() => {});
 
       if (code === 0) {
@@ -304,7 +344,6 @@ async function uploadTaskWorker(docId, data, collection, targetPath) {
   try {
     const captionMsg = `${data.title} - S${data.season}E${data.episode} [${data.language}] [${data.quality}]`;
     
-    // Core transmission implementation framework directly to private storage environments
     const uploadedMsg = await bot.sendVideo(STORAGE_CHANNEL_ID, targetPath, {
       caption: captionMsg
     });
@@ -419,7 +458,6 @@ bot.on('message', async (msg) => {
     const parsedSeason = parseInt(state.collected.season, 10) || 1;
 
     try {
-      // Step 1: Prevent duplicate processing matching exact unique file hash marks immediately
       const dupFileCheck = await db.collection(collection)
         .where('file_unique_id', '==', mediaObj.file_unique_id)
         .limit(1)
@@ -431,8 +469,6 @@ bot.on('message', async (msg) => {
         return;
       }
 
-      // Dynamic forward direct optimization detection block
-      // Copies the video instantly to the private storage channel without processing if Telegram permits it
       if (msg.forward_from_chat || msg.chat.type === 'channel') {
         diagLog('telegram api', 'Attempting direct structural link cloning mapping parameters without network routing passes...');
         try {
@@ -444,11 +480,10 @@ bot.on('message', async (msg) => {
             diagLog('telegram api', 'Direct link duplication operation executed successfully.');
             await bot.sendMessage(chatId, `⚡ <b>Direct Forward Copy Succeeded!</b> Skimmed conversion process paths safely.`, { parse_mode: 'HTML' });
             
-            // Register item inside Firestore system models directly
             await db.collection(collection).add({
               title: state.collected.title,
               season: parsedSeason,
-              episode: 999, // Static boundary or placeholder for standalone files transfers configurations mappings
+              episode: 999,
               language: state.collected.language,
               quality: state.collected.quality,
               status: 'completed',
@@ -464,7 +499,6 @@ bot.on('message', async (msg) => {
         }
       }
 
-      // Step 2: ACID Transactions Block to auto-index and allocate unique episode numbers safely
       let nextEpisode = 1;
       const targetDocId = `${collection}_${crypto.randomBytes(4).toString('hex')}`;
       const docRef = db.collection(collection).doc(targetDocId);
@@ -508,7 +542,6 @@ bot.on('message', async (msg) => {
       diagLog('firestore', 'ACID transaction committed safely.', { docId: targetDocId, episode: nextEpisode });
       await bot.sendMessage(chatId, `📥 Staged: <b>Episode ${nextEpisode}</b> for processing sequence arrays pipelines.`, { parse_mode: 'HTML' });
 
-      // Fetch freshly instantiated parameters map payload elements from document target context data values
       const postFetchDoc = await docRef.get();
       runPipelineRouter(targetDocId, postFetchDoc.data(), collection);
 
@@ -552,7 +585,7 @@ registerAdminCommand('admin resume', async (msg) => {
 });
 
 registerAdminCommand('admin retry', async (msg) => {
-  await bot.sendMessage(msg.chat.id, '🔄 Refreshing and re-evaluating broken/failed process components within structural tracking tables...');
+  await bot.sendMessage(msg.chat.id, '🔄 Refreshing and re-evaluating failed process components within structural tracking tables...');
   await recoverPendingQueue();
 });
 
@@ -590,9 +623,6 @@ async function handleSystemShutdown(signal) {
   
   diagLog('shutdown', `Intercepted framework lifecycle shutdown signal intercept node event: ${signal}. Commencing isolation workflows.`);
   queuePaused = true;
-
-  downloadQueue.pause();
-  compressionQueue.pause();
 
   let checkIterations = 0;
   while (activeJobsCount > 0 && checkIterations < 15) {
