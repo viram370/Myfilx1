@@ -171,15 +171,25 @@ router.get('/file/:videoId', fileLimiter, softAuth, async (req, res) => {
     await mtproto.streamRange(video.channelId, video.messageId, start, end, res, {
       onAbort: (fn) => { abortHandler = fn; },
     });
+
+    // streamRange only resolves once it has written exactly the number of
+    // bytes promised in Content-Length (or the client disconnected, in
+    // which case ending an already-closing socket is a harmless no-op).
+    // Only res.end() here, on the verified-good path.
+    if (!res.writableEnded) res.end();
   } catch (err) {
     log.error('fileStream', 'Streaming failed', err, { videoId, range: req.headers.range });
     if (!res.headersSent) {
       if (err instanceof mtproto.MTProtoDisabledError) return res.status(501).json({ error: err.message });
       if (err instanceof ApiValidationError) return res.status(err.status).json({ error: err.message });
-      res.status(500).json({ error: 'Streaming failed' });
-    } else if (!res.writableEnded) {
-      res.end();
+      return res.status(500).json({ error: 'Streaming failed' });
     }
+    // Headers (and a Content-Length promise) were already sent - calling
+    // res.end() here would silently deliver a body shorter than what we
+    // already told the browser to expect, which is exactly the "looks
+    // complete but isn't" response that breaks HTML5 <video> playback.
+    // Destroy the connection instead so the client sees a hard failure.
+    if (!res.writableEnded) res.destroy(err);
   }
 });
 router.head('/file/:videoId', fileLimiter, softAuth, (req, res, next) => {
