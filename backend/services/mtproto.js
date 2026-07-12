@@ -73,6 +73,48 @@ class MTProtoDisabledError extends Error {
     this.name = 'MTProtoDisabledError';
   }
 }
+/**
+ * Thrown when we could not write exactly the number of bytes we already
+ * promised the browser via Content-Length. The caller (routes/stream.js)
+ * MUST destroy the connection on this error rather than end() it - see
+ * streamRange() below for why.
+ */
+class StreamIntegrityError extends Error {
+  constructor(msg) {
+    super(msg);
+    this.name = 'StreamIntegrityError';
+  }
+}
+
+// Each individual Telegram upload.GetFile RPC gets its own timeout, so a
+// single stuck request fails fast and loud instead of hanging silently
+// until the browser gives up and closes the connection.
+const CHUNK_REQUEST_TIMEOUT_MS = 20000;
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Build a ready-to-use Api.InputDocumentFileLocation for a video Document.
+ * client.iterDownload({ file: <Api.Document> }) depends on GramJS's
+ * internal FileLike -> InputFileLocation auto-cast recognizing a bare
+ * Document, which is not reliable across GramJS versions. Building the
+ * location ourselves sidesteps that entirely.
+ */
+function buildFileLocation(doc) {
+  const { Api } = require('telegram');
+  return new Api.InputDocumentFileLocation({
+    id: doc.id,
+    accessHash: doc.accessHash,
+    fileReference: doc.fileReference,
+    thumbSize: '', // '' = full file, not a thumbnail
+  });
+}
 
 function isEnabled() {
   return CONFIGURED;
@@ -257,6 +299,35 @@ async function verifyMessage(channelId, messageId) {
  * Streams bytes [start, end] (inclusive) for a Telegram video document
  * directly into an HTTP response, honoring backpressure and client
  * disconnects, without ever buffering the whole file in memory.
+ *
+ * ---------------------------------------------------------------------
+ * FIX (playback corruption / "Could not play video"): this previously used
+ * client.iterDownload({ limit: bigInt(length), ... }). Two problems:
+ *
+ *  1. GramJS's DownloadIter treats ANY chunk shorter than `requestSize` as
+ *     end-of-stream and stops the generator immediately - even when that
+ *     short chunk lands in the middle of the requested range, not at the
+ *     real end of the file. Telegram can and does return short chunks
+ *     depending on account tier/DC, well before the actual EOF. This is
+ *     exactly what produced the truncated response: the loop would exit
+ *     having written fewer bytes than were requested.
+ *  2. The old `finally` block called res.end() unconditionally, with NO
+ *     check that the bytes actually written matched the Content-Length
+ *     already sent in headers. That produces a response that LOOKS
+ *     complete (right status, right headers) but has a body shorter than
+ *     promised - a classically corrupt HTTP response that HTML5 <video>
+ *     correctly refuses to play, even though bytes were clearly received.
+ *
+ * Fix: drive the download manually with direct upload.GetFile RPCs (the
+ * same low-level primitive GramJS's iterDownload wraps), track bytesSent
+ * ourselves, and verify bytesSent === contentLength before ever calling
+ * res.end(). On mismatch we throw StreamIntegrityError instead - the
+ * caller (routes/stream.js) destroys the connection rather than ending it
+ * normally, so the browser sees a hard failure instead of a silently
+ * truncated "successful" download. Each chunk request also gets its own
+ * timeout so a stuck RPC fails fast instead of hanging until the browser
+ * gives up.
+ * ---------------------------------------------------------------------
  */
 async function streamRange(channelId, messageId, start, end, res, { onAbort } = {}) {
   await acquireSlot();
@@ -270,33 +341,111 @@ async function streamRange(channelId, messageId, start, end, res, { onAbort } = 
 
     const { doc } = await resolveVideoSource(channelId, messageId);
     const bigInt = require('big-integer');
+    const { Api } = require('telegram');
 
-    const length = end - start + 1;
-    const iter = c.iterDownload({
-      file: doc,
-      offset: bigInt(start),
-      limit: bigInt(length),
-      chunkSize: DEFAULT_CHUNK_SIZE,
-      requestSize: DEFAULT_CHUNK_SIZE,
-    });
+    const contentLength = end - start + 1;
 
-    let written = 0;
-    for await (const chunk of iter) {
-      if (aborted || res.destroyed || res.writableEnded) break;
-      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      const ok = res.write(buf);
-      written += buf.length;
-      if (!ok) {
-        await new Promise((resolve) => res.once('drain', resolve));
+    // MTProto requires the offset passed to upload.GetFile to be an exact
+    // multiple of the requested chunk size, so align down to the nearest
+    // chunk boundary and trim the leading bytes of the first chunk to
+    // land exactly on the requested `start`.
+    const alignedStart = start - (start % DEFAULT_CHUNK_SIZE);
+    const skipBytes = start - alignedStart;
+
+    const fileLocation = buildFileLocation(doc);
+
+    let offset = bigInt(alignedStart);
+    let bytesSent = 0;
+    let isFirstChunk = true;
+    let chunkIndex = 0;
+
+    while (!aborted && bytesSent < contentLength) {
+      chunkIndex += 1;
+
+      let result;
+      try {
+        result = await withTimeout(
+          c.invoke(new Api.upload.GetFile({ location: fileLocation, offset, limit: DEFAULT_CHUNK_SIZE })),
+          CHUNK_REQUEST_TIMEOUT_MS,
+          `GetFile chunk#${chunkIndex} offset=${offset.toString()}`
+        );
+      } catch (err) {
+        log.error('streamRange', 'GetFile chunk request failed or timed out', err, {
+          channelId, messageId, chunkIndex, offset: offset.toString(),
+        });
+        throw err;
       }
-      if (written >= length) break;
+
+      if (result.className === 'upload.FileCdnRedirect') {
+        throw new Error('TELEGRAM_CDN_REDIRECT_UNSUPPORTED');
+      }
+
+      const bytes = result.bytes;
+      if (!bytes || bytes.length === 0) {
+        // Genuine end of file - Telegram has nothing more to give us.
+        log.warn('streamRange', 'Telegram returned an empty chunk (end of file)', {
+          channelId, messageId, chunkIndex, bytesSent, contentLength,
+        });
+        break;
+      }
+
+      let piece = bytes;
+      if (isFirstChunk) {
+        isFirstChunk = false;
+        if (skipBytes > 0) piece = piece.subarray(skipBytes);
+      }
+
+      const remaining = contentLength - bytesSent;
+      if (piece.length > remaining) piece = piece.subarray(0, remaining);
+
+      if (piece.length > 0 && !aborted && !res.destroyed && !res.writableEnded) {
+        const ok = res.write(piece);
+        bytesSent += piece.length;
+        if (!ok) {
+          await new Promise((resolve) => res.once('drain', resolve));
+        }
+      }
+
+      offset = offset.add(bytes.length);
+
+      // A chunk shorter than the requested size means Telegram has
+      // genuinely reached the end of the file at this DC/account tier -
+      // there is nothing more to fetch, regardless of how much of the
+      // requested range remains unfilled.
+      if (bytes.length < DEFAULT_CHUNK_SIZE) break;
     }
-  } catch (err) {
-    if (!res.headersSent) throw err;
-    log.error('streamRange', 'Streaming failed mid-response', err, { channelId, messageId, start, end });
+
+    if (aborted) {
+      // Client disconnected mid-stream (paused, seeked again, closed the
+      // tab). The socket is already gone or going away - nothing to
+      // verify or write further.
+      log.info('streamRange', 'Aborted by client disconnect', { channelId, messageId, bytesSent, contentLength });
+      return;
+    }
+
+    if (bytesSent !== contentLength) {
+      // We already promised `contentLength` bytes via Content-Length but
+      // wrote fewer (or more). Ending the response normally here would
+      // silently hand the browser a body that doesn't match the header
+      // it already parsed - exactly the "Could not play video" failure
+      // mode. Throw so the caller destroys the connection instead.
+      const integrityErr = new StreamIntegrityError(
+        `Streamed ${bytesSent} of ${contentLength} promised bytes for ${channelId}:${messageId} ` +
+          `(range ${start}-${end})`
+      );
+      log.error('streamRange', 'Integrity check failed - byte count mismatch', integrityErr, {
+        channelId, messageId, bytesSent, contentLength, start, end,
+      });
+      throw integrityErr;
+    }
+
+    // Success: exactly the promised number of bytes were written. The
+    // caller (routes/stream.js) is responsible for calling res.end() -
+    // streamRange never ends or destroys the response itself on the
+    // success path, so callers always control exactly when/how the
+    // response finishes.
   } finally {
     releaseSlot();
-    if (!res.writableEnded) res.end();
   }
 }
 
@@ -338,4 +487,5 @@ module.exports = {
   SourceNotFoundError,
   MTProtoDisabledError,
   MTProtoValidationError,
+  StreamIntegrityError,
 };
