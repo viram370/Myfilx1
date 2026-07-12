@@ -742,11 +742,26 @@ function toast(msg,ms=2600){
 
 // ── Backend API client ──────────────────────────────
 const API_BASE = window.MYFLIX_API;
-const tgInitData = (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData) || '';
+
+// FIX (systemic 401s on /users/me/continue-watching, /favorites, /history,
+// /stream/:id/progress): initData was previously read ONCE into a
+// top-level const at script-parse time. On Telegram clients where
+// WebApp.initData is populated a tick after this script first runs
+// (observed on some Android/desktop clients), or when the Mini App is
+// resumed/foregrounded and Telegram issues a fresh initData string
+// without a full page reload, that cached const stayed permanently empty
+// or stale - so every requireAuth-gated request silently sent NO auth
+// header at all and the backend correctly (and unavoidably) returned 401,
+// even inside a real, legitimate Telegram session. Reading the live value
+// on every single request removes the race entirely.
+function getTgInitData(){
+  return (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData) || '';
+}
 
 async function api(path,opts={}){
   const headers={'Content-Type':'application/json',...(opts.headers||{})};
-  if(tgInitData) headers['x-telegram-init-data']=tgInitData;
+  const initData=getTgInitData();
+  if(initData) headers['x-telegram-init-data']=initData;
   const res=await fetch(`${API_BASE}${path}`,{...opts,headers});
   if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e.error||`HTTP ${res.status}`);}
   return res.json();
@@ -1035,7 +1050,6 @@ async function playVideo(v){
       Api.getProgress(v.id).catch(()=>({position:0})),
     ]);
 
-    vid.src=streamUrl;
     vid.preload='auto';
 
     vid.addEventListener('loadedmetadata',()=>{
@@ -1055,7 +1069,18 @@ async function playVideo(v){
       </div>`;
     },{once:true});
 
-    vid.load();
+    // FIX (repeated client disconnects / "Could not play video"): assigning
+    // `.src` on a <video> element already triggers the browser's resource
+    // selection algorithm and starts the network request immediately - a
+    // trailing, explicit `.load()` call (as this code previously had)
+    // re-runs that same algorithm, which per the HTML media element spec
+    // ALWAYS aborts whatever load is currently in progress before starting
+    // a new one. That meant every single playback attempt aborted its own
+    // first byte-range request an instant after issuing it, which is
+    // exactly the "server sees bytes requested, browser disconnects after
+    // receiving some bytes" pattern showing up in the logs. Assigning
+    // `.src` is sufficient on its own; no explicit `.load()` is needed.
+    vid.src=streamUrl;
   }catch(err){
     ld.innerHTML=`<div style="text-align:center;padding:20px">
       <div style="font-size:42px;margin-bottom:14px">${catIcon(v.category)}</div>
