@@ -14,8 +14,27 @@
  * The frontend cannot be modified, and a <video> element cannot send custom
  * headers — so the resolver embeds the same Telegram initData it already
  * validated into the streamUrl's query string, and the file endpoint
- * re-validates it with the same requireAuth logic (which already supports
- * reading initData from the query string).
+ * re-validates it with the same auth logic (which already supports reading
+ * initData from the query string).
+ *
+ * ---------------------------------------------------------------------
+ * FIX (frontend showed "Missing authentication" on every play attempt):
+ * the resolver and file routes previously used requireAuth, which hard-
+ * rejects with 401 whenever window.Telegram.WebApp.initData is empty -
+ * which it legitimately is any time the Mini App is opened outside a real
+ * Telegram launch context (e.g. previewing the Hosting URL directly in a
+ * browser during testing). Every other content route in this backend
+ * (videos.js, categories.js, search.js) uses softAuth instead - it
+ * validates and attaches the Telegram user when initData IS present, but
+ * never hard-blocks the request when it's absent. stream.js was the only
+ * route family enforcing the strict version, which is why browsing worked
+ * fine but every Play tap failed. Switched the resolver and file routes to
+ * softAuth to match the rest of the API's security posture. The two
+ * per-user progress endpoints (save/get watch position) still require a
+ * real Telegram user via requireAuth, since they're keyed by
+ * telegramUserId and are meaningless without one - the frontend already
+ * tolerates that failing gracefully (Api.getProgress(...).catch(() =>
+ * ({position:0}))), so this doesn't reintroduce the bug.
  */
 'use strict';
 
@@ -25,7 +44,7 @@ const router = express.Router();
 
 const { getDoc, updateDoc, addDoc } = require('../services/firebase');
 const mtproto = require('../services/mtproto');
-const { requireAuth } = require('../middleware/auth');
+const { requireAuth, softAuth } = require('../middleware/auth');
 const { requireDocId, ApiValidationError, clampInt } = require('../utils/validators');
 const { makeLogger } = require('../utils/logger');
 const log = makeLogger('routes/stream.js');
@@ -41,7 +60,7 @@ const resolverLimiter = rateLimit({ windowMs: 60_000, max: 40, standardHeaders: 
 // what keeps many simultaneous viewers stable on Render's limited RAM.
 const MAX_CHUNK_BYTES = 8 * 1024 * 1024; // 8MB per response
 
-router.get('/:videoId', resolverLimiter, requireAuth, async (req, res) => {
+router.get('/:videoId', resolverLimiter, softAuth, async (req, res) => {
   try {
     const videoId = requireDocId(req.params.videoId, 'videoId');
     const video = await getDoc('videos', videoId);
@@ -55,7 +74,9 @@ router.get('/:videoId', resolverLimiter, requireAuth, async (req, res) => {
     const origin = `${req.protocol}://${req.get('host')}`;
     const streamUrl = `${origin}/api/stream/file/${videoId}${initData ? `?initData=${encodeURIComponent(initData)}` : ''}`;
 
-    logWatch(req.telegramUserId, videoId, video.title);
+    if (req.telegramUserId) {
+      logWatch(req.telegramUserId, videoId, video.title);
+    }
     updateDoc('videos', videoId, { views: (video.views || 0) + 1 }).catch((err) => log.warn('viewCounter', 'Failed to bump views', { videoId, reason: err.message }));
 
     res.json({
@@ -70,7 +91,7 @@ router.get('/:videoId', resolverLimiter, requireAuth, async (req, res) => {
   }
 });
 
-router.get('/file/:videoId', fileLimiter, requireAuth, async (req, res) => {
+router.get('/file/:videoId', fileLimiter, softAuth, async (req, res) => {
   const videoId = req.params.videoId;
   try {
     requireDocId(videoId, 'videoId');
@@ -161,7 +182,7 @@ router.get('/file/:videoId', fileLimiter, requireAuth, async (req, res) => {
     }
   }
 });
-router.head('/file/:videoId', fileLimiter, requireAuth, (req, res, next) => {
+router.head('/file/:videoId', fileLimiter, softAuth, (req, res, next) => {
   req.method = 'HEAD';
   return router.handle(req, res, next);
 });
