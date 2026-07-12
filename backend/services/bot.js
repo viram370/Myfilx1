@@ -1,1707 +1,622 @@
-/**
- * ============================================================================
- *  MYFLIX ADMIN BOT — bot.js
- * ============================================================================
- *  Production-grade Telegram admin bot for the MYFLIX platform.
- *
- *  Stack:
- *    - node-telegram-bot-api (webhook mode, driven by ../routes/webhook.js)
- *    - Firebase Admin SDK / Firestore (via ./firebase.js -> getDB / getAdmin)
- *    - Designed to run inside an Express app on Render
- *
- *  Exports (kept 100% compatible with the existing server.js / webhook.js /
- *  middleware/auth.js consumers):
- *    - initBot()               -> sets the Telegram webhook, boots the bot
- *    - isAdmin(chatId)         -> boolean admin check
- *    - processUpdate(update)   -> feeds a raw Telegram update into the bot
- *
- *  Firestore index design note (Requirement 5 — "auto indexes"):
- *  --------------------------------------------------------------------------
- *  Firestore automatically maintains a single-field index for every field,
- *  and it can resolve *any* combination of pure equality ("==") filters
- *  using those single-field indexes without a manual composite index.
- *  A composite index is only required when a query mixes an equality
- *  filter with a range/orderBy on a *different* field.
- *
- *  Every query in this file is deliberately written to avoid that
- *  situation: list/filter queries use equality-only filters and sort the
- *  (small, capped) result set in memory, while range/orderBy queries
- *  (stats, "largest video", "last upload", "uploads today") only ever use
- *  a single field. The net effect is that this bot never needs a manual
- *  composite index. As a safety net, saveIndexAwareError() below detects
- *  Firestore's FAILED_PRECONDITION "missing index" error and surfaces the
- *  one-click index-creation link Firestore itself generates, straight to
- *  the admin chat and the console logs.
- * ============================================================================
- */
-
 'use strict';
 
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
 const TelegramBot = require('node-telegram-bot-api');
+const { default: PQueue } = require('p-queue');
 const { getDB, getAdmin } = require('./firebase');
-const { parseMediaInfo } = require('./parser');
-const mtproto = require('./mtproto');
 
 // ============================================================================
-// SECTION 1 — CONFIG & CONSTANTS
+// STAGE 1 — STARTUP VALIDATION & ENVIRONMENT CONFIGURATION
 // ============================================================================
+console.log(`[${new Date().toISOString()}] [STARTUP] Validating environment configurations...`);
+
+const REQUIRED_ENV = ['TELEGRAM_BOT_TOKEN', 'STORAGE_CHANNEL_ID', 'ADMIN_USER_IDS'];
+const missingEnv = REQUIRED_ENV.filter(key => !process.env[key]);
+if (missingEnv.length > 0) {
+  console.error(`[${new Date().toISOString()}] [STARTUP] CRITICAL ERROR: Missing vital environment keys: ${missingEnv.join(', ')}`);
+  process.exit(1);
+}
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const BASE_URL = process.env.RENDER_EXTERNAL_URL || process.env.TELEGRAM_WEBHOOK_URL;
-const ADMIN_IDS = (process.env.ADMIN_USER_IDS || '')
-  .split(',')
-  .map((s) => Number(String(s).trim()))
-  .filter((n) => Number.isFinite(n) && n !== 0);
+const STORAGE_CHANNEL_ID = Number(process.env.STORAGE_CHANNEL_ID);
+const ADMIN_ID = Number(process.env.ADMIN_USER_IDS.split(',')[0].trim());
 
-// Optional: restrict auto-buffering to one specific storage channel. If unset,
-// any channel_post the bot receives is trusted (Telegram only delivers
-// channel_post updates for channels the bot is an administrator of).
-const STORAGE_CHANNEL_ID = process.env.STORAGE_CHANNEL_ID
-  ? Number(process.env.STORAGE_CHANNEL_ID)
-  : null;
+const COLLECTION_MAP = {
+  'anime': 'anime',
+  'webseries': 'webseries',
+  'anime-movie': 'animeMovies',
+  'movie': 'movies'
+};
 
-const CATEGORIES = Object.freeze({
-  ANIME: 'Anime',
-  MOVIES: 'Movies',
-  WEBSERIES: 'Web Series',
-});
+const UPLOAD_DIR = path.resolve(__dirname, '../uploads');
+const CONVERT_DIR = path.resolve(__dirname, '../converted');
 
-const CATEGORY_CODE = { [CATEGORIES.ANIME]: 'A', [CATEGORIES.MOVIES]: 'M', [CATEGORIES.WEBSERIES]: 'W' };
-const CODE_CATEGORY = { A: CATEGORIES.ANIME, M: CATEGORIES.MOVIES, W: CATEGORIES.WEBSERIES };
-const TYPE_CATEGORY = { anime: CATEGORIES.ANIME, movie: CATEGORIES.MOVIES, webseries: CATEGORIES.WEBSERIES };
+// Ensure working disk nodes are allocated cleanly at boot
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+if (!fs.existsSync(CONVERT_DIR)) fs.mkdirSync(CONVERT_DIR, { recursive: true });
 
-const VIDEOS_COLLECTION = 'videos';
+// Background Infrastructure Concurrency Pools
+const downloadQueue = new PQueue({ concurrency: 5 });
+const compressionQueue = new PQueue({ concurrency: 2 });
+const uploadQueue = new PQueue({ concurrency: 1 }); // Sequential Upload Order Preservation Guarantee
 
-const DEFAULT_MAX_BUFFER = 150;
-const HARD_MAX_BUFFER = 500;
-
-const RATE_LIMIT_WINDOW_MS = 10_000;
-const RATE_LIMIT_MAX_COMMANDS = 20;
-
-const PENDING_ACTION_TTL_MS = 2 * 60_000;
-const PENDING_CLEANUP_INTERVAL_MS = 60_000;
-
-const CACHE_TTL_MS = 20_000;
-const LIST_CACHE_TTL_MS = 30_000;
-const LIST_PAGE_SIZE = 8;
-const LIST_FETCH_LIMIT = 500;
-
-const FIND_RESULT_LIMIT = 15;
-const IN_QUERY_CHUNK = 10;
-const BATCH_WRITE_LIMIT = 450; // stay under Firestore's 500 op/batch hard cap
-const GET_ALL_CHUNK = 300;
-const DELETE_QUERY_PAGE = 400;
-
-const LOG_RING_SIZE = 200;
-
-// ============================================================================
-// SECTION 2 — LOG RING BUFFER & LOGGER
-// ============================================================================
-
-const LOG_RING = [];
-
-function pushLog(level, message) {
-  LOG_RING.push({ t: Date.now(), level, message });
-  if (LOG_RING.length > LOG_RING_SIZE) LOG_RING.shift();
-}
-
-function fmtMeta(meta) {
-  if (!meta || Object.keys(meta).length === 0) return '';
-  const parts = Object.entries(meta)
-    .filter(([, v]) => v !== undefined && v !== null && v !== '')
-    .map(([k, v]) => `${k}=${v}`);
-  return parts.length ? ` | ${parts.join(' ')}` : '';
-}
-
-function logSuccess(msg, meta) {
-  const line = `✅ ${msg}${fmtMeta(meta)}`;
-  console.log(line);
-  pushLog('success', line);
-}
-function logWarn(msg, meta) {
-  const line = `⚠️ ${msg}${fmtMeta(meta)}`;
-  console.warn(line);
-  pushLog('warn', line);
-}
-function logError(msg, err, meta) {
-  const line = `❌ ${msg}${fmtMeta(meta)}${err ? ` | ${err.message}` : ''}`;
-  console.error(line);
-  if (err && err.stack) console.error(err.stack);
-  pushLog('error', line + (err && err.stack ? `\n${err.stack}` : ''));
-}
-function logInfo(msg, meta) {
-  const line = `ℹ️ ${msg}${fmtMeta(meta)}`;
-  console.log(line);
-  pushLog('info', line);
-}
-
-// ============================================================================
-// SECTION 3 — GENERIC UTILITIES
-// ============================================================================
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function slugify(str) {
-  return String(str)
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/(^-+|-+$)/g, '')
-    .slice(0, 80) || 'untitled';
-}
-
-function formatBytes(bytes) {
-  if (!bytes || bytes <= 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let i = 0;
-  let n = bytes;
-  while (n >= 1024 && i < units.length - 1) {
-    n /= 1024;
-    i++;
-  }
-  return `${n.toFixed(n >= 10 || i === 0 ? 0 : 2)} ${units[i]}`;
-}
-
-function formatDuration(ms) {
-  if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(2)}s`;
-}
-
-function formatUptime(seconds) {
-  const d = Math.floor(seconds / 86400);
-  const h = Math.floor((seconds % 86400) / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  return `${d}d ${h}h ${m}m ${s}s`;
-}
-
-function toMillis(ts) {
-  if (!ts) return 0;
-  if (typeof ts.toMillis === 'function') return ts.toMillis();
-  if (ts instanceof Date) return ts.getTime();
-  if (typeof ts === 'number') return ts;
-  return 0;
-}
-
-function shortToken() {
-  return crypto.randomBytes(5).toString('hex'); // 10 chars
-}
-
-function chunkArray(arr, size) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
-}
-
-function isTransientError(err) {
-  if (!err) return false;
-  const code = err.code;
-  const transientCodes = new Set([4, 8, 10, 13, 14, 'unavailable', 'deadline-exceeded', 'aborted', 'internal', 'resource-exhausted']);
-  const transientMsgs = ['ECONNRESET', 'ETIMEDOUT', 'socket hang up', 'UNAVAILABLE'];
-  if (transientCodes.has(code)) return true;
-  if (err.message && transientMsgs.some((m) => err.message.includes(m))) return true;
-  return false;
-}
-
-async function withRetry(fn, { retries = 3, baseDelayMs = 300, label = 'operation' } = {}) {
-  let attempt = 0;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    try {
-      return await fn();
-    } catch (err) {
-      attempt++;
-      if (attempt > retries || !isTransientError(err)) throw err;
-      const delay = baseDelayMs * 2 ** (attempt - 1) + Math.floor(Math.random() * 150);
-      logWarn(`Retrying ${label} (attempt ${attempt}/${retries}) after transient error`, { reason: err.message });
-      await sleep(delay);
-    }
-  }
-}
-
-async function withTimeout(promise, ms, label = 'operation') {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`⏱ Timeout after ${ms}ms: ${label}`)), ms);
-  });
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-class ValidationError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'ValidationError';
-  }
-}
-
-function assertValid(condition, message) {
-  if (!condition) throw new ValidationError(message);
-}
-
-// ============================================================================
-// SECTION 4 — VALIDATION
-// ============================================================================
-
-function validateTitle(title) {
-  const t = String(title || '').trim();
-  assertValid(t.length >= 1 && t.length <= 200, 'Title must be 1-200 characters.');
-  assertValid(!t.includes('|'), 'Title cannot contain the "|" character.');
-  return t;
-}
-
-function validateSeason(season) {
-  const n = parseInt(season, 10);
-  assertValid(Number.isInteger(n) && n >= 1 && n <= 999, 'Season must be a whole number between 1 and 999.');
-  return n;
-}
-
-function validateEpisode(episode) {
-  const n = parseInt(episode, 10);
-  assertValid(Number.isInteger(n) && n >= 1 && n <= 9999, 'Episode must be a whole number between 1 and 9999.');
-  return n;
-}
-
-function validateLanguage(language) {
-  const l = String(language || '').trim();
-  assertValid(l.length >= 1 && l.length <= 60, 'Language must be 1-60 characters.');
-  assertValid(/^[\p{L}\p{N}\s,/-]+$/u.test(l), 'Language contains invalid characters.');
-  return l;
-}
-
-function validateChannelId(channelId) {
-  const n = Number(channelId);
-  assertValid(Number.isInteger(n) && n !== 0, 'Invalid channelId.');
-  return n;
-}
-
-function validateMessageId(messageId) {
-  const n = Number(messageId);
-  assertValid(Number.isInteger(n) && n > 0, 'Invalid messageId.');
-  return n;
-}
-
-function normalizeCategory(input) {
-  const raw = String(input || '').trim().toLowerCase();
-  if (['anime', 'a', 'animes'].includes(raw)) return CATEGORIES.ANIME;
-  if (['movie', 'movies', 'm'].includes(raw)) return CATEGORIES.MOVIES;
-  if (['webseries', 'web series', 'web-series', 'series', 'w', 'ws'].includes(raw)) return CATEGORIES.WEBSERIES;
-  throw new ValidationError('Category must be one of: anime, movie, webseries.');
-}
-
-function typeForCategory(category) {
-  if (category === CATEGORIES.ANIME) return 'anime';
-  if (category === CATEGORIES.MOVIES) return 'movie';
-  return 'webseries';
-}
-
-// ============================================================================
-// SECTION 5 — RUNTIME STATE
-// ============================================================================
-
-/** @type {Record<number, Array<{file_id:string,file_unique_id:string,channelId:number,messageId:number,fileSizeBytes?:number,mimeType?:string|null,addedAt:number}>>} */
-const adminBuffer = {};
-/** @type {Record<number, Set<string>>} */
-const bufferSeenIds = {};
-/** @type {Record<number, number>} */
-const maxBufferByChat = {};
-
-/** @type {Map<string, {chatId:number, userId:number, kind:string, payload:any, createdAt:number, promptMessageId:number}>} */
-const pendingActions = new Map();
-
-/** @type {Map<string, {docs:any[], fetchedAt:number}>} */
-const listCache = new Map();
-
-/** @type {Map<string, {value:any, fetchedAt:number}>} */
-const genericCache = new Map();
-
-/** @type {Map<number, {count:number, windowStart:number}>} */
-const rateLimitState = new Map();
-
-const BOT_START_TIME = Date.now();
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of pendingActions.entries()) {
-    if (now - v.createdAt > PENDING_ACTION_TTL_MS) pendingActions.delete(k);
-  }
-  for (const [k, v] of listCache.entries()) {
-    if (now - v.fetchedAt > LIST_CACHE_TTL_MS * 3) listCache.delete(k);
-  }
-  for (const [k, v] of genericCache.entries()) {
-    if (now - v.fetchedAt > CACHE_TTL_MS * 3) genericCache.delete(k);
-  }
-}, PENDING_CLEANUP_INTERVAL_MS).unref?.();
-
-function getCache(key) {
-  const hit = genericCache.get(key);
-  if (hit && Date.now() - hit.fetchedAt < CACHE_TTL_MS) return hit.value;
-  return null;
-}
-function setCache(key, value) {
-  genericCache.set(key, { value, fetchedAt: Date.now() });
-}
-function invalidateCategoryCaches(category) {
-  genericCache.delete('stats');
-  genericCache.delete('storage');
-  if (category) listCache.delete(`list:${CATEGORY_CODE[category]}`);
-}
-
-// ============================================================================
-// SECTION 6 — BOT INSTANCE
-// ============================================================================
-
-if (!token) {
-  logError('TELEGRAM_BOT_TOKEN is not set — bot cannot start', new Error('Missing TELEGRAM_BOT_TOKEN'));
-}
-
-const bot = new TelegramBot(token, { webHook: true });
 let db;
 let botUsername = '';
+const userState = new Map();
+let queuePaused = false;
+let activeJobsCount = 0;
+let isShuttingDown = false;
+
+// Unified Central Logging System
+function diagLog(stage, message, meta = {}) {
+  const ts = new Date().toISOString();
+  const metaStr = Object.keys(meta).length ? ` | Meta: ${JSON.stringify(meta)}` : '';
+  console.log(`[${ts}] [${stage.toUpperCase()}] ${message}${metaStr}`);
+}
+
+// ============================================================================
+// STAGE 2 — INITIALIZATION & AUTOMATIC QUEUE RECOVERY
+// ============================================================================
+const bot = new TelegramBot(token, { webHook: true });
 
 async function initBot() {
   try {
     db = getDB();
+    diagLog('startup', 'Firestore reference captured successfully.');
 
-    if (!BASE_URL) {
-      logError('Missing webhook base URL (RENDER_EXTERNAL_URL / TELEGRAM_WEBHOOK_URL)', new Error('Missing base URL'));
-      return;
+    if (BASE_URL) {
+      const webhookUrl = `${BASE_URL.replace(/\/+$/, '')}/webhook`;
+      await bot.setWebHook(webhookUrl, { secret_token: process.env.WEBHOOK_SECRET, drop_pending_updates: true });
+      diagLog('webhook', 'Webhook setup registration complete', { url: webhookUrl });
     }
 
-    const webhookUrl = `${BASE_URL.replace(/\/+$/, '')}/webhook`;
-    await withRetry(
-      () => bot.setWebHook(webhookUrl, { secret_token: process.env.WEBHOOK_SECRET, drop_pending_updates: true }),
-      { retries: 3, label: 'setWebHook' }
-    );
-    logSuccess('Webhook registered', { url: webhookUrl });
+    const me = await bot.getMe();
+    botUsername = me?.username || 'Bot';
+    diagLog('startup', `Identity verified under handle: @${botUsername}`);
 
-    try {
-      const me = await bot.getMe();
-      botUsername = me?.username || '';
-      logInfo('Bot identity resolved', { username: botUsername, id: me?.id });
-    } catch (err) {
-      logWarn('Could not resolve bot identity via getMe()', { reason: err.message });
-    }
-
-    logSuccess('MYFLIX Admin Bot started', { admins: ADMIN_IDS.length });
+    // Automatically recover interlocked files processing loops upon boot initialization
+    await recoverPendingQueue();
   } catch (err) {
-    logError('initBot() failed', err);
+    diagLog('errors', 'Failed framework bootstrapping within initBot() context', { error: err.message });
+  }
+}
+
+async function recoverPendingQueue() {
+  diagLog('queue', 'Scanning Firestore records to identify orphan items requiring active recovery...');
+  try {
+    for (const colName of Object.values(COLLECTION_MAP)) {
+      const snapshot = await db.collection(colName)
+        .where('status', 'in', ['pending_processing', 'downloading', 'compressing', 'uploading'])
+        .get();
+
+      snapshot.forEach(doc => {
+        if (isShuttingDown) return;
+        const data = doc.data();
+        diagLog('queue', `Orphan task matched! Re-routing to background pipeline worker`, { docId: doc.id, step: data.status });
+        
+        // Dynamic re-routing entry matrix based on legacy state markers
+        if (data.status === 'pending_processing' || data.status === 'downloading') {
+          downloadQueue.add(() => managedTaskRetry(() => downloadTaskWorker(doc.id, data, colName), 'download', doc.id, colName));
+        } else if (data.status === 'compressing') {
+          const ext = data.mimeType === 'video/x-matroska' ? 'mkv' : 'mp4';
+          const downloadPath = path.join(UPLOAD_DIR, `${doc.id}.${ext}`);
+          compressionQueue.add(() => managedTaskRetry(() => compressionTaskWorker(doc.id, data, colName, downloadPath), 'compression', doc.id, colName));
+        } else if (data.status === 'uploading') {
+          const targetPath = path.join(CONVERT_DIR, `${doc.id}.mp4`);
+          uploadQueue.add(() => managedTaskRetry(() => uploadTaskWorker(doc.id, data, colName, targetPath), 'upload', doc.id, colName));
+        }
+      });
+    }
+  } catch (err) {
+    diagLog('errors', 'Queue state synchronization scanning phase crash', { error: err.message });
   }
 }
 
 function isAdmin(chatId) {
-  return ADMIN_IDS.includes(Number(chatId));
+  return Number(chatId) === ADMIN_ID;
 }
 
-// ---- global safety nets (Requirement 1) -----------------------------------
-
-process.on('uncaughtException', (err) => {
-  logError('uncaughtException — bot kept alive', err);
-});
-process.on('unhandledRejection', (reason) => {
-  const err = reason instanceof Error ? reason : new Error(String(reason));
-  logError('unhandledRejection — bot kept alive', err);
-});
-
-bot.on('polling_error', (err) => logError('Telegram polling_error', err));
-bot.on('webhook_error', (err) => logError('Telegram webhook_error', err));
-bot.on('error', (err) => logError('Telegram generic error', err));
-
 // ============================================================================
-// SECTION 7 — SAFE TELEGRAM HELPERS
+// STAGE 3 — DISTRIBUTED WORKER ENGINES & COMPRESSION PIPELINES
 // ============================================================================
-
-async function safeSendMessage(chatId, text, options = {}) {
-  try {
-    return await bot.sendMessage(chatId, text, { parse_mode: 'HTML', disable_web_page_preview: true, ...options });
-  } catch (err) {
-    logError('safeSendMessage failed', err, { chatId });
-    return null;
+async function runPipelineRouter(docId, data, collection) {
+  if (queuePaused || isShuttingDown) {
+    diagLog('queue', 'Task held or rejected. Execution pool constrained.', { docId, queuePaused, isShuttingDown });
+    return;
   }
+  downloadQueue.add(() => managedTaskRetry(() => downloadTaskWorker(docId, data, collection), 'download', docId, collection));
 }
 
-async function safeEditMessageText(text, options = {}) {
+async function managedTaskRetry(taskFn, stageName, docId, collection, attempt = 1) {
+  activeJobsCount++;
   try {
-    return await bot.editMessageText(text, { parse_mode: 'HTML', disable_web_page_preview: true, ...options });
+    const result = await taskFn();
+    activeJobsCount = Math.max(0, activeJobsCount - 1);
+    return result;
   } catch (err) {
-    // "message is not modified" is harmless (e.g. refresh with identical content)
-    if (!/message is not modified/i.test(err.message)) {
-      logError('safeEditMessageText failed', err);
+    activeJobsCount = Math.max(0, activeJobsCount - 1);
+    diagLog('retry', `Operational execution fault caught at stage [${stageName}]. Attempt ${attempt}/3`, { docId, error: err.message });
+    
+    if (attempt < 3 && !isShuttingDown) {
+      return await managedTaskRetry(taskFn, stageName, docId, collection, attempt + 1);
+    } else {
+      diagLog('errors', `Max transactional fault thresholds breached on task stage [${stageName}]. Halting updates pipeline.`, { docId });
+      queuePaused = true;
+      await db.collection(collection).doc(docId).update({ status: 'failed_pipeline', lastError: err.message });
+      
+      bot.sendMessage(ADMIN_ID, `❌ <b>Pipeline Execution Halted!</b>\nStage [${stageName}] failed after max retries.\nDoc ID: <code>${docId}</code>\nError: ${err.message}\nResolve using /admin resume after inspection.`, { parse_mode: 'HTML' });
+      throw err;
     }
-    return null;
   }
 }
 
-async function safeAnswerCallback(callbackQueryId, options = {}) {
+async function downloadTaskWorker(docId, data, collection) {
+  diagLog('download', 'Beginning asset extraction sequence...', { docId });
+  const ext = data.mimeType === 'video/x-matroska' ? 'mkv' : 'mp4';
+  const downloadPath = path.join(UPLOAD_DIR, `${docId}.${ext}`);
+  
+  await db.collection(collection).doc(docId).update({ status: 'downloading', updatedAt: getAdmin().firestore.FieldValue.serverTimestamp() });
+
+  let progressMessageId = null;
   try {
-    await bot.answerCallbackQuery(callbackQueryId, options);
-  } catch (err) {
-    logError('safeAnswerCallback failed', err);
+    const statusText = await bot.sendMessage(ADMIN_ID, `📥 Starting download for ${data.title} S${data.season}...`);
+    progressMessageId = statusText.message_id;
+  } catch (e) {
+    diagLog('telegram api', 'Status push target unreachable', { error: e.message });
   }
+
+  return new Promise((resolve, reject) => {
+    const fileStream = fs.createWriteStream(downloadPath);
+    const telegramStream = bot.getFileStream(data.telegram_file_id);
+    
+    let downloadedBytes = 0;
+    let lastUpdateTs = 0;
+
+    telegramStream.on('data', (chunk) => {
+      downloadedBytes += chunk.length;
+      const now = Date.now();
+      if (data.fileSizeBytes && now - lastUpdateTs > 4000) {
+        lastUpdateTs = now;
+        const pct = Math.floor((downloadedBytes / data.fileSizeBytes) * 100);
+        bot.editMessageText(`📥 Downloading progress tracking status: <b>${pct}%</b> completed.`, { chat_id: ADMIN_ID, message_id: progressMessageId, parse_mode: 'HTML' }).catch(() => {});
+      }
+    });
+
+    telegramStream.pipe(fileStream);
+
+    fileStream.on('finish', () => {
+      fileStream.close();
+      diagLog('download', 'Asset downloaded completely onto disk node buffers.', { downloadPath });
+      if (progressMessageId) bot.deleteMessage(ADMIN_ID, progressMessageId).catch(() => {});
+      
+      compressionQueue.add(() => managedTaskRetry(() => compressionTaskWorker(docId, data, collection, downloadPath), 'compression', docId, collection));
+      resolve();
+    });
+
+    fileStream.on('error', (err) => {
+      fileStream.close();
+      cleanFileNode(downloadPath);
+      if (progressMessageId) bot.deleteMessage(ADMIN_ID, progressMessageId).catch(() => {});
+      reject(err);
+    });
+    
+    telegramStream.on('error', (err) => {
+      fileStream.close();
+      cleanFileNode(downloadPath);
+      if (progressMessageId) bot.deleteMessage(ADMIN_ID, progressMessageId).catch(() => {});
+      reject(err);
+    });
+  });
 }
 
-function userMeta(msg) {
-  return {
-    userId: msg.from?.id,
-    username: msg.from?.username ? `@${msg.from.username}` : msg.from?.first_name,
-    chatId: msg.chat?.id,
-  };
-}
+async function compressionTaskWorker(docId, data, collection, sourcePath) {
+  diagLog('compression', 'Initializing FFmpeg pipeline mapping interfaces...', { docId });
+  const targetPath = path.join(CONVERT_DIR, `${docId}.mp4`);
+  
+  await db.collection(collection).doc(docId).update({ status: 'compressing', updatedAt: getAdmin().firestore.FieldValue.serverTimestamp() });
 
-function friendlyError(err) {
-  if (err instanceof ValidationError) return `⚠️ ${err.message}`;
-  return `❌ Something went wrong: ${err.message}\nThe error has been logged — please try again.`;
-}
+  let progressMessageId = null;
+  try {
+    const msg = await bot.sendMessage(ADMIN_ID, `⏳ Encoding stream pipeline elements for ${data.title} Ep ${data.episode}...`);
+    progressMessageId = msg.message_id;
+  } catch (e) {}
 
-// Detects Firestore's own "create this index" links (Requirement 5 fallback).
-function surfaceIndexLink(chatId, err) {
-  if (err && typeof err.message === 'string' && /index/i.test(err.message) && /https?:\/\//.test(err.message)) {
-    const url = err.message.match(/https?:\/\/\S+/)?.[0];
-    logWarn('Firestore requested a composite index — one-click link below', { url });
-    if (url) safeSendMessage(chatId, `⚠️ Firestore needs an index for this query.\nCreate it here (one click):\n${url}`);
-    return true;
-  }
-  return false;
-}
+  return new Promise((resolve, reject) => {
+    // Replaced exec() shell execution completely with spawn() to protect context bounds and handle memory leaks
+    const ffmpegArgs = [
+      '-y', '-i', sourcePath,
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-profile:v', 'main', '-level', '3.1',
+      '-movflags', '+faststart',
+      '-c:a', 'aac', '-b:a', '128k',
+      targetPath
+    ];
 
-// ============================================================================
-// SECTION 8 — RATE LIMITING & COMMAND WRAPPER
-// ============================================================================
+    diagLog('ffmpeg', 'Spawning sub-process instances dynamically matching properties', { args: ffmpegArgs.join(' ') });
+    const child = spawn('ffmpeg', ffmpegArgs);
 
-function checkRateLimit(userId) {
-  const now = Date.now();
-  const state = rateLimitState.get(userId);
-  if (!state || now - state.windowStart > RATE_LIMIT_WINDOW_MS) {
-    rateLimitState.set(userId, { count: 1, windowStart: now });
-    return true;
-  }
-  state.count++;
-  return state.count <= RATE_LIMIT_MAX_COMMANDS;
-}
+    let duration = data.duration || 0;
+    let lastProgressTs = 0;
 
-function cmdRegex(name) {
-  return new RegExp(`^\\/${name}(?:@\\w+)?(?:\\s+([\\s\\S]+))?$`, 'i');
-}
-
-/**
- * Registers an admin command with unified logging, auth, rate limiting,
- * timing and error handling. `handler(msg, argString)` may throw —
- * ValidationError becomes a friendly warning, anything else is logged with
- * a full stack trace and reported back without ever crashing the process.
- */
-function registerCommand(name, handler, { adminOnly = true } = {}) {
-  bot.onText(cmdRegex(name), async (msg, match) => {
-    const start = Date.now();
-    const meta = userMeta(msg);
-    const argString = (match && match[1]) ? match[1].trim() : '';
-
-    try {
-      if (adminOnly && !isAdmin(meta.chatId)) {
-        logWarn(`Unauthorized access attempt: /${name}`, meta);
-        await safeSendMessage(meta.chatId, '⛔ Access denied. This attempt has been logged.');
-        return;
+    child.stderr.on('data', (buffer) => {
+      const dataStr = buffer.toString();
+      
+      // Parse dynamic duration data mappings directly from output context if not explicitly passed earlier
+      if (!duration) {
+        const durMatch = dataStr.match(/Duration:\s*(\d+):(\d+):(\d+)/);
+        if (durMatch) {
+          duration = (parseInt(durMatch[1], 10) * 3600) + (parseInt(durMatch[2], 10) * 60) + parseInt(durMatch[3], 10);
+        }
       }
 
-      if (!checkRateLimit(meta.userId)) {
-        logWarn(`Rate limit exceeded: /${name}`, meta);
-        await safeSendMessage(meta.chatId, '⚠️ Too many commands — please slow down and try again in a few seconds.');
-        return;
+      const timeMatch = dataStr.match(/time=\s*(\d+):(\d+):(\d+)/);
+      if (timeMatch && duration) {
+        const currentTime = (parseInt(timeMatch[1], 10) * 3600) + (parseInt(timeMatch[2], 10) * 60) + parseInt(timeMatch[3], 10);
+        const pct = Math.min(100, Math.floor((currentTime / duration) * 100));
+        const now = Date.now();
+        if (now - lastProgressTs > 4000 && progressMessageId) {
+          lastProgressTs = now;
+          bot.editMessageText(`⏳ Transcoding compression profile status execution: <b>${pct}%</b> compiled.`, { chat_id: ADMIN_ID, message_id: progressMessageId, parse_mode: 'HTML' }).catch(() => {});
+        }
       }
+    });
 
-      logInfo(`Command received: /${name}`, meta);
+    child.on('close', (code) => {
+      cleanFileNode(sourcePath); // Always clean up temporary input immediately following computation closure
+      if (progressMessageId) bot.deleteMessage(ADMIN_ID, progressMessageId).catch(() => {});
 
-      await handler(msg, argString);
-
-      const elapsed = Date.now() - start;
-      logSuccess(`Command completed: /${name}`, { ...meta, responseTime: formatDuration(elapsed) });
-    } catch (err) {
-      const elapsed = Date.now() - start;
-      logError(`Command failed: /${name}`, err, { ...meta, responseTime: formatDuration(elapsed) });
-      if (!surfaceIndexLink(meta.chatId, err)) {
-        await safeSendMessage(meta.chatId, friendlyError(err));
+      if (code === 0) {
+        diagLog('compression', 'FFmpeg task iteration exited cleanly.', { targetPath });
+        uploadQueue.add(() => managedTaskRetry(() => uploadTaskWorker(docId, data, collection, targetPath), 'upload', docId, collection));
+        resolve();
+      } else {
+        cleanFileNode(targetPath);
+        reject(new Error(`FFmpeg engine execution closed with unexpected error code variant state: ${code}`));
       }
+    });
+
+    child.on('error', (err) => {
+      cleanFileNode(sourcePath);
+      cleanFileNode(targetPath);
+      if (progressMessageId) bot.deleteMessage(ADMIN_ID, progressMessageId).catch(() => {});
+      reject(err);
+    });
+  });
+}
+
+async function uploadTaskWorker(docId, data, collection, targetPath) {
+  diagLog('upload', 'Routing file system stream buffers to main cloud endpoints...', { docId });
+  await db.collection(collection).doc(docId).update({ status: 'uploading', updatedAt: getAdmin().firestore.FieldValue.serverTimestamp() });
+
+  if (!fs.existsSync(targetPath)) {
+    throw new Error(`Critical asset resolution tracking index mapping missing at address point: ${targetPath}`);
+  }
+
+  let progressMessageId = null;
+  try {
+    const msg = await bot.sendMessage(ADMIN_ID, `📤 Transmitting optimized payload assets to target channel nodes...`);
+    progressMessageId = msg.message_id;
+  } catch (e) {}
+
+  try {
+    const captionMsg = `${data.title} - S${data.season}E${data.episode} [${data.language}] [${data.quality}]`;
+    
+    // Core transmission implementation framework directly to private storage environments
+    const uploadedMsg = await bot.sendVideo(STORAGE_CHANNEL_ID, targetPath, {
+      caption: captionMsg
+    });
+
+    const videoMeta = uploadedMsg.video;
+    if (!videoMeta) {
+      throw new Error("Telegram API accepted standard parameter packet upload payload structural array components verification failure error payload missing.");
     }
-  });
+
+    await db.collection(collection).doc(docId).update({
+      status: 'completed',
+      messageId: uploadedMsg.message_id,
+      channelId: STORAGE_CHANNEL_ID,
+      telegram_file_id: videoMeta.file_id,
+      file_unique_id: videoMeta.file_unique_id,
+      fileSizeBytes: videoMeta.file_size,
+      duration: videoMeta.duration,
+      updatedAt: getAdmin().firestore.FieldValue.serverTimestamp()
+    });
+
+    diagLog('firestore', 'Metadata structures successfully synchronized to structural targets.', { docId });
+    if (progressMessageId) bot.deleteMessage(ADMIN_ID, progressMessageId).catch(() => {});
+    
+    cleanFileNode(targetPath);
+    return true;
+  } catch (err) {
+    cleanFileNode(targetPath);
+    if (progressMessageId) bot.deleteMessage(ADMIN_ID, progressMessageId).catch(() => {});
+    throw err;
+  }
+}
+
+function cleanFileNode(filePath) {
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      diagLog('cleanup', 'Cleaned up temporary disk file asset successfully', { filePath });
+    }
+  } catch (e) {
+    diagLog('errors', 'Failed to remove file from disk buffer', { filePath, error: e.message });
+  }
 }
 
 // ============================================================================
-// SECTION 9 — FIRESTORE HELPERS
+// STAGE 4 — WIZARD MANAGEMENT DISPATCH ROUTERS
 // ============================================================================
-
-function videoDocId(type, title, season, episode) {
-  return `${type}_${slugify(title)}_s${season}_ep${episode}`;
-}
-
-function buildVideoData({ title, category, season, episode, fileId, fileUniqueId, channelId, messageId, language, fileSizeBytes, quality }) {
-  const admin = getAdmin();
-  const data = {
-    title,
-    seriesTitle: title,
-    category,
-    season,
-    episode,
-    telegram_file_id: fileId,
-    file_unique_id: fileUniqueId,
-    channelId,
-    messageId,
-    language,
-    published: true,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-  };
-  // Ignore undefined values explicitly (belt-and-braces on top of
-  // db.settings({ ignoreUndefinedProperties: true }) in firebase.js).
-  if (fileSizeBytes !== undefined && fileSizeBytes !== null) data.fileSizeBytes = fileSizeBytes;
-  if (quality) data.quality = quality;
-  return data;
-}
-
-/** Commits an array of {ref, data} set-operations in Firestore-safe batches. */
-async function batchedSet(items) {
-  const chunks = chunkArray(items, BATCH_WRITE_LIMIT);
-  let written = 0;
-  for (const chunk of chunks) {
-    await withRetry(async () => {
-      const batch = db.batch();
-      for (const { ref, data } of chunk) batch.set(ref, data, { merge: false });
-      await batch.commit();
-    }, { label: 'batchedSet' });
-    written += chunk.length;
-  }
-  return written;
-}
-
-/** Commits an array of doc refs as deletes in Firestore-safe batches. */
-async function batchedDelete(refs) {
-  const chunks = chunkArray(refs, BATCH_WRITE_LIMIT);
-  let deleted = 0;
-  for (const chunk of chunks) {
-    await withRetry(async () => {
-      const batch = db.batch();
-      for (const ref of chunk) batch.delete(ref);
-      await batch.commit();
-    }, { label: 'batchedDelete' });
-    deleted += chunk.length;
-  }
-  return deleted;
-}
-
-/** Repeatedly pages through a query and deletes matches until none remain. */
-async function deleteByQuery(queryBuilder) {
-  let totalDeleted = 0;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    const snap = await withRetry(() => queryBuilder().limit(DELETE_QUERY_PAGE).get(), { label: 'deleteByQuery.get' });
-    if (snap.empty) break;
-    const refs = snap.docs.map((d) => d.ref);
-    totalDeleted += await batchedDelete(refs);
-    if (snap.size < DELETE_QUERY_PAGE) break;
-  }
-  return totalDeleted;
-}
-
-async function getAllChunked(refs) {
-  const chunks = chunkArray(refs, GET_ALL_CHUNK);
-  const out = [];
-  for (const chunk of chunks) {
-    if (chunk.length === 0) continue;
-    const docs = await withRetry(() => db.getAll(...chunk), { label: 'getAllChunked' });
-    out.push(...docs);
-  }
-  return out;
-}
-
-async function findExistingFileUniqueIds(uniqueIds) {
-  const found = new Set();
-  const chunks = chunkArray([...new Set(uniqueIds)], IN_QUERY_CHUNK);
-  for (const chunk of chunks) {
-    const snap = await withRetry(
-      () => db.collection(VIDEOS_COLLECTION).where('file_unique_id', 'in', chunk).select('file_unique_id').get(),
-      { label: 'findExistingFileUniqueIds' }
-    );
-    snap.forEach((d) => found.add(d.get('file_unique_id')));
-  }
-  return found;
-}
-
-// ============================================================================
-// SECTION 10 — BUFFER MANAGEMENT (Requirement 6)
-// ============================================================================
-// Buffering works identically whether a video arrives as:
-//   (a) a message sent directly to the bot by an admin, or
-//   (b) a channel_post / edited_channel_post from the storage channel the
-//       bot is an administrator of.
-// Both paths funnel through bufferVideoItem() so /saveanime, /savemovie,
-// /savewebseries, /showbuffer and /clearbuffer keep working completely
-// unmodified regardless of where the video came from.
-
-function getMaxBuffer(chatId) {
-  return maxBufferByChat[chatId] || DEFAULT_MAX_BUFFER;
-}
-
-function isStorageChannel(chatId) {
-  if (STORAGE_CHANNEL_ID) return Number(chatId) === STORAGE_CHANNEL_ID;
-  // No specific channel configured — trust any channel_post the bot receives,
-  // since Telegram only delivers those updates for channels the bot admins.
-  return true;
-}
-
-function extractVideoMedia(msg) {
-  if (msg.video) return msg.video;
-  if (msg.document?.mime_type?.startsWith('video/')) return msg.document;
-  return null;
-}
-
-function formatDetectedLine(detected) {
-  if (!detected || !detected.title) return '';
-  return `\n🔎 Detected: ${detected.title}${detected.season != null ? ` S${detected.season}` : ''}${detected.episode != null ? `E${detected.episode}` : ''}${detected.language ? ` · ${detected.language}` : ''}${detected.quality ? ` · ${detected.quality}` : ''}`;
-}
-
-/**
- * Buffers a single video into a specific admin's buffer (keyed by bufferChatId).
- * Used by both the direct-to-bot path and the channel_post path.
- * Never throws — returns a status object instead.
- */
-async function bufferVideoItem(bufferChatId, media, msg, source) {
-  if (!adminBuffer[bufferChatId]) adminBuffer[bufferChatId] = [];
-  if (!bufferSeenIds[bufferChatId]) bufferSeenIds[bufferChatId] = new Set();
-
-  const channelId = msg.chat.id;
-  const messageId = msg.message_id;
-  const max = getMaxBuffer(bufferChatId);
-
-  if (adminBuffer[bufferChatId].length >= max) {
-    logWarn('Buffer full — video dropped', { source, bufferChatId, channelId, messageId, max });
-    return { status: 'full', max };
-  }
-
-  if (bufferSeenIds[bufferChatId].has(media.file_unique_id)) {
-    // Requirement 6 — ignore duplicate videos using file_unique_id.
-    logInfo('Duplicate video ignored', { source, bufferChatId, channelId, messageId, fileUniqueId: media.file_unique_id });
-    return { status: 'duplicate' };
-  }
-
-  const rawText = msg.caption || media.file_name || '';
-  const detected = parseMediaInfo(rawText);
-
-  bufferSeenIds[bufferChatId].add(media.file_unique_id);
-  adminBuffer[bufferChatId].push({
-    file_id: media.file_id,
-    file_unique_id: media.file_unique_id,
-    channelId,
-    messageId,
-    fileSizeBytes: media.file_size,
-    mimeType: media.mime_type || null,
-    addedAt: Date.now(),
-    detected,
-  });
-
-  const count = adminBuffer[bufferChatId].length;
-
-  // Requirement 9 — detailed console logging.
-  logInfo('Video buffered', {
-    source,
-    bufferChatId,
-    channelId,
-    messageId,
-    fileId: media.file_id,
-    fileUniqueId: media.file_unique_id,
-    bufferCount: count,
-    detectedTitle: detected.title,
-    detectedS: detected.season,
-    detectedE: detected.episode,
-  });
-
-  return { status: 'ok', count, max, detected };
-}
-
-// ---- (a) videos sent directly to the bot ------------------------------------
-
-bot.on('video', (msg) => handleDirectVideo(msg, msg.video).catch((err) => logError('video buffer handler failed', err)));
-bot.on('document', (msg) => {
-  const media = extractVideoMedia(msg);
-  if (media) handleDirectVideo(msg, media).catch((err) => logError('document buffer handler failed', err));
-});
-
-async function handleDirectVideo(msg, media) {
+bot.onText(/^\/add (anime|webseries|anime-movie|movie)$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   if (!isAdmin(chatId)) return;
 
-  const result = await bufferVideoItem(chatId, media, msg, 'direct');
+  const targetType = match[1].toLowerCase();
+  diagLog('commands', `Initialization parsing context requested: /add ${targetType}`, { chatId });
+  
+  userState.set(chatId, { mode: 'collect_metadata', type: targetType, step: 0, collected: {} });
+  await bot.sendMessage(chatId, `🎬 <b>Entering Setup Mode for [${targetType.toUpperCase()}]</b>\nPlease enter the <b>Title</b>:`, { parse_mode: 'HTML' });
+});
 
-  if (result.status === 'full') {
-    return safeSendMessage(chatId, `⚠️ Buffer full (${result.max}). Save it with /saveanime, /savemovie or /savewebseries first, or /clearbuffer.`);
-  }
-  if (result.status === 'duplicate') {
-    return safeSendMessage(chatId, '⚠️ Duplicate video skipped (already in buffer).');
-  }
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(chatId) || !userState.has(chatId) || isShuttingDown) return;
 
-  safeSendMessage(chatId, `✅ Buffered (${result.count}/${result.max})${formatDetectedLine(result.detected)}`);
-}
-
-// ---- (b) videos posted in the storage channel --------------------------------
-// node-telegram-bot-api emits 'channel_post' / 'edited_channel_post' as their
-// own top-level events carrying the full message object — it does NOT also
-// emit 'video'/'document' sub-events for them (those only fire for regular
-// 'message' updates), so channel uploads must be handled separately here.
-
-bot.on('channel_post', (msg) => handleChannelVideo(msg, 'channel_post').catch((err) => logError('channel_post buffer handler failed', err)));
-bot.on('edited_channel_post', (msg) => handleChannelVideo(msg, 'edited_channel_post').catch((err) => logError('edited_channel_post buffer handler failed', err)));
-
-async function handleChannelVideo(msg, source) {
-  const channelId = msg.chat.id;
-  if (!isStorageChannel(channelId)) return;
-
-  const media = extractVideoMedia(msg);
-  if (!media) return;
-
-  if (ADMIN_IDS.length === 0) {
-    logWarn('Channel video received but no ADMIN_USER_IDS configured — nothing buffered', { channelId, messageId: msg.message_id });
+  const state = userState.get(chatId);
+  if (msg.text && msg.text.startsWith('/')) {
+    if (msg.text.toLowerCase() === '/done' && state.mode === 'upload_mode') {
+      userState.delete(chatId);
+      await bot.sendMessage(chatId, '🏁 <b>Upload Session Finished!</b> Exited loop configuration scopes cleanly.', { parse_mode: 'HTML' });
+      diagLog('commands', 'Terminated target channel upload active configuration session loops context references.');
+    }
     return;
   }
 
-  // Buffer the video into every admin's personal buffer so whichever admin
-  // later runs /saveanime, /savemovie, /savewebseries, /showbuffer or
-  // /clearbuffer sees it — those commands remain untouched.
-  let primaryResult = null;
-  for (const adminId of ADMIN_IDS) {
-    const result = await bufferVideoItem(adminId, media, msg, source);
-    if (adminId === ADMIN_IDS[0]) primaryResult = result;
-  }
-  if (!primaryResult) return;
+  if (state.mode === 'collect_metadata') {
+    const steps = ['title', 'season', 'language', 'quality', 'poster', 'banner', 'description'];
+    const currentField = steps[state.step];
 
-  if (primaryResult.status === 'full') {
-    return safeSendMessage(channelId, `⚠️ Buffer full (${primaryResult.max}). Save it with /saveanime, /savemovie or /savewebseries first, or /clearbuffer.`);
-  }
-  if (primaryResult.status === 'duplicate') {
-    return safeSendMessage(channelId, '⚠️ Duplicate video skipped (already in buffer).');
-  }
-
-  safeSendMessage(channelId, `✅ Buffered (${primaryResult.count}/${primaryResult.max})${formatDetectedLine(primaryResult.detected)}`);
-}
-
-// ============================================================================
-// SECTION 11 — COMMANDS: start / help
-// ============================================================================
-
-registerCommand('start', async (msg) => {
-  await safeSendMessage(msg.chat.id, [
-    '🎬 <b>Welcome to MYFLIX Admin Bot</b>',
-    '',
-    isAdmin(msg.chat.id) ? 'You are recognized as an admin.' : 'This bot is restricted to admins.',
-    '',
-    'Send /help to see every available command.',
-  ].join('\n'), {});
-}, { adminOnly: false });
-
-registerCommand('help', async (msg) => {
-  const text = [
-    '📚 <b>MYFLIX Admin Commands</b>',
-    '',
-    '<b>Saving</b>',
-    '/saveanime Title|Season|Language|StartEp',
-    '/savemovie Title|Season|Language|StartEp',
-    '/savewebseries Title|Season|Language|StartEp',
-    '/autosave Title|Season|Language|StartEp — category auto-detected too',
-    '<i>Any field may be blank or "auto" to use what was detected from the caption/filename (e.g. "Demon Slayer S02E04 Hindi 720p").</i>',
-    '',
-    '<b>Buffer</b>',
-    '/showbuffer — view current buffer',
-    '/maxbuffer &lt;n&gt; — set buffer capacity (1-500)',
-    '/clearbuffer — empty the buffer',
-    '',
-    '<b>Deleting</b> (all ask for confirmation)',
-    '/deleteanime &lt;docId&gt; — delete whole anime (all seasons)',
-    '/deleteanime season &lt;N&gt; &lt;docId&gt; — delete one season',
-    '/deleteanime episode &lt;S&gt; &lt;E&gt; &lt;docId&gt; — delete one episode',
-    '/deletemovie &lt;docId&gt; — delete that movie',
-    '/deleteseries &lt;docId&gt; — delete whole web series (all seasons)',
-    '/deleteseries season &lt;N&gt; &lt;docId&gt;',
-    '/deleteseries episode &lt;S&gt; &lt;E&gt; &lt;docId&gt;',
-    '/deletelanguage category|Language',
-    '/deleteallanime',
-    '/deleteallmovies',
-    '/deleteallwebseries',
-    '',
-    '<b>Browsing</b>',
-    '/listanime · /listmovies · /listwebseries',
-    '/find title|episode|season|language|category &lt;value&gt;',
-    '',
-    '<b>Monitoring</b>',
-    '/stats · /storage · /health · /logs · /ping',
-    '',
-    '<i>category can be: anime, movie, webseries</i>',
-  ].join('\n');
-  await safeSendMessage(msg.chat.id, text, {});
-});
-
-// ============================================================================
-// SECTION 12 — COMMANDS: save (Requirement 3 & 5)
-// ============================================================================
-
-const AUTO_TOKEN = /^(auto|)$/i;
-
-/**
- * @param {object} msg
- * @param {'anime'|'movie'|'webseries'|null} type null => category is
- *        auto-detected per batch from the first buffered item's caption.
- * @param {string} argString "Title|Season|Language|StartEpisode", any
- *        segment may be blank or "auto" to fall back to what the parser
- *        detected from Telegram captions/filenames.
- */
-async function executeSave(msg, type, argString) {
-  const chatId = msg.chat.id;
-  const start = Date.now();
-
-  const buf = adminBuffer[chatId] || [];
-  assertValid(buf.length > 0, 'Buffer is empty. Forward videos to the bot first.');
-
-  const parts = (argString || '').split('|').map((s) => s.trim());
-  const first = buf[0].detected || {};
-
-  const category = type ? TYPE_CATEGORY[type] : normalizeCategory(first.category || 'Movies');
-  const resolvedType = type || typeForCategory(category);
-
-  const titleRaw = AUTO_TOKEN.test(parts[0]) ? first.title : parts[0];
-  assertValid(titleRaw, 'Could not detect a title automatically — usage: /save' + resolvedType + ' Title|Season|Language|StartEpisode');
-  const title = validateTitle(titleRaw);
-
-  const explicitSeason = parts[1] && !AUTO_TOKEN.test(parts[1]) ? validateSeason(parts[1]) : null;
-  const explicitLanguage = parts[2] && !AUTO_TOKEN.test(parts[2]) ? validateLanguage(parts[2]) : null;
-  const startEpisode = parts[3] && !AUTO_TOKEN.test(parts[3]) ? validateEpisode(parts[3]) : 1;
-
-  const language = explicitLanguage || (first.language ? validateLanguage(first.language) : null) || 'Hindi';
-
-  // Validate every buffered item before touching Firestore.
-  const validatedBuf = buf.map((item) => ({
-    fileId: item.file_id,
-    fileUniqueId: item.file_unique_id,
-    channelId: validateChannelId(item.channelId),
-    messageId: validateMessageId(item.messageId),
-    fileSizeBytes: item.fileSizeBytes,
-    detected: item.detected || {},
-  }));
-
-  // Cross-title duplicate prevention: has this exact Telegram file already been saved?
-  const alreadySaved = await findExistingFileUniqueIds(validatedBuf.map((v) => v.fileUniqueId));
-
-  // Best-effort MTProto verification that each source message still exists
-  // and actually carries video/document media before we write anything.
-  const verification = new Map();
-  if (mtproto.isEnabled()) {
-    const CONCURRENCY = 5;
-    for (let i = 0; i < validatedBuf.length; i += CONCURRENCY) {
-      const slice = validatedBuf.slice(i, i + CONCURRENCY);
-      const results = await Promise.all(slice.map((item) => mtproto.verifyMessage(item.channelId, item.messageId)));
-      slice.forEach((item, idx) => verification.set(item.fileUniqueId, results[idx]));
-    }
-  }
-
-  const candidates = [];
-  let skippedInvalidSource = 0;
-  let autoIndex = 0;
-  validatedBuf.forEach((item) => {
-    if (alreadySaved.has(item.fileUniqueId)) return;
-    const v = verification.get(item.fileUniqueId);
-    if (v && v.ok === false) {
-      skippedInvalidSource++;
-      logWarn('Skipped invalid source before save', { fileUniqueId: item.fileUniqueId, channelId: item.channelId, messageId: item.messageId, reason: v.reason });
-      return;
-    }
-
-    const season = explicitSeason ?? (item.detected.season != null ? validateSeason(item.detected.season) : 1);
-    const episode = item.detected.episode != null ? validateEpisode(item.detected.episode) : validateEpisode(startEpisode + autoIndex++);
-    const quality = item.detected.quality || null;
-
-    const id = videoDocId(resolvedType, title, season, episode);
-    candidates.push({
-      id,
-      ref: db.collection(VIDEOS_COLLECTION).doc(id),
-      data: buildVideoData({
-        title, category, season, episode,
-        fileId: item.fileId, fileUniqueId: item.fileUniqueId,
-        channelId: item.channelId, messageId: item.messageId,
-        language, fileSizeBytes: item.fileSizeBytes, quality,
-      }),
-      season,
-    });
-  });
-
-  // Prevent duplicate documents: filter out IDs that already exist.
-  const existingDocs = await getAllChunked(candidates.map((c) => c.ref));
-  const existingIds = new Set(existingDocs.filter((d) => d.exists).map((d) => d.id));
-  const toWrite = candidates.filter((c) => !existingIds.has(c.id));
-
-  const skippedDuplicateFile = validatedBuf.length - candidates.length - skippedInvalidSource;
-  const skippedExistingDoc = candidates.length - toWrite.length;
-
-  const savedCount = await batchedSet(toWrite);
-
-  invalidateCategoryCaches(category);
-  adminBuffer[chatId] = [];
-  if (bufferSeenIds[chatId]) bufferSeenIds[chatId].clear();
-
-  const elapsed = Date.now() - start;
-  logSuccess(`Saved ${category}`, {
-    ...userMeta(msg),
-    title,
-    saved: savedCount,
-    skippedDup: skippedDuplicateFile + skippedExistingDoc,
-    skippedInvalidSource,
-    firestoreLatency: formatDuration(elapsed),
-  });
-
-  const seasonsUsed = [...new Set(toWrite.map((c) => c.season))].sort((a, b) => a - b);
-  const lines = [
-    `✅ <b>${category === CATEGORIES.WEBSERIES ? 'Web Series' : category.replace(/s$/, '')} Saved</b>`,
-    '',
-    `Title: ${title}`,
-    `Season: ${seasonsUsed.join(', ') || '—'}`,
-    `Episodes Saved: ${savedCount}`,
-    `Language: ${language}`,
-  ];
-  if (skippedDuplicateFile + skippedExistingDoc > 0) lines.push(`Skipped Duplicates: ${skippedDuplicateFile + skippedExistingDoc}`);
-  if (skippedInvalidSource > 0) lines.push(`Skipped Invalid Source: ${skippedInvalidSource}`);
-  lines.push('', `Firestore ID: <code>${toWrite[0]?.id || '—'}</code>`, '', `Time: ${formatDuration(elapsed)}`);
-  lines.push('', '✅ Buffer cleared.');
-
-  await safeSendMessage(chatId, lines.join('\n'), {});
-}
-
-registerCommand('saveanime', (msg, arg) => executeSave(msg, 'anime', arg));
-registerCommand('savemovie', (msg, arg) => executeSave(msg, 'movie', arg));
-registerCommand('savewebseries', (msg, arg) => executeSave(msg, 'webseries', arg));
-registerCommand('autosave', (msg, arg) => executeSave(msg, null, arg));
-
-// ============================================================================
-// SECTION 13 — COMMANDS: buffer utilities
-// ============================================================================
-
-registerCommand('maxbuffer', async (msg, arg) => {
-  const chatId = msg.chat.id;
-  assertValid(arg, `Usage: /maxbuffer <1-${HARD_MAX_BUFFER}> (current: ${getMaxBuffer(chatId)})`);
-  const n = parseInt(arg, 10);
-  assertValid(Number.isInteger(n) && n >= 1 && n <= HARD_MAX_BUFFER, `Buffer size must be between 1 and ${HARD_MAX_BUFFER}.`);
-  maxBufferByChat[chatId] = n;
-  await safeSendMessage(chatId, `✅ Max buffer size set to ${n}.`, {});
-});
-
-registerCommand('showbuffer', async (msg) => {
-  const chatId = msg.chat.id;
-  const buf = adminBuffer[chatId] || [];
-  if (buf.length === 0) {
-    await safeSendMessage(chatId, 'ℹ️ Buffer is empty.', {});
-    return;
-  }
-  const totalBytes = buf.reduce((sum, b) => sum + (b.fileSizeBytes || 0), 0);
-  const oldestAgeSec = Math.round((Date.now() - buf[0].addedAt) / 1000);
-  const text = [
-    `📦 <b>Buffer Status</b>`,
-    '',
-    `Videos: ${buf.length} / ${getMaxBuffer(chatId)}`,
-    `Approx. Size: ${formatBytes(totalBytes)}`,
-    `Oldest item: ${oldestAgeSec}s ago`,
-  ].join('\n');
-  await safeSendMessage(chatId, text, {});
-});
-
-registerCommand('clearbuffer', async (msg) => {
-  const chatId = msg.chat.id;
-  const count = (adminBuffer[chatId] || []).length;
-  adminBuffer[chatId] = [];
-  if (bufferSeenIds[chatId]) bufferSeenIds[chatId].clear();
-  await safeSendMessage(chatId, `🗑 Buffer cleared (${count} item${count === 1 ? '' : 's'} removed).`, {});
-});
-
-// ============================================================================
-// SECTION 14 — CONFIRMATION FLOW (Requirement 4 & 14)
-// ============================================================================
-
-async function requestConfirmation(chatId, userId, promptText, kind, payload) {
-  const tok = shortToken();
-  const sent = await safeSendMessage(chatId, `⚠️ ${promptText}\n\nAre you sure?`, {
-    reply_markup: {
-      inline_keyboard: [[
-        { text: '✅ Delete', callback_data: `cy:${tok}` },
-        { text: '❌ Cancel', callback_data: `cn:${tok}` },
-      ]],
-    },
-  });
-  pendingActions.set(tok, { chatId, userId, kind, payload, createdAt: Date.now(), promptMessageId: sent?.message_id });
-}
-
-bot.on('callback_query', async (query) => {
-  const chatId = query.message?.chat?.id;
-  const userId = query.from?.id;
-  const data = query.data || '';
-
-  try {
-    if (!isAdmin(chatId)) {
-      logWarn('Unauthorized callback_query attempt', { userId, chatId, data });
-      await safeAnswerCallback(query.id, { text: '⛔ Access denied.', show_alert: true });
-      return;
-    }
-
-    if (data.startsWith('cy:') || data.startsWith('cn:')) {
-      const confirmed = data.startsWith('cy:');
-      const tok = data.slice(3);
-      const pending = pendingActions.get(tok);
-
-      if (!pending) {
-        await safeAnswerCallback(query.id, { text: '⌛ This confirmation expired.', show_alert: true });
-        return;
+    if (currentField === 'poster' || currentField === 'banner') {
+      if (msg.photo) {
+        state.collected[currentField] = msg.photo[msg.photo.length - 1].file_id;
+      } else {
+        state.collected[currentField] = (msg.text && msg.text.toLowerCase() === 'skip') ? null : msg.text;
       }
-      pendingActions.delete(tok);
-
-      if (!confirmed) {
-        await safeAnswerCallback(query.id, { text: 'Cancelled.' });
-        await safeEditMessageText('❎ Cancelled — nothing was deleted.', { chat_id: chatId, message_id: query.message.message_id });
-        return;
-      }
-
-      await safeAnswerCallback(query.id, { text: 'Processing…' });
-      await safeEditMessageText('⏳ Deleting…', { chat_id: chatId, message_id: query.message.message_id });
-
-      const start = Date.now();
-      const result = await runDeleteAction(pending.kind, pending.payload);
-      const elapsed = Date.now() - start;
-
-      logSuccess('Delete executed', { userId, chatId, kind: pending.kind, deleteTime: formatDuration(elapsed), removed: result.count });
-      await safeEditMessageText(result.message + `\nExecution Time: ${formatDuration(elapsed)}`, {
-        chat_id: chatId,
-        message_id: query.message.message_id,
-      });
-      return;
-    }
-
-    if (data.startsWith('pg:')) {
-      const [, code, pageStr] = data.split(':');
-      await renderListPage(chatId, code, parseInt(pageStr, 10), query.message.message_id);
-      await safeAnswerCallback(query.id);
-      return;
-    }
-
-    if (data.startsWith('rf:')) {
-      const target = data.slice(3);
-      await safeAnswerCallback(query.id, { text: '🔄 Refreshed' });
-      if (target === 'stats') await renderStats(chatId, query.message.message_id);
-      else if (target === 'storage') await renderStorage(chatId, query.message.message_id);
-      else if (target === 'health') await renderHealth(chatId, query.message.message_id);
-      return;
-    }
-
-    await safeAnswerCallback(query.id);
-  } catch (err) {
-    logError('callback_query handler failed', err, { chatId, userId, data });
-    await safeAnswerCallback(query.id, { text: '❌ Something went wrong.', show_alert: true });
-  }
-});
-
-// ============================================================================
-// ============================================================================
-// SECTION 15 — DELETE LOGIC — UNIFIED DELETE SYSTEM
-// ============================================================================
-// One command per category instead of many separate delete commands:
-//   /deleteanime   <docId>                       — whole anime (all seasons)
-//   /deleteanime   season <N> <docId>            — one season
-//   /deleteanime   episode <S> <E> <docId>        — one episode
-//   /deletemovie   <docId>                       — that movie only
-//   /deleteseries  <docId>                       — whole web series
-//   /deleteseries  season <N> <docId>
-//   /deleteseries  episode <S> <E> <docId>
-//
-// The actual Firestore delete operations (batchedDelete / deleteByQuery /
-// invalidateCategoryCaches) are unchanged from before — only how a command
-// resolves category+title (by looking the docId up in Firestore first, then
-// validating it) and routes into those operations is new.
-
-function pluralCategory(category) {
-  return category === CATEGORIES.WEBSERIES ? 'Web Series' : category;
-}
-
-const DOC_ID_RE = /^[A-Za-z0-9_-]{3,200}$/;
-
-/** Looks up a document by ID and returns { ref, data }. Friendly 404 error otherwise. */
-async function loadDocForDelete(docId) {
-  assertValid(docId && DOC_ID_RE.test(docId), `That does not look like a valid Firestore document ID: <code>${docId || ''}</code>`);
-  const ref = db.collection(VIDEOS_COLLECTION).doc(docId);
-  const snap = await withRetry(() => ref.get(), { label: 'loadDocForDelete' });
-  assertValid(snap.exists, `Document not found: <code>${docId}</code>. It may have already been deleted.`);
-  return { ref, data: snap.data() || {} };
-}
-
-/** Confirms the looked-up document actually belongs to the category the command targets. */
-function assertCategoryMatches(data, expectedCategory, command) {
-  assertValid(
-    data.category === expectedCategory,
-    `Wrong category — that document is stored as "${data.category || 'unknown'}", but /${command} only deletes ${pluralCategory(expectedCategory)}. Use the matching delete command instead.`
-  );
-}
-
-async function assertSeasonExists(category, title, season) {
-  const snap = await withRetry(
-    () => db.collection(VIDEOS_COLLECTION).where('category', '==', category).where('title', '==', title).where('season', '==', season).limit(1).get(),
-    { label: 'assertSeasonExists' }
-  );
-  assertValid(!snap.empty, `Season not found: "${title}" has no Season ${season}.`);
-}
-
-async function assertEpisodeExists(category, title, season, episode) {
-  const snap = await withRetry(
-    () => db.collection(VIDEOS_COLLECTION)
-      .where('category', '==', category).where('title', '==', title)
-      .where('season', '==', season).where('episode', '==', episode)
-      .limit(1).get(),
-    { label: 'assertEpisodeExists' }
-  );
-  assertValid(!snap.empty, `Episode not found: "${title}" S${season}E${episode} does not exist.`);
-}
-
-/** Builds the standard post-delete summary: Title / Season / Episode / Deleted count / Firestore time. */
-function formatDeleteSummary({ title, category, season, episode, count, firestoreMs, docId, alreadyDeleted }) {
-  const lines = [alreadyDeleted ? '⚠️ <b>Already Deleted</b>' : '🗑 <b>Deleted</b>', ''];
-  lines.push(`Title: ${title || '—'}`);
-  if (category) lines.push(`Category: ${pluralCategory(category)}`);
-  lines.push(`Season: ${season != null ? season : '—'}`);
-  lines.push(`Episode: ${episode != null ? episode : '—'}`);
-  if (docId) lines.push(`Source Doc: <code>${docId}</code>`);
-  lines.push(`Deleted Count: ${count}`);
-  lines.push(`Firestore Time: ${formatDuration(firestoreMs)}`);
-  if (alreadyDeleted) lines.push('', 'Nothing was removed — it looks like this was already deleted.');
-  return lines.join('\n');
-}
-
-async function runDeleteAction(kind, payload) {
-  const fsStart = Date.now();
-  switch (kind) {
-    case 'deleteEntireTitle': {
-      const { category, title, docId } = payload;
-      const refsByTitle = await withRetry(() => db.collection(VIDEOS_COLLECTION).where('category', '==', category).where('title', '==', title).get());
-      const refsBySeriesTitle = await withRetry(() => db.collection(VIDEOS_COLLECTION).where('category', '==', category).where('seriesTitle', '==', title).get());
-      const map = new Map();
-      refsByTitle.forEach((d) => map.set(d.id, d.ref));
-      refsBySeriesTitle.forEach((d) => map.set(d.id, d.ref));
-      const count = await batchedDelete([...map.values()]);
-      const firestoreMs = Date.now() - fsStart;
-      invalidateCategoryCaches(category);
-      return { count, message: formatDeleteSummary({ title, category, season: null, episode: null, count, firestoreMs, docId, alreadyDeleted: count === 0 }) };
-    }
-    case 'deleteSeason': {
-      const { category, title, season, docId } = payload;
-      const count = await deleteByQuery(() =>
-        db.collection(VIDEOS_COLLECTION).where('category', '==', category).where('title', '==', title).where('season', '==', season)
-      );
-      const firestoreMs = Date.now() - fsStart;
-      invalidateCategoryCaches(category);
-      return { count, message: formatDeleteSummary({ title, category, season, episode: null, count, firestoreMs, docId, alreadyDeleted: count === 0 }) };
-    }
-    case 'deleteEpisode': {
-      const { category, title, season, episode, docId } = payload;
-      const count = await deleteByQuery(() =>
-        db.collection(VIDEOS_COLLECTION)
-          .where('category', '==', category).where('title', '==', title)
-          .where('season', '==', season).where('episode', '==', episode)
-      );
-      const firestoreMs = Date.now() - fsStart;
-      invalidateCategoryCaches(category);
-      return { count, message: formatDeleteSummary({ title, category, season, episode, count, firestoreMs, docId, alreadyDeleted: count === 0 }) };
-    }
-    case 'deleteDoc': {
-      const { docId } = payload;
-      const ref = db.collection(VIDEOS_COLLECTION).doc(docId);
-      const snap = await ref.get();
-      const firestoreMsMiss = Date.now() - fsStart;
-      if (!snap.exists) {
-        return { count: 0, message: formatDeleteSummary({ title: null, category: null, season: null, episode: null, count: 0, firestoreMs: firestoreMsMiss, docId, alreadyDeleted: true }) };
-      }
-      const data = snap.data();
-      await ref.delete();
-      const firestoreMs = Date.now() - fsStart;
-      invalidateCategoryCaches(data.category);
-      return { count: 1, message: formatDeleteSummary({ title: data.title, category: data.category, season: data.season, episode: data.episode, count: 1, firestoreMs, docId }) };
-    }
-    case 'deleteLanguage': {
-      const { category, language } = payload;
-      const count = await deleteByQuery(() =>
-        db.collection(VIDEOS_COLLECTION).where('category', '==', category).where('language', '==', language)
-      );
-      invalidateCategoryCaches(category);
-      return { count, message: `🗑 <b>Deleted</b>\n\nCategory: ${pluralCategory(category)}\nLanguage: ${language}\nEpisodes Removed: ${count}` };
-    }
-    case 'deleteEntireCategory': {
-      const { category } = payload;
-      const count = await deleteByQuery(() => db.collection(VIDEOS_COLLECTION).where('category', '==', category));
-      invalidateCategoryCaches(category);
-      return { count, message: `🗑 <b>Deleted</b>\n\nCategory: ${pluralCategory(category)} (entire catalog)\nDocuments Removed: ${count}` };
-    }
-    default:
-      return { count: 0, message: '❌ Unknown delete action.' };
-  }
-}
-
-function unifiedDeleteUsage(command, category) {
-  if (category === CATEGORIES.MOVIES) {
-    return `Usage:\n/${command} &lt;FirestoreDocumentID&gt;`;
-  }
-  return [
-    'Usage:',
-    `/${command} &lt;FirestoreDocumentID&gt; — delete the whole title (all seasons)`,
-    `/${command} season &lt;SeasonNumber&gt; &lt;FirestoreDocumentID&gt;`,
-    `/${command} episode &lt;Season&gt; &lt;Episode&gt; &lt;FirestoreDocumentID&gt;`,
-  ].join('\n');
-}
-
-/**
- * Registers one unified delete command for a category. Every path validates
- * the document exists, the category matches, and (for season/episode) that
- * the season/episode actually exists — before ever asking for confirmation.
- */
-function registerUnifiedDelete(command, category) {
-  registerCommand(command, async (msg, argString) => {
-    const parts = argString.split(/\s+/).filter(Boolean);
-    assertValid(parts.length > 0, unifiedDeleteUsage(command, category));
-
-    const sub = parts[0].toLowerCase();
-
-    if (sub === 'season') {
-      assertValid(category !== CATEGORIES.MOVIES, `Movies don't have seasons. Usage: /${command} <FirestoreDocumentID>`);
-      assertValid(parts.length === 3, `Usage: /${command} season <SeasonNumber> <FirestoreDocumentID>`);
-      const season = validateSeason(parts[1]);
-      const docId = parts[2];
-
-      const { data } = await loadDocForDelete(docId);
-      assertCategoryMatches(data, category, command);
-      const title = data.title;
-      assertValid(title, `Document <code>${docId}</code> has no title on record.`);
-      await assertSeasonExists(category, title, season);
-
-      await requestConfirmation(
-        msg.chat.id, msg.from.id,
-        `Delete <b>Season ${season}</b> of "${title}" (${pluralCategory(category)})?\n\nSource Doc: <code>${docId}</code>`,
-        'deleteSeason', { category, title, season, docId }
-      );
-      return;
-    }
-
-    if (sub === 'episode') {
-      assertValid(category !== CATEGORIES.MOVIES, `Movies don't have episodes. Usage: /${command} <FirestoreDocumentID>`);
-      assertValid(parts.length === 4, `Usage: /${command} episode <Season> <Episode> <FirestoreDocumentID>`);
-      const season = validateSeason(parts[1]);
-      const episode = validateEpisode(parts[2]);
-      const docId = parts[3];
-
-      const { data } = await loadDocForDelete(docId);
-      assertCategoryMatches(data, category, command);
-      const title = data.title;
-      assertValid(title, `Document <code>${docId}</code> has no title on record.`);
-      await assertSeasonExists(category, title, season);
-      await assertEpisodeExists(category, title, season, episode);
-
-      await requestConfirmation(
-        msg.chat.id, msg.from.id,
-        `Delete <b>S${season}E${episode}</b> of "${title}" (${pluralCategory(category)})?\n\nSource Doc: <code>${docId}</code>`,
-        'deleteEpisode', { category, title, season, episode, docId }
-      );
-      return;
-    }
-
-    // Whole-title mode (anime/webseries) or single-movie mode.
-    assertValid(parts.length === 1, unifiedDeleteUsage(command, category));
-    const docId = parts[0];
-
-    const { data } = await loadDocForDelete(docId);
-    assertCategoryMatches(data, category, command);
-    const title = data.title;
-    assertValid(title, `Document <code>${docId}</code> has no title on record.`);
-
-    if (category === CATEGORIES.MOVIES) {
-      await requestConfirmation(
-        msg.chat.id, msg.from.id,
-        `Delete this movie — "${title}"?\n\nSource Doc: <code>${docId}</code>`,
-        'deleteDoc', { docId }
-      );
+    } else if (currentField === 'description') {
+      state.collected[currentField] = (msg.text && msg.text.toLowerCase() === 'skip') ? null : msg.text;
     } else {
-      await requestConfirmation(
-        msg.chat.id, msg.from.id,
-        `Delete <b>ALL</b> seasons/episodes of "${title}" (${pluralCategory(category)})?\n\nSource Doc: <code>${docId}</code>`,
-        'deleteEntireTitle', { category, title, docId }
-      );
+      state.collected[currentField] = msg.text;
     }
-  });
-}
 
-registerUnifiedDelete('deleteanime', CATEGORIES.ANIME);
-registerUnifiedDelete('deletemovie', CATEGORIES.MOVIES);
-registerUnifiedDelete('deleteseries', CATEGORIES.WEBSERIES);
-
-// ---- untouched: bulk delete-by-language / delete-entire-category ----------
-// (not part of the unified redesign — kept exactly as before)
-
-registerCommand('deletelanguage', async (msg, arg) => {
-  assertValid(arg, 'Usage: /deletelanguage category|Language');
-  const [catRaw, langRaw] = arg.split('|').map((s) => s.trim());
-  const category = normalizeCategory(catRaw);
-  const language = validateLanguage(langRaw);
-  await requestConfirmation(
-    msg.chat.id, msg.from.id,
-    `Delete every ${pluralCategory(category)} video in "${language}"?`,
-    'deleteLanguage', { category, language }
-  );
-});
-
-function registerDeleteAllCommand(command, category) {
-  registerCommand(command, async (msg) => {
-    await requestConfirmation(
-      msg.chat.id, msg.from.id,
-      `Delete the <b>ENTIRE</b> ${pluralCategory(category)} catalog? This cannot be undone.`,
-      'deleteEntireCategory', { category }
-    );
-  });
-}
-registerDeleteAllCommand('deleteallanime', CATEGORIES.ANIME);
-registerDeleteAllCommand('deleteallmovies', CATEGORIES.MOVIES);
-registerDeleteAllCommand('deleteallwebseries', CATEGORIES.WEBSERIES);
-
-// ============================================================================
-// SECTION 16 — LISTING & PAGINATION (Requirement 14)
-// ============================================================================
-
-async function fetchCategoryDocsCached(category) {
-  const code = CATEGORY_CODE[category];
-  const key = `list:${code}`;
-  const cached = listCache.get(key);
-  if (cached && Date.now() - cached.fetchedAt < LIST_CACHE_TTL_MS) return cached.docs;
-
-  const snap = await withRetry(
-    () => db.collection(VIDEOS_COLLECTION).where('category', '==', category)
-      .select('title', 'season', 'episode', 'language', 'published', 'createdAt')
-      .limit(LIST_FETCH_LIMIT).get(),
-    { label: 'fetchCategoryDocsCached' }
-  );
-  const docs = snap.docs
-    .map((d) => ({ id: d.id, ...d.data() }))
-    .sort((a, b) => toMillis(b.createdAt) - toMillis(a.createdAt));
-
-  listCache.set(key, { docs, fetchedAt: Date.now() });
-  return docs;
-}
-
-function renderListText(category, docs, page) {
-  const totalPages = Math.max(1, Math.ceil(docs.length / LIST_PAGE_SIZE));
-  const clampedPage = Math.min(Math.max(page, 0), totalPages - 1);
-  const slice = docs.slice(clampedPage * LIST_PAGE_SIZE, clampedPage * LIST_PAGE_SIZE + LIST_PAGE_SIZE);
-
-  const lines = [`📋 <b>${pluralCategory(category)}</b> — ${docs.length} video${docs.length === 1 ? '' : 's'}`, ''];
-  if (slice.length === 0) {
-    lines.push('No videos found.');
-  } else {
-    for (const d of slice) {
-      lines.push(`• <b>${d.title}</b> S${d.season}E${d.episode} · ${d.language || '—'} ${d.published ? '' : '(unpublished)'}`);
-      lines.push(`  <code>${d.id}</code>`);
+    state.step++;
+    
+    if (state.step < steps.length) {
+      const nextField = steps[state.step];
+      const isOptional = state.step >= 4;
+      await bot.sendMessage(chatId, `Enter <b>${nextField.charAt(0).toUpperCase() + nextField.slice(1)}</b>${isOptional ? ' (optional - type "skip" to ignore)' : ''}:`, { parse_mode: 'HTML' });
+      userState.set(chatId, state);
+    } else {
+      state.mode = 'upload_mode';
+      userState.set(chatId, state);
+      diagLog('commands', 'Session parameters parsed and staged.', state.collected);
+      await bot.sendMessage(chatId, `🚀 <b>Configuration Profile Active!</b>\n\nYou are now in <b>Upload Mode</b>.\nForward files or video payloads directly.\n\nType <code>/done</code> when you are finished uploading episodes.`, { parse_mode: 'HTML' });
     }
-  }
-  lines.push('', `Page ${clampedPage + 1}/${totalPages}`);
-  return { text: lines.join('\n'), clampedPage, totalPages };
-}
-
-async function renderListPage(chatId, code, page, messageId) {
-  const category = CODE_CATEGORY[code];
-  if (!category) return;
-  const docs = await fetchCategoryDocsCached(category);
-  const { text, clampedPage, totalPages } = renderListText(category, docs, page || 0);
-
-  const buttons = [];
-  if (clampedPage > 0) buttons.push({ text: '⬅ Prev', callback_data: `pg:${code}:${clampedPage - 1}` });
-  buttons.push({ text: `${clampedPage + 1}/${totalPages}`, callback_data: `pg:${code}:${clampedPage}` });
-  if (clampedPage < totalPages - 1) buttons.push({ text: 'Next ➡', callback_data: `pg:${code}:${clampedPage + 1}` });
-
-  const options = { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [buttons] } };
-  if (messageId) {
-    await safeEditMessageText(text, options);
-  } else {
-    await safeSendMessage(chatId, text, { reply_markup: options.reply_markup });
-  }
-}
-
-function registerListCommand(command, category) {
-  registerCommand(command, async (msg) => {
-    await renderListPage(msg.chat.id, CATEGORY_CODE[category], 0, null);
-  });
-}
-registerListCommand('listanime', CATEGORIES.ANIME);
-registerListCommand('listmovies', CATEGORIES.MOVIES);
-registerListCommand('listwebseries', CATEGORIES.WEBSERIES);
-
-// ============================================================================
-// SECTION 17 — STATS / STORAGE / HEALTH / LOGS / PING (Requirement 8 & 10)
-// ============================================================================
-
-async function computeStats() {
-  const cached = getCache('stats');
-  if (cached) return cached;
-
-  const col = db.collection(VIDEOS_COLLECTION);
-
-  const [animeCount, movieCount, seriesCount] = await Promise.all([
-    withRetry(() => col.where('category', '==', CATEGORIES.ANIME).count().get()),
-    withRetry(() => col.where('category', '==', CATEGORIES.MOVIES).count().get()),
-    withRetry(() => col.where('category', '==', CATEGORIES.WEBSERIES).count().get()),
-  ]);
-
-  const startOfDay = new Date();
-  startOfDay.setHours(0, 0, 0, 0);
-
-  const [uploadsTodaySnap, lastUploadSnap, largestSnap] = await Promise.all([
-    withRetry(() => col.where('createdAt', '>=', startOfDay).count().get()),
-    withRetry(() => col.orderBy('createdAt', 'desc').limit(1).get()),
-    withRetry(() => col.orderBy('fileSizeBytes', 'desc').limit(1).get()),
-  ]);
-
-  const stats = {
-    animeTotal: animeCount.data().count,
-    movieTotal: movieCount.data().count,
-    seriesTotal: seriesCount.data().count,
-    total: animeCount.data().count + movieCount.data().count + seriesCount.data().count,
-    uploadsToday: uploadsTodaySnap.data().count,
-    lastUpload: lastUploadSnap.empty ? null : lastUploadSnap.docs[0].data(),
-    largest: largestSnap.empty ? null : largestSnap.docs[0].data(),
-  };
-  setCache('stats', stats);
-  return stats;
-}
-
-async function renderStats(chatId, editMessageId) {
-  const start = Date.now();
-  const s = await computeStats();
-  const elapsed = Date.now() - start;
-
-  const lines = [
-    '📊 <b>MYFLIX Stats</b>',
-    '',
-    `Total Videos: ${s.total}`,
-    `Anime: ${s.animeTotal}`,
-    `Movies: ${s.movieTotal}`,
-    `Web Series: ${s.seriesTotal}`,
-    '',
-    `Uploads Today: ${s.uploadsToday}`,
-    `Last Upload: ${s.lastUpload ? s.lastUpload.title + ` (S${s.lastUpload.season}E${s.lastUpload.episode})` : '—'}`,
-    `Largest Video: ${s.largest ? `${s.largest.title} (${formatBytes(s.largest.fileSizeBytes)})` : '—'}`,
-    '',
-    `Firestore Latency: ${formatDuration(elapsed)}`,
-  ];
-  const options = { reply_markup: { inline_keyboard: [[{ text: '🔄 Refresh', callback_data: 'rf:stats' }]] } };
-  if (editMessageId) await safeEditMessageText(lines.join('\n'), { chat_id: chatId, message_id: editMessageId, ...options });
-  else await safeSendMessage(chatId, lines.join('\n'), options);
-}
-registerCommand('stats', (msg) => renderStats(msg.chat.id, null));
-
-async function computeStorage() {
-  const cached = getCache('storage');
-  if (cached) return cached;
-
-  const col = db.collection(VIDEOS_COLLECTION);
-  const perCategory = {};
-  let totalBytes = 0;
-
-  for (const category of Object.values(CATEGORIES)) {
-    const snap = await withRetry(() => col.where('category', '==', category).select('fileSizeBytes').get(), { label: 'computeStorage' });
-    let bytes = 0;
-    snap.forEach((d) => { bytes += d.get('fileSizeBytes') || 0; });
-    perCategory[category] = bytes;
-    totalBytes += bytes;
-  }
-
-  const result = { totalBytes, perCategory };
-  setCache('storage', result);
-  return result;
-}
-
-async function renderStorage(chatId, editMessageId) {
-  const start = Date.now();
-  const s = await computeStorage();
-  const elapsed = Date.now() - start;
-
-  const lines = [
-    '💾 <b>Storage Breakdown</b>',
-    '',
-    `Total: ${formatBytes(s.totalBytes)}`,
-    `Anime: ${formatBytes(s.perCategory[CATEGORIES.ANIME])}`,
-    `Movies: ${formatBytes(s.perCategory[CATEGORIES.MOVIES])}`,
-    `Web Series: ${formatBytes(s.perCategory[CATEGORIES.WEBSERIES])}`,
-    '',
-    `Computed in: ${formatDuration(elapsed)}`,
-    '<i>Note: figures rely on Telegram-reported file sizes captured at upload time.</i>',
-  ];
-  const options = { reply_markup: { inline_keyboard: [[{ text: '🔄 Refresh', callback_data: 'rf:storage' }]] } };
-  if (editMessageId) await safeEditMessageText(lines.join('\n'), { chat_id: chatId, message_id: editMessageId, ...options });
-  else await safeSendMessage(chatId, lines.join('\n'), options);
-}
-registerCommand('storage', (msg) => renderStorage(msg.chat.id, null));
-
-async function renderHealth(chatId, editMessageId) {
-  const dbStart = Date.now();
-  let firestoreLatency = -1;
-  try {
-    await withTimeout(db.collection(VIDEOS_COLLECTION).limit(1).get(), 5000, 'firestore health check');
-    firestoreLatency = Date.now() - dbStart;
-  } catch (err) {
-    logError('Firestore health check failed', err);
-  }
-
-  const mem = process.memoryUsage();
-  const totalBufferCount = Object.values(adminBuffer).reduce((sum, arr) => sum + arr.length, 0);
-
-  const lines = [
-    '🩺 <b>Bot Health</b>',
-    '',
-    `Status: ${firestoreLatency >= 0 ? '✅ Healthy' : '❌ Firestore unreachable'}`,
-    `Firestore Latency: ${firestoreLatency >= 0 ? formatDuration(firestoreLatency) : 'timeout'}`,
-    `Uptime: ${formatUptime(process.uptime())}`,
-    `Memory (RSS): ${formatBytes(mem.rss)}`,
-    `Memory (Heap): ${formatBytes(mem.heapUsed)} / ${formatBytes(mem.heapTotal)}`,
-    `Buffered Videos (all chats): ${totalBufferCount}`,
-    `Pending Confirmations: ${pendingActions.size}`,
-    `Node: ${process.version}`,
-  ];
-  const options = { reply_markup: { inline_keyboard: [[{ text: '🔄 Refresh', callback_data: 'rf:health' }]] } };
-  if (editMessageId) await safeEditMessageText(lines.join('\n'), { chat_id: chatId, message_id: editMessageId, ...options });
-  else await safeSendMessage(chatId, lines.join('\n'), options);
-}
-registerCommand('health', (msg) => renderHealth(msg.chat.id, null));
-
-registerCommand('logs', async (msg) => {
-  if (LOG_RING.length === 0) {
-    await safeSendMessage(msg.chat.id, 'ℹ️ No logs recorded yet.', {});
-    return;
-  }
-  const recent = LOG_RING.slice(-20);
-  const body = recent.map((l) => `<code>${new Date(l.t).toISOString().slice(11, 19)}</code> ${escapeHtml(l.message.split('\n')[0]).slice(0, 200)}`).join('\n');
-  const text = `🧾 <b>Recent Logs</b> (last ${recent.length})\n\n${body}`.slice(0, 4000);
-  await safeSendMessage(msg.chat.id, text, {});
-});
-
-registerCommand('ping', async (msg) => {
-  const start = Date.now();
-  const sent = await safeSendMessage(msg.chat.id, '🏓 Pinging…', {});
-  const elapsed = Date.now() - start;
-  if (sent) {
-    await safeEditMessageText(`🏓 Pong! ${elapsed}ms`, { chat_id: msg.chat.id, message_id: sent.message_id });
-  }
-});
-
-function escapeHtml(str) {
-  return String(str).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
-}
-
-// ============================================================================
-// SECTION 18 — SEARCH (Requirement 7)
-// ============================================================================
-
-registerCommand('find', async (msg, arg) => {
-  assertValid(arg, 'Usage: /find title|episode|season|language|category <value>');
-  const spaceIdx = arg.indexOf(' ');
-  assertValid(spaceIdx > 0, 'Usage: /find title|episode|season|language|category <value>');
-
-  const field = arg.slice(0, spaceIdx).trim().toLowerCase();
-  const value = arg.slice(spaceIdx + 1).trim();
-  assertValid(value, 'Please provide a value to search for.');
-
-  const col = db.collection(VIDEOS_COLLECTION);
-  let snaps = [];
-
-  switch (field) {
-    case 'title': {
-      const t = validateTitle(value);
-      const [byTitle, bySeries] = await Promise.all([
-        withRetry(() => col.where('title', '>=', t).where('title', '<=', t + '\uf8ff').limit(FIND_RESULT_LIMIT).get()),
-        withRetry(() => col.where('seriesTitle', '>=', t).where('seriesTitle', '<=', t + '\uf8ff').limit(FIND_RESULT_LIMIT).get()),
-      ]);
-      snaps = [...byTitle.docs, ...bySeries.docs];
-      break;
-    }
-    case 'episode': {
-      const e = validateEpisode(value);
-      const r = await withRetry(() => col.where('episode', '==', e).limit(FIND_RESULT_LIMIT).get());
-      snaps = r.docs;
-      break;
-    }
-    case 'season': {
-      const s = validateSeason(value);
-      const r = await withRetry(() => col.where('season', '==', s).limit(FIND_RESULT_LIMIT).get());
-      snaps = r.docs;
-      break;
-    }
-    case 'language': {
-      const l = validateLanguage(value);
-      const r = await withRetry(() => col.where('language', '==', l).limit(FIND_RESULT_LIMIT).get());
-      snaps = r.docs;
-      break;
-    }
-    case 'category': {
-      const c = normalizeCategory(value);
-      const r = await withRetry(() => col.where('category', '==', c).limit(FIND_RESULT_LIMIT).get());
-      snaps = r.docs;
-      break;
-    }
-    default:
-      throw new ValidationError('First word must be one of: title, episode, season, language, category.');
-  }
-
-  const seen = new Map();
-  for (const d of snaps) seen.set(d.id, d.data());
-
-  if (seen.size === 0) {
-    await safeSendMessage(msg.chat.id, `🔍 No results for ${field} "${value}".`, {});
     return;
   }
 
-  const lines = [`🔍 <b>Search results</b> — ${field}: "${value}" (${seen.size})`, ''];
-  let i = 0;
-  for (const [id, d] of seen.entries()) {
-    if (i >= FIND_RESULT_LIMIT) break;
-    lines.push(`• <b>${d.title}</b> [${d.category}] S${d.season}E${d.episode} · ${d.language}`);
-    lines.push(`  <code>${id}</code>`);
-    i++;
+  if (state.mode === 'upload_mode') {
+    const isVideo = msg.video || (msg.document && msg.document.mime_type?.startsWith('video/'));
+    if (!isVideo) return;
+
+    const mediaObj = msg.video || msg.document;
+    diagLog('telegram api', 'Incoming media hook caught inside operational tracking configurations.', { fileUniqueId: mediaObj.file_unique_id });
+
+    const collection = COLLECTION_MAP[state.type];
+    const parsedSeason = parseInt(state.collected.season, 10) || 1;
+
+    try {
+      // Step 1: Prevent duplicate processing matching exact unique file hash marks immediately
+      const dupFileCheck = await db.collection(collection)
+        .where('file_unique_id', '==', mediaObj.file_unique_id)
+        .limit(1)
+        .get();
+
+      if (!dupFileCheck.empty) {
+        diagLog('firestore', 'Blocking duplicate attempt matching exact fingerprint hash metadata criteria', { fileUniqueId: mediaObj.file_unique_id });
+        await bot.sendMessage(chatId, `⚠️ <b>Duplicate Upload Dropped!</b> This exact video file fingerprint has already been registered in the database.`, { parse_mode: 'HTML' });
+        return;
+      }
+
+      // Dynamic forward direct optimization detection block
+      // Copies the video instantly to the private storage channel without processing if Telegram permits it
+      if (msg.forward_from_chat || msg.chat.type === 'channel') {
+        diagLog('telegram api', 'Attempting direct structural link cloning mapping parameters without network routing passes...');
+        try {
+          const directCopyMsg = await bot.copyMessage(STORAGE_CHANNEL_ID, msg.chat.id, msg.message_id, {
+            caption: `${state.collected.title} - S${parsedSeason} [Direct Copy Transfer Mapping]`
+          });
+          
+          if (directCopyMsg && directCopyMsg.message_id) {
+            diagLog('telegram api', 'Direct link duplication operation executed successfully.');
+            await bot.sendMessage(chatId, `⚡ <b>Direct Forward Copy Succeeded!</b> Skimmed conversion process paths safely.`, { parse_mode: 'HTML' });
+            
+            // Register item inside Firestore system models directly
+            await db.collection(collection).add({
+              title: state.collected.title,
+              season: parsedSeason,
+              episode: 999, // Static boundary or placeholder for standalone files transfers configurations mappings
+              language: state.collected.language,
+              quality: state.collected.quality,
+              status: 'completed',
+              messageId: directCopyMsg.message_id,
+              channelId: STORAGE_CHANNEL_ID,
+              file_unique_id: mediaObj.file_unique_id,
+              createdAt: getAdmin().firestore.FieldValue.serverTimestamp()
+            });
+            return;
+          }
+        } catch (copyErr) {
+          diagLog('warnings', 'Direct transfer replication rejected. Falling back to local pipeline structures.', { reason: copyErr.message });
+        }
+      }
+
+      // Step 2: ACID Transactions Block to auto-index and allocate unique episode numbers safely
+      let nextEpisode = 1;
+      const targetDocId = `${collection}_${crypto.randomBytes(4).toString('hex')}`;
+      const docRef = db.collection(collection).doc(targetDocId);
+
+      await db.runTransaction(async (transaction) => {
+        const queryRef = db.collection(collection)
+          .where('title', '==', state.collected.title)
+          .where('season', '==', parsedSeason);
+          
+        const querySnapshot = await transaction.get(queryRef);
+        
+        if (!querySnapshot.empty) {
+          const activeEpisodes = querySnapshot.docs.map(d => parseInt(d.data().episode, 10) || 0);
+          nextEpisode = Math.max(...activeEpisodes) + 1;
+        }
+
+        const payloadData = {
+          title: state.collected.title,
+          season: parsedSeason,
+          episode: nextEpisode,
+          language: state.collected.language,
+          quality: state.collected.quality,
+          poster: state.collected.poster || null,
+          banner: state.collected.banner || null,
+          description: state.collected.description || null,
+          telegram_file_id: mediaObj.file_id,
+          file_unique_id: mediaObj.file_unique_id,
+          mimeType: mediaObj.mime_type || 'video/mp4',
+          fileSizeBytes: mediaObj.file_size || 0,
+          duration: mediaObj.duration || 0,
+          status: 'pending_processing',
+          channelId: chatId,
+          messageId: null,
+          createdAt: getAdmin().firestore.FieldValue.serverTimestamp(),
+          updatedAt: getAdmin().firestore.FieldValue.serverTimestamp()
+        };
+
+        transaction.set(docRef, payloadData);
+      });
+
+      diagLog('firestore', 'ACID transaction committed safely.', { docId: targetDocId, episode: nextEpisode });
+      await bot.sendMessage(chatId, `📥 Staged: <b>Episode ${nextEpisode}</b> for processing sequence arrays pipelines.`, { parse_mode: 'HTML' });
+
+      // Fetch freshly instantiated parameters map payload elements from document target context data values
+      const postFetchDoc = await docRef.get();
+      runPipelineRouter(targetDocId, postFetchDoc.data(), collection);
+
+    } catch (err) {
+      diagLog('errors', 'Failed transactional parsing validation matrix logic routines inside worker flows.', { error: err.message });
+      await bot.sendMessage(chatId, `❌ Pipeline execution failure context error: ${err.message}`);
+    }
   }
-  await safeSendMessage(msg.chat.id, lines.join('\n'), {});
 });
 
 // ============================================================================
-// SECTION 19 — UNKNOWN COMMAND FALLBACK
+// STAGE 5 — ADMINISTRATIVE AND MANAGEMENT MODULE COMMAND INTERFACES
 // ============================================================================
-
-bot.onText(/^\/(\w+)/, async (msg, match) => {
-  const known = new Set([
-    'start', 'help', 'saveanime', 'savemovie', 'savewebseries', 'autosave',
-    'deleteanime', 'deletemovie', 'deleteseries',
-    'deletelanguage', 'deleteallanime', 'deleteallmovies', 'deleteallwebseries',
-    'listanime', 'listmovies', 'listwebseries', 'stats', 'storage', 'health', 'logs', 'ping',
-    'maxbuffer', 'showbuffer', 'clearbuffer', 'find',
-  ]);
-  const cmd = match[1].toLowerCase();
-  if (known.has(cmd)) return; // already handled by a dedicated listener
-  if (!isAdmin(msg.chat.id)) return;
-  await safeSendMessage(msg.chat.id, `❓ Unknown command /${cmd}. Send /help to see everything I support.`, {});
+registerAdminCommand('admin status', async (msg) => {
+  const statusReport = [
+    '⚙️ <b>System Pipeline Operations Status</b>',
+    `Processing Core State: ${queuePaused ? '⏸ PAUSED' : '▶️ ACTIVE'}`,
+    `Download Cluster Jobs: ${downloadQueue.pending} active / ${downloadQueue.size} pending`,
+    `Compression Cluster Jobs: ${compressionQueue.pending} active / ${compressionQueue.size} pending`,
+    `Preservation Upload Queue: ${uploadQueue.pending} active / ${uploadQueue.size} pending`,
+    `Running Structural Workers Count: ${activeJobsCount}`
+  ].join('\n');
+  await bot.sendMessage(msg.chat.id, statusReport, { parse_mode: 'HTML' });
 });
 
+registerAdminCommand('admin queue', async (msg) => {
+  await bot.sendMessage(msg.chat.id, `📋 Core operational backlog count value metric: <b>${downloadQueue.size + compressionQueue.size + uploadQueue.size} items pending execution</b>.`, { parse_mode: 'HTML' });
+});
+
+registerAdminCommand('admin pause', async (msg) => {
+  queuePaused = true;
+  diagLog('queue', 'Pipeline operations execution loops suspended by administrative override directive.');
+  await bot.sendMessage(msg.chat.id, '⏸ <b>Processing Workers Suspended!</b> Incoming objects will store state properties until /admin resume.');
+});
+
+registerAdminCommand('admin resume', async (msg) => {
+  queuePaused = false;
+  diagLog('queue', 'Pipeline processing modules operationalized again.');
+  await bot.sendMessage(msg.chat.id, '▶️ <b>Processing Workers Reactivated!</b> Flushing backlog queue elements across pipeline modules.');
+  await recoverPendingQueue();
+});
+
+registerAdminCommand('admin retry', async (msg) => {
+  await bot.sendMessage(msg.chat.id, '🔄 Refreshing and re-evaluating broken/failed process components within structural tracking tables...');
+  await recoverPendingQueue();
+});
+
+registerAdminCommand('admin cancel', async (msg) => {
+  downloadQueue.clear();
+  compressionQueue.clear();
+  uploadQueue.clear();
+  diagLog('queue', 'Purged configuration execution blocks inside volatile cluster tracking spaces.');
+  await bot.sendMessage(msg.chat.id, '🗑 <b>Backlog Queues Completely Purged!</b> All cached memory processing item array references dropped.');
+});
+
+function registerAdminCommand(commandTokenStr, handlerFn) {
+  const chunks = commandTokenStr.split(' ');
+  bot.onText(new RegExp(`^\\/${chunks[0]}(?:\\s+(.*))?$`, 'i'), async (msg, match) => {
+    if (!isAdmin(msg.chat.id)) return;
+    if (chunks.length > 1) {
+      const argsText = match[1] ? match[1].trim().toLowerCase() : '';
+      if (!argsText.startsWith(chunks[1])) return;
+    }
+    diagLog('commands', `Processing incoming valid administrative command sequence string signature match verification line: /${commandTokenStr}`);
+    try {
+      await handlerFn(msg);
+    } catch (err) {
+      diagLog('errors', `Internal exception runtime interrupt processing command routing token execution block matching: /${commandTokenStr}`, { error: err.message });
+    }
+  });
+}
+
 // ============================================================================
-// SECTION 20 — EXPORTS
+// STAGE 6 — SYSTEM GRACEFUL SHUTDOWN & LIFECYCLE CONTROLS
 // ============================================================================
+async function handleSystemShutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  
+  diagLog('shutdown', `Intercepted framework lifecycle shutdown signal intercept node event: ${signal}. Commencing isolation workflows.`);
+  queuePaused = true;
+
+  downloadQueue.pause();
+  compressionQueue.pause();
+
+  let checkIterations = 0;
+  while (activeJobsCount > 0 && checkIterations < 15) {
+    diagLog('shutdown', `Waiting for active pipeline routines to drain cleanly... Threads running: ${activeJobsCount}`);
+    await new Promise(r => setTimeout(r, 2000));
+    checkIterations++;
+  }
+
+  diagLog('shutdown', 'System clean down procedures completely terminated. Finalizing processes.');
+  process.exit(0);
+}
+
+process.on('SIGINT', () => handleSystemShutdown('SIGINT'));
+process.on('SIGTERM', () => handleSystemShutdown('SIGTERM'));
 
 module.exports = {
   initBot,
   isAdmin,
   processUpdate: (update) => {
     try {
+      if (isShuttingDown) return;
       bot.processUpdate(update);
     } catch (err) {
-      logError('processUpdate failed', err);
+      diagLog('errors', 'Critical interruption handled inside raw webhook update dispatcher processing thread', { error: err.message });
     }
   },
 };
