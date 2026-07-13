@@ -4,17 +4,41 @@
  * Background compress → upload pipeline for handlers/adminUpload.js
  * (/add anime | webseries | anime-movie | movie).
  *
- *   Telegram video received
- *     -> immediately acknowledged, pushed onto the compression queue
- *     -> (background) downloaded from Telegram
- *     -> (background) FFmpeg remux/transcode -> browser-streamable MP4
- *     -> marked "ready"
- *     -> upload worker uploads READY items to the storage channel,
- *        but STRICTLY in the order they were received — an episode
- *        that finishes compressing early still waits for every earlier
- *        episode to finish uploading first.
- *     -> Firestore doc written (auto season/episode numbering)
- *     -> temp files deleted
+ * SOURCE HANDLING (fixes "Source message not found (channelId=<userId>,
+ * messageId=<n>)"):
+ *   - A video uploaded DIRECTLY to the bot is identified purely by its
+ *     Telegram `file_id` and downloaded via the plain Bot API
+ *     (services/telegramUpload.js#downloadViaBotApi). It is NEVER looked
+ *     up by channelId+messageId — a private bot chat is a user peer, not
+ *     a channel, and the MTProto channel-message lookup used for the
+ *     storage channel elsewhere in this project does not apply to it.
+ *   - A video FORWARDED from a channel is detected from the incoming
+ *     message's forward metadata. We first try a server-side
+ *     bot.copyMessage() straight into the storage channel (no download
+ *     at all); if that isn't possible (bot not in the source channel,
+ *     message gone, etc.) we transparently fall back to the same
+ *     file_id-based download+compress+upload path used for direct
+ *     uploads.
+ *   - A "Copy"'d message (Telegram's own copy feature, as opposed to
+ *     Forward) carries no forward metadata at all — Telegram makes it
+ *     indistinguishable from a direct upload — so it naturally goes
+ *     through the direct-upload path, which is the correct behavior.
+ *
+ * QUEUE BEHAVIOR:
+ *   - Each item moves through its own state machine independently:
+ *     waiting -> (copying -> [done]) OR (downloading -> compressing ->
+ *     ready -> uploading -> done), with 'failed' reachable from any
+ *     active stage after 3 retries of THAT stage only.
+ *   - Compression/download runs in the background with bounded
+ *     concurrency, order-independent — the bot keeps accepting new
+ *     episodes while others are mid-pipeline.
+ *   - The final "publish" step (copy, or upload-to-storage-channel +
+ *     Firestore write) is strictly ordered: episode 3 never gets
+ *     published before episode 1 and 2, even if it finished compressing
+ *     first.
+ *   - A failed item does NOT stop the batch — remaining episodes keep
+ *     processing, and the exact error is shown to the admin against that
+ *     episode's line in the progress message.
  *
  * One session = one admin's currently-open /add wizard + its queue of
  * episodes. Sessions live only in memory (single-process, matches the
@@ -56,6 +80,12 @@ function slugify(str) {
   return String(str).toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-+|-+$)/g, '').slice(0, 80) || 'untitled';
 }
 
+// Set once via setBotInstance() at startup (handlers/adminUpload.js) —
+// needed here for Bot-API downloads and copyMessage, neither of which
+// go through the MTProto client.
+let botInstance = null;
+function setBotInstance(bot) { botInstance = bot; }
+
 // ============================================================================
 // SESSIONS
 // ============================================================================
@@ -65,9 +95,9 @@ const sessions = new Map();
 
 /**
  * @param {number} chatId
- * @param {object} meta { kind: 'anime'|'webseries'|'anime-movie'|'movie', category, title, season, language, quality, year, storageChannelId }
- * @param {(text:string)=>Promise<void>} onProgress called (debounced by caller) whenever item states change
- * @param {(session:object)=>Promise<void>} onFinished called once every item is done or the session is paused on failure
+ * @param {object} meta { kind, category, hasSeason, title, season, language, quality, year, storageChannelId }
+ * @param {(session:object)=>Promise<void>} callbacks.onProgress called whenever item states change
+ * @param {(session:object)=>Promise<void>} callbacks.onFinished called once every item reaches done/failed and the wizard is finalized
  */
 function createSession(chatId, meta, { onProgress, onFinished }) {
   const session = {
@@ -75,13 +105,13 @@ function createSession(chatId, meta, { onProgress, onFinished }) {
     ...meta,
     items: [],
     episodeBase: null, // resolved lazily, once, from Firestore
-    paused: false,
     finalizing: false,
     closed: false,
     onProgress,
     onFinished,
   };
   sessions.set(chatId, session);
+  log.info('createSession', 'New /add session created', { chatId, kind: meta.kind, title: meta.title, season: meta.season });
   return session;
 }
 
@@ -112,22 +142,16 @@ async function maybeCompleteSession(session) {
   await closeSession(session);
 }
 
-/**
- * Ends a session right away and reports the final summary. Used both for
- * the normal "everything settled" completion path and for the pause
- * path below — pausing means "stop everything, nothing more happens
- * automatically", so the chat shouldn't stay permanently blocked from
- * starting a new /add session just because some items never got past
- * "waiting" (still-queued jobs bail out harmlessly once the session is
- * gone — see the `if (!session ...) return;` guards below).
- */
 async function closeSession(session) {
   if (session.closed) return;
   session.closed = true;
+  const done = session.items.filter((it) => it.status === 'done').length;
+  const failed = session.items.filter((it) => it.status === 'failed').length;
+  log.info('closeSession', 'Session complete', { chatId: session.chatId, done, failed, total: session.items.length });
   try {
     await session.onFinished(session);
   } catch (err) {
-    log.error('closeSession', 'onFinished callback threw', err, { chatId: session.chatId });
+    log.error('closeSession', 'onFinished callback threw', err, { chatId: session.chatId, stack: err.stack });
   }
   endSession(session.chatId);
 }
@@ -160,24 +184,56 @@ async function resolveEpisodeBase(session) {
 }
 
 // ============================================================================
+// SOURCE DETECTION
+// ============================================================================
+
+/**
+ * Detects whether an incoming message was forwarded from a channel, using
+ * the current Bot API's `forward_origin` field (Bot API 7.0+) with a
+ * fallback to the legacy `forward_from_chat`/`forward_from_message_id`
+ * fields for older clients/library versions. Returns null for a direct
+ * upload OR a Telegram "Copy"'d message — Telegram does not attach any
+ * forward metadata to copied messages, so those are indistinguishable
+ * from direct uploads and correctly fall through to the download path.
+ */
+function detectForwardOrigin(msg) {
+  const origin = msg.forward_origin;
+  if (origin && origin.type === 'channel' && origin.chat && origin.message_id) {
+    return { chatId: origin.chat.id, messageId: origin.message_id };
+  }
+  if (msg.forward_from_chat && msg.forward_from_chat.type === 'channel' && msg.forward_from_message_id) {
+    return { chatId: msg.forward_from_chat.id, messageId: msg.forward_from_message_id };
+  }
+  return null;
+}
+
+// ============================================================================
 // ADDING ITEMS (called from the Telegram video/document handler)
 // ============================================================================
 
 /**
  * @param {object} session
- * @param {{file_id:string, file_unique_id:string, file_size?:number}} media
- * @param {{chat:{id:number}, message_id:number}} msg the raw Telegram message carrying the video
+ * @param {{file_id:string, file_unique_id:string, file_size?:number, duration?:number, width?:number, height?:number}} media
+ * @param {object} msg the raw Telegram message carrying the video
  */
 function addItem(session, media, msg) {
   const seq = session.items.length;
+  const forwardOrigin = detectForwardOrigin(msg);
+
   const item = {
     seq,
+    fileId: media.file_id,
     fileUniqueId: media.file_unique_id,
-    sourceChannelId: msg.chat.id,
-    sourceMessageId: msg.message_id,
     fileSizeBytes: media.file_size || null,
-    status: 'waiting', // waiting -> downloading -> compressing -> ready -> uploading -> done | failed
-    attempts: { compress: 0, upload: 0 },
+    durationHint: media.duration || 0,
+    widthHint: media.width || 0,
+    heightHint: media.height || 0,
+    sourceType: forwardOrigin ? 'forwarded' : 'direct',
+    forwardChatId: forwardOrigin ? forwardOrigin.chatId : null,
+    forwardMessageId: forwardOrigin ? forwardOrigin.messageId : null,
+    needsCopyAttempt: !!forwardOrigin,
+    status: 'waiting', // waiting -> [copying ->] downloading -> compressing -> ready -> uploading -> done | failed
+    attempts: { copy: 0, compress: 0, upload: 0 },
     episode: null,
     tempIn: null,
     tempOut: null,
@@ -186,8 +242,22 @@ function addItem(session, media, msg) {
     uploading: false,
   };
   session.items.push(item);
-  compressQueue.push({ chatId: session.chatId, seq });
-  pumpCompressQueue();
+
+  log.info('addItem', 'Upload received', {
+    chatId: session.chatId, seq, sourceType: item.sourceType,
+    fileUniqueId: item.fileUniqueId, fileSizeBytes: item.fileSizeBytes,
+  });
+
+  if (item.sourceType === 'forwarded') {
+    // copyMessage is a cheap, near-instant server-side Telegram call, so
+    // there's no need to background it like compression — it's attempted
+    // when the item's turn comes up in the strictly-ordered publish step.
+    item.status = 'ready';
+    pumpUploadQueue();
+  } else {
+    compressQueue.push({ chatId: session.chatId, seq });
+    pumpCompressQueue();
+  }
   return item;
 }
 
@@ -203,7 +273,7 @@ function pumpCompressQueue() {
     const job = compressQueue.shift();
     compressActive++;
     runCompressJob(job)
-      .catch((err) => log.error('pumpCompressQueue', 'Unhandled compress job error', err, job))
+      .catch((err) => log.error('pumpCompressQueue', 'Unhandled compress job error', err, { ...job, stack: err.stack }))
       .finally(() => {
         compressActive--;
         pumpCompressQueue();
@@ -213,14 +283,29 @@ function pumpCompressQueue() {
 
 function cleanupFile(p) {
   if (!p) return;
-  fs.unlink(p, () => {}); // best-effort, never blocks the pipeline on cleanup errors
+  fs.unlink(p, (err) => {
+    if (err && err.code !== 'ENOENT') log.warn('cleanupFile', 'Failed to remove temp file', { path: p, reason: err.message });
+  });
 }
 
 async function runCompressJob({ chatId, seq }) {
   const session = sessions.get(chatId);
   if (!session || session.closed) return;
   const item = session.items[seq];
-  if (!item || session.paused) return;
+  if (!item) return;
+
+  if (item.fileSizeBytes && item.fileSizeBytes > transfer.BOT_API_DOWNLOAD_LIMIT_BYTES) {
+    const sizeMb = (item.fileSizeBytes / 1024 / 1024).toFixed(1);
+    const message = `File is ${sizeMb}MB — Telegram's Bot API only allows downloading files up to 20MB directly. ` +
+      `Forward this video from a channel the bot is a member of instead (copied server-side, no size limit).`;
+    log.error('runCompressJob', 'File too large for Bot API download', new Error(message), { chatId, seq, fileSizeBytes: item.fileSizeBytes });
+    item.status = 'failed';
+    item.error = message;
+    await session.onProgress(session);
+    await maybeCompleteSession(session);
+    pumpUploadQueue();
+    return;
+  }
 
   const stamp = `${chatId}_${seq}_${Date.now()}`;
   const inPath = path.join(UPLOADS_DIR, `${stamp}.src`);
@@ -230,32 +315,42 @@ async function runCompressJob({ chatId, seq }) {
     item.attempts.compress = attempt;
     try {
       item.status = 'downloading';
+      log.info('runCompressJob', `Download started (attempt ${attempt}/${MAX_ATTEMPTS})`, { chatId, seq, fileId: item.fileId });
       await session.onProgress(session);
 
-      await transfer.downloadEpisode(item.sourceChannelId, item.sourceMessageId, inPath);
+      await transfer.downloadViaBotApi(botInstance, item.fileId, inPath);
       item.tempIn = inPath;
+      log.success('runCompressJob', 'Download completed', { chatId, seq, path: inPath });
 
       item.status = 'compressing';
+      log.info('runCompressJob', 'Compression started', { chatId, seq });
       await session.onProgress(session);
 
       const info = await compress.processFile(inPath, outPath);
       item.tempOut = outPath;
       item.probe = info;
+      log.success('runCompressJob', 'Compression completed', { chatId, seq, mode: info.mode, duration: info.duration });
 
       item.status = 'ready';
+      item.needsCopyAttempt = false;
       await session.onProgress(session);
       pumpUploadQueue();
       return;
     } catch (err) {
-      log.error('runCompressJob', `Compression attempt ${attempt}/${MAX_ATTEMPTS} failed`, err, { chatId, seq });
+      log.error('runCompressJob', `Attempt ${attempt}/${MAX_ATTEMPTS} failed`, err, { chatId, seq, stack: err.stack });
       cleanupFile(inPath);
       cleanupFile(outPath);
+      item.tempIn = null;
+      item.tempOut = null;
+
       if (attempt >= MAX_ATTEMPTS) {
+        // Only THIS episode fails — the batch and every other episode
+        // keep going (tickSessionUpload skips 'failed' items).
         item.status = 'failed';
-        item.error = `Compression failed after ${MAX_ATTEMPTS} attempts: ${err.message}`;
-        session.paused = true;
+        item.error = `Download/compression failed after ${MAX_ATTEMPTS} attempts: ${err.message}`;
         await session.onProgress(session);
-        await closeSession(session);
+        await maybeCompleteSession(session);
+        pumpUploadQueue();
         return;
       }
       await sleep(RETRY_BASE_DELAY_MS * attempt);
@@ -264,7 +359,7 @@ async function runCompressJob({ chatId, seq }) {
 }
 
 // ============================================================================
-// UPLOAD QUEUE (strict FIFO across the whole session — never skips ahead)
+// PUBLISH QUEUE (strict FIFO across the whole session — never skips ahead)
 // ============================================================================
 
 let uploadTickScheduled = false;
@@ -276,11 +371,11 @@ function pumpUploadQueue() {
     uploadTickScheduled = false;
     try {
       for (const session of sessions.values()) {
-        if (session.paused || session.closed) continue;
+        if (session.closed) continue;
         await tickSessionUpload(session);
       }
     } catch (err) {
-      log.error('pumpUploadQueue', 'Tick failed', err);
+      log.error('pumpUploadQueue', 'Tick failed', err, { stack: err.stack });
     }
   });
 }
@@ -299,17 +394,67 @@ async function tickSessionUpload(session) {
 
   next.uploading = true;
   try {
-    await uploadItem(session, next);
+    if (next.needsCopyAttempt) {
+      const copied = await tryCopyPath(session, next);
+      if (!copied) {
+        // Fell back to download+compress — pumpUploadQueue() will revisit
+        // this same item once compression marks it 'ready' again.
+        next.uploading = false;
+        return;
+      }
+    } else {
+      await uploadPreparedFile(session, next);
+    }
   } finally {
     next.uploading = false;
   }
+  pumpUploadQueue(); // immediately check whether the next item is also ready
 }
 
-async function uploadItem(session, item) {
+/** @returns {boolean} true if the copy succeeded and the item is fully done */
+async function tryCopyPath(session, item) {
+  item.attempts.copy += 1;
+  item.status = 'copying';
+  log.info('tryCopyPath', 'Copy attempt started', { chatId: session.chatId, seq: item.seq, attempt: item.attempts.copy });
+  await session.onProgress(session);
+
+  try {
+    const { messageId } = await transfer.copyMessageToStorage(
+      botInstance, item.forwardChatId, item.forwardMessageId, session.storageChannelId
+    );
+
+    const episode = session.hasSeason ? (await resolveEpisodeBase(session)) + item.seq : null;
+    item.episode = episode;
+
+    await writeFirestoreDoc(session, item, episode, {
+      channelId: session.storageChannelId,
+      messageId,
+      documentId: item.fileId,
+      size: item.fileSizeBytes || 0,
+    });
+    log.success('tryCopyPath', 'Firestore updated', { chatId: session.chatId, seq: item.seq, episode });
+
+    item.status = 'done';
+    log.success('tryCopyPath', 'Cleanup completed (nothing to clean up — no local files were used)', { chatId: session.chatId, seq: item.seq });
+    await session.onProgress(session);
+    return true;
+  } catch (err) {
+    log.error('tryCopyPath', 'Copy not possible — falling back to download+compress+upload', err, { chatId: session.chatId, seq: item.seq, stack: err.stack });
+    item.needsCopyAttempt = false;
+    item.status = 'waiting';
+    await session.onProgress(session);
+    compressQueue.push({ chatId: session.chatId, seq: item.seq });
+    pumpCompressQueue();
+    return false;
+  }
+}
+
+async function uploadPreparedFile(session, item) {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     item.attempts.upload = attempt;
     try {
       item.status = 'uploading';
+      log.info('uploadPreparedFile', `Upload started (attempt ${attempt}/${MAX_ATTEMPTS})`, { chatId: session.chatId, seq: item.seq });
       await session.onProgress(session);
 
       const episode = session.hasSeason ? (await resolveEpisodeBase(session)) + item.seq : null;
@@ -318,27 +463,32 @@ async function uploadItem(session, item) {
       const fileName = buildFileName(session, item, episode);
       const result = await transfer.uploadEpisode(session.storageChannelId, item.tempOut, {
         fileName,
-        duration: item.probe?.duration || 0,
-        width: item.probe?.width || 0,
-        height: item.probe?.height || 0,
+        duration: item.probe?.duration || item.durationHint || 0,
+        width: item.probe?.width || item.widthHint || 0,
+        height: item.probe?.height || item.heightHint || 0,
       });
+      log.success('uploadPreparedFile', 'Upload completed', { chatId: session.chatId, seq: item.seq, newMessageId: result.messageId });
 
       await writeFirestoreDoc(session, item, episode, result);
+      log.success('uploadPreparedFile', 'Firestore updated', { chatId: session.chatId, seq: item.seq, episode });
 
       item.status = 'done';
       cleanupFile(item.tempIn);
       cleanupFile(item.tempOut);
+      log.success('uploadPreparedFile', 'Cleanup completed', { chatId: session.chatId, seq: item.seq });
+
       await session.onProgress(session);
-      pumpUploadQueue();
       return;
     } catch (err) {
-      log.error('uploadItem', `Upload attempt ${attempt}/${MAX_ATTEMPTS} failed`, err, { chatId: session.chatId, seq: item.seq });
+      log.error('uploadPreparedFile', `Attempt ${attempt}/${MAX_ATTEMPTS} failed`, err, { chatId: session.chatId, seq: item.seq, stack: err.stack });
       if (attempt >= MAX_ATTEMPTS) {
+        // Only THIS episode fails — the batch and every other episode
+        // keep going (tickSessionUpload skips 'failed' items).
         item.status = 'failed';
         item.error = `Upload failed after ${MAX_ATTEMPTS} attempts: ${err.message}`;
-        session.paused = true; // "pause queue, do not continue with later episodes"
+        cleanupFile(item.tempIn);
+        cleanupFile(item.tempOut);
         await session.onProgress(session);
-        await closeSession(session);
         return;
       }
       await sleep(RETRY_BASE_DELAY_MS * attempt);
@@ -393,7 +543,7 @@ async function writeFirestoreDoc(session, item, episode, uploadResult) {
     language: session.language,
     quality: session.quality || null,
     year: session.year || null,
-    duration: item.probe?.duration || 0,
+    duration: item.probe?.duration || item.durationHint || 0,
     fileSizeBytes: uploadResult.size,
     published: true,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -410,6 +560,7 @@ async function writeFirestoreDoc(session, item, episode, uploadResult) {
 
 const STATUS_ICON = {
   waiting: '⏳',
+  copying: '🔗',
   downloading: '📥',
   compressing: '🔄',
   ready: '📦',
@@ -419,9 +570,10 @@ const STATUS_ICON = {
 };
 const STATUS_LABEL = {
   waiting: 'Waiting',
+  copying: 'Copying from channel',
   downloading: 'Downloading',
   compressing: 'Compressing',
-  ready: 'Queued for upload',
+  ready: 'Queued',
   uploading: 'Uploading',
   done: 'Uploaded',
   failed: 'Failed',
@@ -440,14 +592,15 @@ function renderSessionText(session) {
     const icon = STATUS_ICON[item.status] || '❓';
     const statusText = STATUS_LABEL[item.status] || item.status;
     let line = `${escapeHtml(epLabel)} ${icon} ${statusText}`;
-    if (item.status === 'failed' && item.error) line += ` — ${escapeHtml(item.error.slice(0, 120))}`;
+    if (item.status === 'failed' && item.error) line += ` — ${escapeHtml(item.error.slice(0, 200))}`;
     lines.push(line);
   });
 
-  if (session.paused) {
-    lines.push('', '⏸ <b>Queue paused</b> — an episode failed after 3 retries. Fix the issue and re-upload it, or clear this batch and start again.');
-  } else if (!session.finalizing) {
+  const stillActive = session.items.some((it) => it.status !== 'done' && it.status !== 'failed');
+  if (!session.finalizing) {
     lines.push('', 'ℹ️ Still accepting episodes — send more, or send <b>Done</b> when finished.');
+  } else if (stillActive) {
+    lines.push('', '⏳ Finishing remaining episodes…');
   }
 
   return lines.join('\n');
@@ -458,6 +611,7 @@ function escapeHtml(str) {
 }
 
 module.exports = {
+  setBotInstance,
   createSession,
   getSession,
   endSession,
