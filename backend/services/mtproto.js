@@ -449,6 +449,66 @@ async function streamRange(channelId, messageId, start, end, res, { onAbort } = 
   }
 }
 
+/**
+ * Downloads a full Telegram document to a local file path. Used by the
+ * upload-pipeline compression worker (services/telegramTransfer.js) to
+ * pull a source video onto disk before handing it to FFmpeg — this is a
+ * plain sequential download (not range-based like streamRange), so it
+ * does not share the streaming semaphore with live playback requests.
+ */
+async function downloadToFile(channelId, messageId, destPath, { onProgress } = {}) {
+  const c = await connect();
+  if (!c) throw new MTProtoDisabledError();
+
+  const fs = require('fs');
+  const bigInt = require('big-integer');
+  const { Api } = require('telegram');
+
+  const { doc, size } = await resolveVideoSource(channelId, messageId);
+  const fileLocation = buildFileLocation(doc);
+  const out = fs.createWriteStream(destPath);
+
+  let offset = bigInt(0);
+  let written = 0;
+  let chunkIndex = 0;
+
+  try {
+    while (written < size) {
+      chunkIndex += 1;
+      const result = await withTimeout(
+        c.invoke(new Api.upload.GetFile({ location: fileLocation, offset, limit: DEFAULT_CHUNK_SIZE })),
+        CHUNK_REQUEST_TIMEOUT_MS,
+        `downloadToFile chunk#${chunkIndex} offset=${offset.toString()}`
+      );
+
+      if (result.className === 'upload.FileCdnRedirect') {
+        throw new Error('TELEGRAM_CDN_REDIRECT_UNSUPPORTED');
+      }
+
+      const bytes = result.bytes;
+      if (!bytes || bytes.length === 0) break;
+
+      await new Promise((resolve, reject) => {
+        out.write(bytes, (err) => (err ? reject(err) : resolve()));
+      });
+
+      written += bytes.length;
+      offset = offset.add(bytes.length);
+      if (onProgress) onProgress(written, size);
+      if (bytes.length < DEFAULT_CHUNK_SIZE) break;
+    }
+
+    if (written !== size) {
+      throw new Error(`downloadToFile: wrote ${written} of ${size} expected bytes for ${channelId}:${messageId}`);
+    }
+  } finally {
+    await new Promise((resolve) => out.end(resolve));
+  }
+
+  const fileNameAttr = (doc.attributes || []).find((a) => a.className === 'DocumentAttributeFilename');
+  return { path: destPath, size: written, mimeType: doc.mimeType || 'video/mp4', fileName: fileNameAttr?.fileName || null };
+}
+
 function health() {
   return {
     configured: CONFIGURED,
@@ -482,6 +542,9 @@ module.exports = {
   resolveVideoSource,
   verifyMessage,
   streamRange,
+  downloadToFile,
+  connect,
+  resolveEntity,
   health,
   shutdown,
   SourceNotFoundError,
