@@ -117,6 +117,7 @@ let sharedSafeEditMessageText = null;
 function registerAdminUpload(bot, { isAdmin, safeSendMessage, safeEditMessageText }) {
   sharedSafeSendMessage = safeSendMessage;
   sharedSafeEditMessageText = safeEditMessageText;
+  pipeline.setBotInstance(bot);
 
   const kindPattern = Object.keys(KIND_ALIASES).sort((a, b) => b.length - a.length).join('|');
   const addRegex = new RegExp(`^\\/add(?:@\\w+)?\\s+(${kindPattern})\\s*$`, 'i');
@@ -315,12 +316,12 @@ function makeFinishedHandler(id) {
     const failed = session.items.filter((it) => it.status === 'failed').length;
 
     const summary = [
-      session.paused ? '⏸ <b>Batch stopped</b>' : '✅ <b>Batch complete</b>',
+      failed > 0 && done > 0 ? '⚠️ <b>Batch complete (with failures)</b>' : (failed > 0 ? '❌ <b>Batch failed</b>' : '✅ <b>Batch complete</b>'),
       '',
       `Title: ${session.title}`,
       session.hasSeason ? `Season: ${session.season}` : null,
       `Uploaded: ${done}`,
-      failed ? `Failed: ${failed}` : null,
+      failed ? `Failed: ${failed} (see details above — retry those specific episodes with a new /add)` : null,
     ].filter(Boolean).join('\n');
 
     try {
