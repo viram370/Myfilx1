@@ -26,6 +26,7 @@
 'use strict';
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { makeLogger } = require('../utils/logger');
 const log = makeLogger('queue/pipeline.js');
@@ -33,7 +34,10 @@ const compress = require('../services/compress');
 const transfer = require('../services/telegramUpload');
 const { getDB, getAdmin } = require('../services/firebase');
 
-const TEMP_DIR = path.join(__dirname, '..', 'temp');
+// Uses the OS temp dir rather than a path inside the repo — safer across
+// hosts (Render, containers, etc.) where the app directory's writability
+// or persistence guarantees can vary, but /tmp is always writable.
+const TEMP_DIR = path.join(os.tmpdir(), 'myflix-add-pipeline');
 const UPLOADS_DIR = path.join(TEMP_DIR, 'uploads');
 const CONVERTED_DIR = path.join(TEMP_DIR, 'converted');
 for (const dir of [UPLOADS_DIR, CONVERTED_DIR]) {
