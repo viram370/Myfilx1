@@ -1,28 +1,141 @@
 /**
  * services/telegramUpload.js
  * ----------------------------------------------------------------------
- * Big-file transfer primitives for the admin upload pipeline, built on
- * top of the existing GramJS MTProto client in services/mtproto.js
- * (same client already used for streaming). Two operations:
+ * Transfer primitives for the admin upload pipeline (queue/pipeline.js).
  *
- *   downloadEpisode(channelId, messageId, destPath) — pulls a source
- *   video fully to disk so FFmpeg can work on it.
+ * IMPORTANT — this file intentionally does NOT use channelId+messageId to
+ * download source videos. That was the cause of:
+ *   "Compression failed after 3 attempts: Source message not found
+ *    (channelId=<userId>, messageId=<n>)."
+ * A video uploaded directly to the bot lives in the bot's private chat
+ * with the admin — that "chat" is a user peer, not a channel, and the
+ * MTProto channel-message lookup used elsewhere in this project (for the
+ * real storage channel) simply does not apply to it. Source videos are
+ * now always identified by their Telegram `file_id` instead, which the
+ * Bot API hands out for every video regardless of where it came from.
  *
- *   uploadEpisode(targetChannelId, filePath, opts) — pushes the
- *   converted file to the storage channel. Uses GramJS's client.sendFile,
- *   which chunks large uploads automatically (upload.saveBigFilePart)
- *   and is not subject to the Bot API's 50MB send limit.
+ * Three operations:
+ *
+ *   downloadViaBotApi(bot, fileId, destPath) — downloads a source video
+ *   using the plain Bot API (bot.getFile + the /file/bot<token>/... URL).
+ *   NOTE: Telegram's Bot API caps file downloads at 20MB regardless of
+ *   how large a file the bot can *receive* — this only affects the
+ *   source-download step, not the final upload (see uploadEpisode below,
+ *   which still uses MTProto and is not subject to that cap).
+ *
+ *   copyMessageToStorage(bot, fromChatId, fromMessageId, toChatId) — for
+ *   videos forwarded from a channel the bot can see: asks Telegram to
+ *   copy the message server-side directly into the storage channel, with
+ *   no download/re-upload through this server at all.
+ *
+ *   uploadEpisode(targetChannelId, filePath, opts) — pushes a locally
+ *   compressed file into the storage channel over the existing GramJS
+ *   MTProto client (services/mtproto.js), which chunks large uploads
+ *   automatically and isn't subject to the Bot API's ~50MB send limit.
  * ----------------------------------------------------------------------
  */
 'use strict';
 
+const fs = require('fs');
 const path = require('path');
+const axios = require('axios');
 const { makeLogger } = require('../utils/logger');
 const log = makeLogger('services/telegramUpload.js');
 const mtproto = require('./mtproto');
 
-async function downloadEpisode(channelId, messageId, destPath, { onProgress } = {}) {
-  return mtproto.downloadToFile(channelId, messageId, destPath, { onProgress });
+const BOT_API_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024;
+
+/**
+ * Downloads a video the bot received (directly or as a fallback when a
+ * channel copy isn't possible) using the plain Bot API — file_id based,
+ * never channelId/messageId.
+ *
+ * @param {import('node-telegram-bot-api')} bot
+ * @param {string} fileId
+ * @param {string} destPath
+ */
+async function downloadViaBotApi(bot, fileId, destPath) {
+  if (!bot) throw new Error('downloadViaBotApi: no bot instance available.');
+
+  log.info('downloadViaBotApi', 'Requesting file path from Bot API', { fileId });
+
+  let file;
+  try {
+    file = await bot.getFile(fileId);
+  } catch (err) {
+    log.error('downloadViaBotApi', 'bot.getFile failed', err, { fileId, stack: err.stack });
+    if (/file is too big/i.test(err.message || '')) {
+      throw new Error(
+        `File exceeds Telegram's Bot API 20MB download limit. Forward it from a channel the bot is a ` +
+        `member of instead (that path copies server-side with no size limit), or upload it to the ` +
+        `storage channel directly.`
+      );
+    }
+    throw new Error(`Telegram getFile failed: ${err.message}`);
+  }
+
+  if (!file || !file.file_path) {
+    throw new Error('Telegram returned no file_path — the file may exceed the Bot API\'s 20MB download limit.');
+  }
+
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) throw new Error('TELEGRAM_BOT_TOKEN is not set — cannot build the file download URL.');
+
+  const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+  log.info('downloadViaBotApi', 'Download started', { fileId, destPath, expectedSize: file.file_size || null });
+
+  const response = await axios.get(url, { responseType: 'stream', timeout: 0 });
+  const out = fs.createWriteStream(destPath);
+  let written = 0;
+
+  await new Promise((resolve, reject) => {
+    response.data.on('data', (chunk) => { written += chunk.length; });
+    response.data.on('error', reject);
+    out.on('error', reject);
+    out.on('finish', resolve);
+    response.data.pipe(out);
+  });
+
+  if (written === 0) {
+    throw new Error('Downloaded file is empty (0 bytes) — Telegram returned no content.');
+  }
+
+  log.success('downloadViaBotApi', 'Download completed', { fileId, destPath, bytes: written });
+  return { path: destPath, size: written };
+}
+
+/**
+ * Attempts a server-side copy of a channel-forwarded video straight into
+ * the storage channel, with no download at all. Throws if the bot can't
+ * see the source chat/message (e.g. it isn't a member of that channel) —
+ * callers should catch this and fall back to downloadViaBotApi.
+ *
+ * @param {import('node-telegram-bot-api')} bot
+ * @param {number|string} fromChatId the original channel the video was forwarded from
+ * @param {number} fromMessageId the original message id in that channel
+ * @param {number|string} toChatId the storage channel
+ * @returns {{messageId:number}}
+ */
+async function copyMessageToStorage(bot, fromChatId, fromMessageId, toChatId) {
+  if (!bot) throw new Error('copyMessageToStorage: no bot instance available.');
+
+  log.info('copyMessageToStorage', 'Attempting server-side copy', { fromChatId, fromMessageId, toChatId });
+
+  let result;
+  try {
+    result = await bot.copyMessage(toChatId, fromChatId, fromMessageId);
+  } catch (err) {
+    log.error('copyMessageToStorage', 'copyMessage failed', err, { fromChatId, fromMessageId, toChatId, stack: err.stack });
+    throw new Error(`Telegram copyMessage failed: ${err.message}`);
+  }
+
+  const messageId = typeof result === 'object' && result !== null ? result.message_id : result;
+  if (!messageId) {
+    throw new Error('copyMessage returned no message_id.');
+  }
+
+  log.success('copyMessageToStorage', 'Copy completed', { fromChatId, fromMessageId, toChatId, newMessageId: messageId });
+  return { messageId };
 }
 
 /**
@@ -32,6 +145,8 @@ async function downloadEpisode(channelId, messageId, destPath, { onProgress } = 
  * @returns {{channelId:*, messageId:number, documentId:string, accessHash:string, size:number, mimeType:string}}
  */
 async function uploadEpisode(targetChannelId, filePath, opts = {}) {
+  log.info('uploadEpisode', 'Upload started', { targetChannelId, filePath });
+
   const client = await mtproto.connect();
   if (!client) throw new mtproto.MTProtoDisabledError();
 
@@ -65,7 +180,7 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
     throw new Error('Telegram accepted the upload but returned no document — cannot record it.');
   }
 
-  log.success('uploadEpisode', 'Episode uploaded to storage channel', {
+  log.success('uploadEpisode', 'Upload completed', {
     targetChannelId, messageId: sent.id, size: Number(doc.size),
   });
 
@@ -79,4 +194,9 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
   };
 }
 
-module.exports = { downloadEpisode, uploadEpisode };
+module.exports = {
+  downloadViaBotApi,
+  copyMessageToStorage,
+  uploadEpisode,
+  BOT_API_DOWNLOAD_LIMIT_BYTES,
+};
