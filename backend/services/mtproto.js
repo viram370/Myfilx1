@@ -4,17 +4,26 @@
  * True MTProto client (GramJS), used for:
  *   1. Streaming large video files out of the storage channel for playback
  *      (streamRange, below).
- *   2. Downloading source videos for the admin upload pipeline
- *      (downloadToFile, below) — both compressed-source downloads and, as
- *      of this change, videos uploaded directly to the bot that exceed
- *      the Bot API's 20MB download cap (see services/telegramUpload.js
- *      #downloadViaMTProto and queue/pipeline.js#downloadSourceFile).
+ *   2. Downloading source videos for the admin upload pipeline that live
+ *      in a REAL Telegram channel (downloadToFile, below, via
+ *      services/telegramUpload.js#downloadFromChannel) — forwarded
+ *      videos and videos posted straight into a channel the bot admins.
  * The classic Telegram Bot API (`getFile`) caps downloads at 20MB, which
- * is why the old implementation broke on anything bigger than a short
- * clip. GramJS talks MTProto directly (the same protocol Telegram apps
- * use) and can pull arbitrary byte ranges — or a full file — out of a
- * document without that cap, whether the document lives in a channel or
- * in a private chat the bot is part of.
+ * is why the old streaming implementation broke on anything bigger than a
+ * short clip. GramJS talks MTProto directly (the same protocol Telegram
+ * apps use) and can pull arbitrary byte ranges — or a full file — out of
+ * a document without that cap.
+ *
+ * IMPORTANT — every function below that takes a `channelId` requires a
+ * REAL Telegram channel id. None of them work on a private chat id (e.g.
+ * an admin's own user id): a private chat is a different kind of MTProto
+ * peer ("user"), and resolveEntity()/resolveVideoSource() only know how
+ * to resolve channels. Treating a private chat id as a channelId is
+ * exactly what produced "Source message not found (channelId=<userId>,
+ * messageId=<n>)" in an earlier version of the upload pipeline. Videos
+ * uploaded directly to the bot are downloaded via the plain Bot API
+ * instead (services/telegramUpload.js#downloadViaBotApi) — this file is
+ * never involved in that path.
  *
  * Setup (one-time):
  *   1. Get TELEGRAM_API_ID / TELEGRAM_API_HASH from https://my.telegram.org
@@ -240,9 +249,9 @@ async function resolveEntity(channelId, { retried = false } = {}) {
       return resolveEntity(id, { retried: true });
     }
     throw new SourceNotFoundError(
-      `Cannot resolve Telegram peer ${channelId}: ${err.message}. If this is the storage channel, ensure the ` +
-      `bot account is a member/admin of it; if this is a private chat (a direct upload), the bot's MTProto ` +
-      `session may not have that dialog cached yet — it refreshes automatically and retries once.`
+      `Cannot resolve Telegram channel ${channelId}: ${err.message}. Ensure the bot account is a member/admin ` +
+      `of this channel. (This function only ever resolves real channels — if you're seeing this for what should ` +
+      `be a direct upload to the bot, that's a bug: direct uploads must use the Bot API, not MTProto.)`
     );
   }
 }
@@ -462,14 +471,12 @@ async function streamRange(channelId, messageId, start, end, res, { onAbort } = 
 
 /**
  * Downloads a full Telegram document to a local file path. Used by the
- * upload-pipeline (services/telegramUpload.js) to pull a source video
- * onto disk before handing it to FFmpeg — this is a plain sequential
- * download (not range-based like streamRange), so it does not share the
- * streaming semaphore with live playback requests. `channelId` here is
- * really just "the peer the message lives in" — it works the same way
- * for a storage channel and for a private chat (e.g. a video uploaded
- * directly to the bot, downloaded via downloadViaMTProto for anything
- * over the Bot API's 20MB cap).
+ * upload pipeline (services/telegramUpload.js#downloadFromChannel) to
+ * pull a source video onto disk before handing it to FFmpeg — this is a
+ * plain sequential download (not range-based like streamRange), so it
+ * does not share the streaming semaphore with live playback requests.
+ * `channelId` must be a REAL Telegram channel id — never a private chat
+ * id (see the file header for why).
  */
 async function downloadToFile(channelId, messageId, destPath, { onProgress } = {}) {
   const c = await connect();
