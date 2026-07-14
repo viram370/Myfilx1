@@ -775,11 +775,17 @@ async function handleChannelVideo(msg, source) {
 
   // Buffer the video into every admin's personal buffer so whichever admin
   // later runs /saveanime, /savemovie, /savewebseries, /showbuffer or
-  // /clearbuffer sees it — those commands remain untouched.
+  // /clearbuffer sees it — those commands remain untouched. Admins whose
+  // /add session already claimed this same channel post (handlers/
+  // adminUpload.js's channel_post capture) are skipped here, same as the
+  // direct-upload path below — otherwise it'd get buffered AND queued into
+  // the /add batch, and the admin would see a stray "Buffered" message for
+  // a video that's already part of their batch.
   let primaryResult = null;
   for (const adminId of ADMIN_IDS) {
+    if (isAddSessionActive(adminId)) continue;
     const result = await bufferVideoItem(adminId, media, msg, source);
-    if (adminId === ADMIN_IDS[0]) primaryResult = result;
+    if (!primaryResult) primaryResult = result;
   }
   if (!primaryResult) return;
 
