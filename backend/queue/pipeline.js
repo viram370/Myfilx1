@@ -6,12 +6,22 @@
  *
  * SOURCE HANDLING (fixes "Source message not found (channelId=<userId>,
  * messageId=<n>)"):
- *   - A video uploaded DIRECTLY to the bot is identified purely by its
- *     Telegram `file_id` and downloaded via the plain Bot API
- *     (services/telegramUpload.js#downloadViaBotApi). It is NEVER looked
- *     up by channelId+messageId — a private bot chat is a user peer, not
- *     a channel, and the MTProto channel-message lookup used for the
- *     storage channel elsewhere in this project does not apply to it.
+ *   - A video uploaded DIRECTLY to the bot is identified by its Telegram
+ *     `file_id` (for identity/dedup) and downloaded by SIZE:
+ *       - <=20MB: the plain Bot API (services/telegramUpload.js
+ *         #downloadViaBotApi / bot.getFile), same as before.
+ *       - >20MB: the existing MTProto (GramJS) client — logged in as this
+ *         same bot — reads the file straight out of the admin's private
+ *         chat with the bot (services/telegramUpload.js
+ *         #downloadViaMTProto), using the message's own chatId+messageId.
+ *         This is NOT the channel-message lookup that broke before: a
+ *         private chat is a user peer rather than a channel, but
+ *         mtproto.js's entity/message resolution is peer-agnostic and
+ *         handles both the same way. The admin never needs to forward
+ *         anything to a channel — large files are picked up automatically.
+ *       - If the reported size is missing/wrong and the Bot API rejects
+ *         the file as "too big" anyway, the download transparently falls
+ *         back to MTProto rather than failing the episode.
  *   - A video FORWARDED from a channel is detected from the incoming
  *     message's forward metadata. We first try a server-side
  *     bot.copyMessage() straight into the storage channel (no download
@@ -225,6 +235,14 @@ function addItem(session, media, msg) {
     fileId: media.file_id,
     fileUniqueId: media.file_unique_id,
     fileSizeBytes: media.file_size || null,
+    // The chat + message the video itself lives in (the admin's private
+    // chat with the bot). Used by downloadSourceFile() to fetch the file
+    // via MTProto when it's too large for the Bot API — set regardless of
+    // sourceType, since a failed channel-copy attempt also falls back to
+    // downloading straight from this same message (see tryCopyPath).
+    chatMessageId: msg.message_id || null,
+    downloadMethod: null, // 'bot-api' | 'mtproto', set once a download starts
+    downloadProgress: null, // 0-100, only meaningful while status === 'downloading'
     durationHint: media.duration || 0,
     widthHint: media.width || 0,
     heightHint: media.height || 0,
@@ -294,19 +312,6 @@ async function runCompressJob({ chatId, seq }) {
   const item = session.items[seq];
   if (!item) return;
 
-  if (item.fileSizeBytes && item.fileSizeBytes > transfer.BOT_API_DOWNLOAD_LIMIT_BYTES) {
-    const sizeMb = (item.fileSizeBytes / 1024 / 1024).toFixed(1);
-    const message = `File is ${sizeMb}MB — Telegram's Bot API only allows downloading files up to 20MB directly. ` +
-      `Forward this video from a channel the bot is a member of instead (copied server-side, no size limit).`;
-    log.error('runCompressJob', 'File too large for Bot API download', new Error(message), { chatId, seq, fileSizeBytes: item.fileSizeBytes });
-    item.status = 'failed';
-    item.error = message;
-    await session.onProgress(session);
-    await maybeCompleteSession(session);
-    pumpUploadQueue();
-    return;
-  }
-
   const stamp = `${chatId}_${seq}_${Date.now()}`;
   const inPath = path.join(UPLOADS_DIR, `${stamp}.src`);
   const outPath = path.join(CONVERTED_DIR, `${stamp}.mp4`);
@@ -315,14 +320,18 @@ async function runCompressJob({ chatId, seq }) {
     item.attempts.compress = attempt;
     try {
       item.status = 'downloading';
-      log.info('runCompressJob', `Download started (attempt ${attempt}/${MAX_ATTEMPTS})`, { chatId, seq, fileId: item.fileId });
+      item.downloadProgress = 0;
+      log.info('runCompressJob', `Download started (attempt ${attempt}/${MAX_ATTEMPTS})`, {
+        chatId, seq, fileId: item.fileId, fileSizeBytes: item.fileSizeBytes,
+      });
       await session.onProgress(session);
 
-      await transfer.downloadViaBotApi(botInstance, item.fileId, inPath);
+      await downloadSourceFile(session, item, inPath);
       item.tempIn = inPath;
-      log.success('runCompressJob', 'Download completed', { chatId, seq, path: inPath });
+      log.success('runCompressJob', 'Download completed', { chatId, seq, path: inPath, method: item.downloadMethod });
 
       item.status = 'compressing';
+      item.downloadProgress = null;
       log.info('runCompressJob', 'Compression started', { chatId, seq });
       await session.onProgress(session);
 
@@ -342,6 +351,7 @@ async function runCompressJob({ chatId, seq }) {
       cleanupFile(outPath);
       item.tempIn = null;
       item.tempOut = null;
+      item.downloadProgress = null;
 
       if (attempt >= MAX_ATTEMPTS) {
         // Only THIS episode fails — the batch and every other episode
@@ -355,6 +365,53 @@ async function runCompressJob({ chatId, seq }) {
       }
       await sleep(RETRY_BASE_DELAY_MS * attempt);
     }
+  }
+}
+
+/**
+ * Downloads the source video for `item` into `inPath`, choosing the
+ * transport purely by size:
+ *   - at or under the Bot API's 20MB download cap: bot.getFile() via
+ *     transfer.downloadViaBotApi (unchanged, fast, no MTProto round trip).
+ *   - over that cap: the existing MTProto (GramJS) client, reading the
+ *     file directly out of the message it arrived in
+ *     (session.chatId + item.chatMessageId) — the admin's private chat
+ *     with the bot. No forwarding to a channel is required.
+ * If the reported size is missing/wrong and the Bot API rejects the file
+ * as "too big" anyway, this transparently retries over MTProto instead of
+ * failing the attempt outright.
+ */
+async function downloadSourceFile(session, item, inPath) {
+  const knownSize = typeof item.fileSizeBytes === 'number' && item.fileSizeBytes > 0;
+  const tooBigForBotApi = knownSize && item.fileSizeBytes > transfer.BOT_API_DOWNLOAD_LIMIT_BYTES;
+
+  const onProgress = (written, total) => {
+    item.downloadProgress = total ? Math.min(100, Math.floor((written / total) * 100)) : null;
+    // Debounced internally by renderProgressBySession — safe to call on
+    // every chunk without spamming Telegram's editMessageText rate limit.
+    Promise.resolve(session.onProgress(session)).catch(() => {});
+  };
+
+  if (tooBigForBotApi) {
+    item.downloadMethod = 'mtproto';
+    log.info('downloadSourceFile', 'File exceeds Bot API 20MB cap — downloading via MTProto', {
+      chatId: session.chatId, seq: item.seq, fileSizeBytes: item.fileSizeBytes,
+    });
+    return transfer.downloadViaMTProto(session.chatId, item.chatMessageId, inPath, { onProgress });
+  }
+
+  item.downloadMethod = 'bot-api';
+  try {
+    return await transfer.downloadViaBotApi(botInstance, item.fileId, inPath);
+  } catch (err) {
+    if (/too big/i.test(err.message || '')) {
+      log.warn('downloadSourceFile', 'Bot API rejected file as too big despite reported size — falling back to MTProto', {
+        chatId: session.chatId, seq: item.seq, fileSizeBytes: item.fileSizeBytes,
+      });
+      item.downloadMethod = 'mtproto';
+      return transfer.downloadViaMTProto(session.chatId, item.chatMessageId, inPath, { onProgress });
+    }
+    throw err;
   }
 }
 
@@ -592,6 +649,9 @@ function renderSessionText(session) {
     const icon = STATUS_ICON[item.status] || '❓';
     const statusText = STATUS_LABEL[item.status] || item.status;
     let line = `${escapeHtml(epLabel)} ${icon} ${statusText}`;
+    if (item.status === 'downloading' && typeof item.downloadProgress === 'number') {
+      line += item.downloadMethod === 'mtproto' ? ` (large file, ${item.downloadProgress}%)` : ` (${item.downloadProgress}%)`;
+    }
     if (item.status === 'failed' && item.error) line += ` — ${escapeHtml(item.error.slice(0, 200))}`;
     lines.push(line);
   });
