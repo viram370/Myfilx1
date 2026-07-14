@@ -9,9 +9,19 @@
  *   /add anime | webseries | anime-movie | movie
  *     -> bot asks Title (+ Season, for anime/webseries) + Language + Quality
  *        (+ Year, for movie/anime-movie)
- *     -> "upload mode": admin forwards videos, each is immediately
- *        acknowledged and queued for background compression + upload
- *        (queue/pipeline.js), auto-numbering episodes from Firestore
+ *     -> "upload mode": the admin can send episodes THREE ways, all
+ *        auto-detected and immediately queued for the right pipeline
+ *        (queue/pipeline.js), auto-numbering episodes from Firestore:
+ *          - direct upload to the bot -> Bot API / MTProto-by-size download
+ *          - forwarded from a channel -> server-side copyMessage(), with
+ *            an MTProto fallback reading straight from the source channel
+ *          - posted straight into a private storage channel the bot
+ *            admins (channel_post/edited_channel_post) -> same
+ *            copyMessage()/MTProto pipeline as a forward, joining
+ *            whichever /add batch(es) are currently waiting for episodes
+ *        A Telegram "Copy" (as opposed to Forward) carries no metadata at
+ *        all, so it's indistinguishable from a direct upload and correctly
+ *        falls through to the direct-upload path.
  *     -> admin sends "Done" to close upload mode; the pipeline keeps
  *        draining whatever is still compressing/uploading
  *     -> ONE message is edited throughout with live per-episode status
@@ -186,6 +196,16 @@ function registerAdminUpload(bot, { isAdmin, safeSendMessage, safeEditMessageTex
     const media = extractVideoMedia(msg);
     if (media) captureEpisode(chatIdOf(msg), msg, media).catch((err) => log.error('document handler', 'capture failed', err));
   });
+
+  // ---- videos posted straight into a private storage channel ----------
+  // These never pass through 'video'/'document' (node-telegram-bot-api
+  // only emits those for regular 'message' updates) and carry no forward
+  // metadata of their own (there's nothing to forward from — the post
+  // itself IS the source), so they need their own capture path that flags
+  // channelNative so pipeline.js treats msg.chat/msg.message_id as the
+  // origin instead of expecting forward_origin.
+  bot.on('channel_post', (msg) => captureChannelEpisode(msg, 'channel_post').catch((err) => log.error('channel_post handler', 'capture failed', err)));
+  bot.on('edited_channel_post', (msg) => captureChannelEpisode(msg, 'edited_channel_post').catch((err) => log.error('edited_channel_post handler', 'capture failed', err)));
 }
 
 function chatIdOf(msg) { return msg.chat.id; }
@@ -194,6 +214,24 @@ function extractVideoMedia(msg) {
   if (msg.video) return msg.video;
   if (msg.document?.mime_type?.startsWith('video/')) return msg.document;
   return null;
+}
+
+/**
+ * Chat ids of admins whose /add wizard has finished collecting fields and
+ * is actively waiting for episodes — i.e. genuinely "in upload mode", not
+ * mid-wizard (still typing title/season/etc.) and not already winding down.
+ * Used to decide which running /add batch(es) a channel-posted video (no
+ * admin chat of its own) should join.
+ */
+function activeUploadModeChatIds() {
+  const ids = [];
+  for (const [chatId, wizard] of wizards.entries()) {
+    if (wizard.stepIndex < wizard.steps.length) continue; // still collecting title/season/etc.
+    const session = pipeline.getSession(chatId);
+    if (!session || session.finalizing || session.closed) continue;
+    ids.push(chatId);
+  }
+  return ids;
 }
 
 // ============================================================================
@@ -259,6 +297,53 @@ async function captureEpisode(id, msg, media) {
   // First video creates the progress message; every subsequent update
   // (including later videos) edits that SAME message — never spam chat.
   await renderProgressBySession(session, id, { force: true });
+}
+
+/**
+ * Mirrors services/bot.js's isStorageChannel(): if STORAGE_CHANNEL_ID is
+ * set, only react to channel_post updates from that channel — if it's
+ * unset, trust any channel_post, since Telegram only delivers those for
+ * channels the bot actually administers.
+ */
+function isRecognizedChannel(channelId) {
+  const configured = process.env.STORAGE_CHANNEL_ID;
+  if (!configured) return true;
+  return Number(channelId) === Number(configured);
+}
+
+/**
+ * Videos posted straight into a private storage channel the bot admins
+ * (channel_post/edited_channel_post) have no admin chat of their own, so
+ * they're routed into every /add batch currently waiting for episodes
+ * (mirrors the legacy buffer's multi-admin broadcast in services/bot.js).
+ * Each gets flagged channelNative so pipeline.js treats the post itself —
+ * not a forward — as the source, joins the batch immediately, and gets
+ * auto-numbered/copy-pathed exactly like a forwarded video.
+ */
+async function captureChannelEpisode(msg, source) {
+  if (!isRecognizedChannel(msg.chat.id)) return;
+
+  const media = extractVideoMedia(msg);
+  if (!media) return;
+
+  const targets = activeUploadModeChatIds();
+  if (targets.length === 0) return; // no /add batch waiting — the legacy /saveanime buffer handles it instead
+
+  for (const chatId of targets) {
+    const session = pipeline.getSession(chatId);
+    if (!session || session.finalizing || session.closed) continue;
+
+    // edited_channel_post can re-fire for the same post (e.g. a caption
+    // edit) — don't double-queue an already-captured video.
+    if (session.items.some((it) => it.fileUniqueId === media.file_unique_id)) continue;
+
+    pipeline.addItem(session, media, msg, { channelNative: true });
+    log.info('captureChannelEpisode', 'Channel-posted video captured into /add batch', {
+      source, chatId, channelId: msg.chat.id, messageId: msg.message_id, fileUniqueId: media.file_unique_id,
+    });
+
+    await renderProgressBySession(session, chatId, { force: true });
+  }
 }
 
 async function finishUploadMode(id, safeSendMessage) {
