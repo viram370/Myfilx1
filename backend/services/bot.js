@@ -1699,7 +1699,7 @@ bot.onText(/^\/(\w+)/, async (msg, match) => {
     'deleteanime', 'deletemovie', 'deleteseries',
     'deletelanguage', 'deleteallanime', 'deleteallmovies', 'deleteallwebseries',
     'listanime', 'listmovies', 'listwebseries', 'stats', 'storage', 'health', 'logs', 'ping',
-    'maxbuffer', 'showbuffer', 'clearbuffer', 'find', 'add', 'canceladd',
+    'maxbuffer', 'showbuffer', 'clearbuffer', 'find', 'add', 'canceladd', 'done',
   ]);
   const cmd = match[1].toLowerCase();
   if (known.has(cmd)) return; // already handled by a dedicated listener
