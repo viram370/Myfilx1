@@ -3,40 +3,39 @@
  * ----------------------------------------------------------------------
  * Transfer primitives for the admin upload pipeline (queue/pipeline.js).
  *
- * IMPORTANT — source videos uploaded directly to the bot are never looked
- * up by channelId+messageId for the *identity* of the file (that's what
- * `file_id`/`file_unique_id` are for — the Bot API hands those out for
- * every video regardless of where it came from, and Firestore/dedup logic
- * still keys off them). But downloading the actual bytes of a video that
- * lives in the bot's private chat with the admin now has TWO transports,
- * chosen purely by file size:
+ * STRICT RULE (fixes "Source message not found (channelId=<userId>,
+ * messageId=<n>)"): MTProto is ONLY ever used with a real Telegram
+ * channel id. It is never given a private chat id, and a private chat id
+ * is never passed off as a "channelId". Concretely:
  *
- *   downloadViaBotApi(bot, fileId, destPath) — plain Bot API (bot.getFile
- *   + the /file/bot<token>/... URL). Telegram hard-caps this at 20MB
- *   regardless of how large a file the bot can *receive* — used for
- *   anything at or under that cap.
+ *   downloadViaBotApi(bot, fileId, destPath) — the ONLY way a video
+ *   uploaded DIRECTLY to the bot is downloaded. Plain Bot API
+ *   (bot.getFile + the /file/bot<token>/... URL). Telegram hard-caps this
+ *   at 20MB regardless of how large a file the bot can *receive* — there
+ *   is no MTProto fallback for this case (a private bot chat is a user
+ *   peer, not a channel, and MTProto's channel-message lookup does not
+ *   apply to it — that mismatch is exactly what caused the bug above).
+ *   A direct upload over 20MB fails validation before any download is
+ *   attempted (see queue/pipeline.js's batch-lock validation step) with a
+ *   clear message asking the admin to forward it from a channel instead.
  *
- *   downloadViaMTProto(chatId, messageId, destPath, opts) — for anything
- *   over 20MB. Pulls the file directly out of the admin's private chat
- *   with the bot using the existing GramJS MTProto client
- *   (services/mtproto.js), which is logged in as this same bot via
- *   botAuthToken and is not subject to the Bot API's download cap. A
- *   private chat is a user peer rather than a channel, but
- *   mtproto.js's entity/message resolution (resolveEntity + getMessages)
- *   is peer-agnostic and works the same way for it — no forwarding to a
- *   channel is required.
- *
- * Two more operations round out the pipeline:
+ *   downloadFromChannel(channelId, messageId, destPath, opts) — for
+ *   videos whose bytes genuinely live in a real Telegram channel: either
+ *   forwarded to the bot (Telegram's `forward_origin`/`forward_from_chat`
+ *   gives us the real source channel id + message id) or posted straight
+ *   into a channel the bot administers. Uses the existing GramJS MTProto
+ *   client (services/mtproto.js), which is logged in as this bot via
+ *   botAuthToken and is not subject to the Bot API's download cap.
  *
  *   copyMessageToStorage(bot, fromChatId, fromMessageId, toChatId) — for
- *   videos forwarded from a channel the bot can see: asks Telegram to
- *   copy the message server-side directly into the storage channel, with
- *   no download/re-upload through this server at all.
+ *   the same real-channel case above: asks Telegram to copy the message
+ *   server-side directly into the storage channel, no download at all.
+ *   Tried first; downloadFromChannel is the fallback if it isn't possible.
  *
  *   uploadEpisode(targetChannelId, filePath, opts) — pushes a locally
- *   compressed file into the storage channel over the existing GramJS
- *   MTProto client (services/mtproto.js), which chunks large uploads
- *   automatically and isn't subject to the Bot API's ~50MB send limit.
+ *   compressed file into the storage channel (a real channel) over the
+ *   MTProto client, which chunks large uploads automatically and isn't
+ *   subject to the Bot API's ~50MB send limit.
  * ----------------------------------------------------------------------
  */
 'use strict';
@@ -51,9 +50,8 @@ const mtproto = require('./mtproto');
 const BOT_API_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024;
 
 /**
- * Downloads a video the bot received (directly or as a fallback when a
- * channel copy isn't possible) using the plain Bot API — file_id based,
- * never channelId/messageId.
+ * Downloads a video uploaded DIRECTLY to the bot. file_id based, never
+ * channelId/messageId — a direct upload has no channel at all.
  *
  * @param {import('node-telegram-bot-api')} bot
  * @param {string} fileId
@@ -70,11 +68,9 @@ async function downloadViaBotApi(bot, fileId, destPath) {
   } catch (err) {
     log.error('downloadViaBotApi', 'bot.getFile failed', err, { fileId, stack: err.stack });
     if (/file is too big/i.test(err.message || '')) {
-      // Caller (queue/pipeline.js#downloadSourceFile) catches this specific
-      // message and transparently retries over MTProto — surfaced here in
-      // case this function is ever called directly without that fallback.
       throw new Error(
-        `File exceeds Telegram's Bot API 20MB download limit (file is too big). Use downloadViaMTProto instead.`
+        `File exceeds Telegram's Bot API 20MB download limit. Direct uploads have no other download path — ` +
+        `forward this video from a channel the bot is a member of instead.`
       );
     }
     throw new Error(`Telegram getFile failed: ${err.message}`);
@@ -111,58 +107,60 @@ async function downloadViaBotApi(bot, fileId, destPath) {
 }
 
 /**
- * Downloads a video the bot received directly (in its private chat with
- * the admin) using the existing MTProto (GramJS) client instead of the
- * Bot API — for anything over the Bot API's 20MB download cap. No
- * forwarding to a channel is required: the client is logged in as this
- * same bot, so it can read the message straight out of that private chat
- * the same way it reads storage-channel messages elsewhere in this file.
+ * Downloads a video that lives in a REAL Telegram channel — never a
+ * private chat. `channelId` here must always come from Telegram's own
+ * forward metadata (`forward_origin.chat.id` / `forward_from_chat.id`) or
+ * from a channel_post's own `chat.id`; callers must never pass an admin's
+ * private chat id here (see queue/pipeline.js — 'direct' source items
+ * never call this function at all).
  *
- * @param {number|string} chatId the private chat id the video was received in (the admin's chat)
- * @param {number} messageId the id of the message carrying the video, in that chat
+ * @param {number|string} channelId
+ * @param {number} messageId
  * @param {string} destPath
  * @param {{onProgress?:(written:number, total:number)=>void}} opts
  */
-async function downloadViaMTProto(chatId, messageId, destPath, opts = {}) {
+async function downloadFromChannel(channelId, messageId, destPath, opts = {}) {
   if (!mtproto.isEnabled()) {
     throw new Error(
-      'File exceeds the Bot API\'s 20MB download limit and MTProto is not configured ' +
-      '(set TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_STRING_SESSION) — cannot download it.'
+      'MTProto is not configured (set TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_STRING_SESSION) — ' +
+      'cannot download from the source channel.'
     );
   }
-  if (!messageId) {
-    throw new Error('downloadViaMTProto: no messageId available for this upload — cannot locate it via MTProto.');
+  if (!channelId || !messageId) {
+    throw new Error(`downloadFromChannel: missing channelId/messageId (channelId=${channelId}, messageId=${messageId}).`);
   }
 
-  log.info('downloadViaMTProto', 'Large-file download started via MTProto', { chatId, messageId, destPath });
+  log.info('downloadFromChannel', 'Channel download started', { channelId, messageId, destPath });
 
   let result;
   try {
-    result = await mtproto.downloadToFile(chatId, messageId, destPath, {
+    result = await mtproto.downloadToFile(channelId, messageId, destPath, {
       onProgress: opts.onProgress,
     });
   } catch (err) {
-    log.error('downloadViaMTProto', 'MTProto download failed', err, { chatId, messageId, stack: err.stack });
-    throw new Error(`MTProto download failed: ${err.message}`);
+    log.error('downloadFromChannel', 'MTProto channel download failed', err, { channelId, messageId, stack: err.stack });
+    throw new Error(`MTProto channel download failed: ${err.message}`);
   }
 
   if (!result || !result.size) {
-    throw new Error('MTProto download returned no bytes.');
+    throw new Error('MTProto channel download returned no bytes.');
   }
 
-  log.success('downloadViaMTProto', 'Download completed', { chatId, messageId, destPath, bytes: result.size });
+  log.success('downloadFromChannel', 'Download completed', { channelId, messageId, destPath, bytes: result.size });
   return { path: destPath, size: result.size };
 }
 
 /**
- * Attempts a server-side copy of a channel-forwarded video straight into
- * the storage channel, with no download at all. Throws if the bot can't
- * see the source chat/message (e.g. it isn't a member of that channel) —
- * callers should catch this and fall back to downloadViaBotApi.
+ * Attempts a server-side copy of a channel video straight into the
+ * storage channel, with no download at all. `fromChatId` must be a real
+ * channel id (see downloadFromChannel's contract above). Throws if the
+ * bot can't see the source chat/message (e.g. it isn't a member of that
+ * channel) — callers should catch this and fall back to
+ * downloadFromChannel.
  *
  * @param {import('node-telegram-bot-api')} bot
- * @param {number|string} fromChatId the original channel the video was forwarded from
- * @param {number} fromMessageId the original message id in that channel
+ * @param {number|string} fromChatId the real source channel
+ * @param {number} fromMessageId the message id in that channel
  * @param {number|string} toChatId the storage channel
  * @returns {{messageId:number}}
  */
@@ -246,7 +244,7 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
 
 module.exports = {
   downloadViaBotApi,
-  downloadViaMTProto,
+  downloadFromChannel,
   copyMessageToStorage,
   uploadEpisode,
   BOT_API_DOWNLOAD_LIMIT_BYTES,
