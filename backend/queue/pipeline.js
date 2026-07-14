@@ -198,15 +198,33 @@ async function resolveEpisodeBase(session) {
 // ============================================================================
 
 /**
- * Detects whether an incoming message was forwarded from a channel, using
- * the current Bot API's `forward_origin` field (Bot API 7.0+) with a
- * fallback to the legacy `forward_from_chat`/`forward_from_message_id`
- * fields for older clients/library versions. Returns null for a direct
- * upload OR a Telegram "Copy"'d message — Telegram does not attach any
- * forward metadata to copied messages, so those are indistinguishable
- * from direct uploads and correctly fall through to the download path.
+ * Detects the channel a video's bytes actually live in, so the publish
+ * step can try a server-side copy (or MTProto read) straight from there
+ * instead of just downloading whatever copy the bot happens to have.
+ * Covers three of the four source kinds addItem() needs to distinguish
+ * (the plain Bot API `forward_origin`/`forward_from_chat` fields, current
+ * Bot API 7.0+ and legacy, plus native channel posts):
+ *
+ *   - Forwarded-to-the-bot: a message forwarded from a channel into the
+ *     admin's private chat with the bot carries `forward_origin` (or the
+ *     legacy `forward_from_chat`/`forward_from_message_id` pair) pointing
+ *     at the original channel + message.
+ *   - Channel-native (private storage channel): the message itself IS a
+ *     `channel_post`/`edited_channel_post` — Telegram never attaches
+ *     forward metadata to those (there's nothing to forward from, the
+ *     post itself is the source), so the caller must tell us via
+ *     `opts.channelNative` that `msg` already lives in the channel we
+ *     should treat as the origin.
+ *
+ * Returns null for a direct upload OR a Telegram "Copy"'d message —
+ * Telegram does not attach any forward metadata to copied messages, so
+ * those are indistinguishable from direct uploads and correctly fall
+ * through to the direct-upload download path.
  */
-function detectForwardOrigin(msg) {
+function detectChannelOrigin(msg, opts = {}) {
+  if (opts.channelNative && msg.chat && msg.chat.id && msg.message_id) {
+    return { chatId: msg.chat.id, messageId: msg.message_id };
+  }
   const origin = msg.forward_origin;
   if (origin && origin.type === 'channel' && origin.chat && origin.message_id) {
     return { chatId: origin.chat.id, messageId: origin.message_id };
@@ -218,38 +236,43 @@ function detectForwardOrigin(msg) {
 }
 
 // ============================================================================
-// ADDING ITEMS (called from the Telegram video/document handler)
+// ADDING ITEMS (called from the Telegram video/document/channel_post handlers)
 // ============================================================================
 
 /**
  * @param {object} session
  * @param {{file_id:string, file_unique_id:string, file_size?:number, duration?:number, width?:number, height?:number}} media
- * @param {object} msg the raw Telegram message carrying the video
+ * @param {object} msg the raw Telegram message carrying the video (a private-chat
+ *   message for direct/forwarded uploads, or the channel_post message itself
+ *   for videos posted straight into a private storage channel)
+ * @param {{channelNative?:boolean}} opts pass channelNative:true when `msg` IS a
+ *   channel_post/edited_channel_post — see detectChannelOrigin() above
  */
-function addItem(session, media, msg) {
+function addItem(session, media, msg, opts = {}) {
   const seq = session.items.length;
-  const forwardOrigin = detectForwardOrigin(msg);
+  const channelOrigin = detectChannelOrigin(msg, opts);
 
   const item = {
     seq,
     fileId: media.file_id,
     fileUniqueId: media.file_unique_id,
     fileSizeBytes: media.file_size || null,
-    // The chat + message the video itself lives in (the admin's private
-    // chat with the bot). Used by downloadSourceFile() to fetch the file
-    // via MTProto when it's too large for the Bot API — set regardless of
-    // sourceType, since a failed channel-copy attempt also falls back to
-    // downloading straight from this same message (see tryCopyPath).
+    // The chat + message the video itself lives in, from the bot's own
+    // point of view (the admin's private chat for a direct upload, or the
+    // channel for a channel-native post). Used by downloadSourceFile()'s
+    // Bot-API/MTProto fallback for plain 'direct' items — forwarded/
+    // channel-native items use forwardChatId/forwardMessageId instead
+    // (see resolveDownloadTarget), since that's the authoritative copy.
     chatMessageId: msg.message_id || null,
     downloadMethod: null, // 'bot-api' | 'mtproto', set once a download starts
     downloadProgress: null, // 0-100, only meaningful while status === 'downloading'
     durationHint: media.duration || 0,
     widthHint: media.width || 0,
     heightHint: media.height || 0,
-    sourceType: forwardOrigin ? 'forwarded' : 'direct',
-    forwardChatId: forwardOrigin ? forwardOrigin.chatId : null,
-    forwardMessageId: forwardOrigin ? forwardOrigin.messageId : null,
-    needsCopyAttempt: !!forwardOrigin,
+    sourceType: channelOrigin ? 'forwarded' : 'direct',
+    forwardChatId: channelOrigin ? channelOrigin.chatId : null,
+    forwardMessageId: channelOrigin ? channelOrigin.messageId : null,
+    needsCopyAttempt: !!channelOrigin,
     status: 'waiting', // waiting -> [copying ->] downloading -> compressing -> ready -> uploading -> done | failed
     attempts: { copy: 0, compress: 0, upload: 0 },
     episode: null,
@@ -261,8 +284,11 @@ function addItem(session, media, msg) {
   };
   session.items.push(item);
 
+  // Requirement — log source type, channel id, message id and (once
+  // resolved) the selected pipeline + episode number for every item.
   log.info('addItem', 'Upload received', {
     chatId: session.chatId, seq, sourceType: item.sourceType,
+    channelId: item.forwardChatId, messageId: item.forwardMessageId || item.chatMessageId,
     fileUniqueId: item.fileUniqueId, fileSizeBytes: item.fileSizeBytes,
   });
 
@@ -369,14 +395,33 @@ async function runCompressJob({ chatId, seq }) {
 }
 
 /**
+ * Picks which chat + message the MTProto fallback should actually read
+ * from. For a plain 'direct' upload that's the admin's own private chat
+ * (session.chatId + item.chatMessageId) — the only place the video
+ * exists. For a 'forwarded' item (forwarded-to-the-bot OR a channel-native
+ * post from a private storage channel) it's the ORIGINAL channel
+ * (item.forwardChatId + item.forwardMessageId) — the authoritative copy,
+ * which the bot's MTProto client can read directly as long as it's a
+ * member/admin of that channel, regardless of whether a copyMessage()
+ * attempt already ran or a forwarded copy ever landed in the admin's chat.
+ */
+function resolveDownloadTarget(session, item) {
+  if (item.sourceType === 'forwarded' && item.forwardChatId && item.forwardMessageId) {
+    return { chatId: item.forwardChatId, messageId: item.forwardMessageId };
+  }
+  return { chatId: session.chatId, messageId: item.chatMessageId };
+}
+
+/**
  * Downloads the source video for `item` into `inPath`, choosing the
  * transport purely by size:
  *   - at or under the Bot API's 20MB download cap: bot.getFile() via
  *     transfer.downloadViaBotApi (unchanged, fast, no MTProto round trip).
  *   - over that cap: the existing MTProto (GramJS) client, reading the
- *     file directly out of the message it arrived in
- *     (session.chatId + item.chatMessageId) — the admin's private chat
- *     with the bot. No forwarding to a channel is required.
+ *     file directly out of its authoritative source (see
+ *     resolveDownloadTarget) — the admin's private chat for a direct
+ *     upload, or the original channel for a forwarded/channel-native item.
+ *     No forwarding to a channel is ever required for either path.
  * If the reported size is missing/wrong and the Bot API rejects the file
  * as "too big" anyway, this transparently retries over MTProto instead of
  * failing the attempt outright.
@@ -384,6 +429,7 @@ async function runCompressJob({ chatId, seq }) {
 async function downloadSourceFile(session, item, inPath) {
   const knownSize = typeof item.fileSizeBytes === 'number' && item.fileSizeBytes > 0;
   const tooBigForBotApi = knownSize && item.fileSizeBytes > transfer.BOT_API_DOWNLOAD_LIMIT_BYTES;
+  const target = resolveDownloadTarget(session, item);
 
   const onProgress = (written, total) => {
     item.downloadProgress = total ? Math.min(100, Math.floor((written / total) * 100)) : null;
@@ -394,22 +440,28 @@ async function downloadSourceFile(session, item, inPath) {
 
   if (tooBigForBotApi) {
     item.downloadMethod = 'mtproto';
-    log.info('downloadSourceFile', 'File exceeds Bot API 20MB cap — downloading via MTProto', {
-      chatId: session.chatId, seq: item.seq, fileSizeBytes: item.fileSizeBytes,
+    log.info('downloadSourceFile', 'Pipeline selected', {
+      chatId: session.chatId, seq: item.seq, sourceType: item.sourceType, pipeline: 'mtproto',
+      channelId: target.chatId, messageId: target.messageId, fileSizeBytes: item.fileSizeBytes,
     });
-    return transfer.downloadViaMTProto(session.chatId, item.chatMessageId, inPath, { onProgress });
+    return transfer.downloadViaMTProto(target.chatId, target.messageId, inPath, { onProgress });
   }
 
   item.downloadMethod = 'bot-api';
+  log.info('downloadSourceFile', 'Pipeline selected', {
+    chatId: session.chatId, seq: item.seq, sourceType: item.sourceType, pipeline: 'bot-api',
+    channelId: target.chatId, messageId: target.messageId,
+  });
   try {
     return await transfer.downloadViaBotApi(botInstance, item.fileId, inPath);
   } catch (err) {
     if (/too big/i.test(err.message || '')) {
-      log.warn('downloadSourceFile', 'Bot API rejected file as too big despite reported size — falling back to MTProto', {
-        chatId: session.chatId, seq: item.seq, fileSizeBytes: item.fileSizeBytes,
+      log.warn('downloadSourceFile', 'Bot API rejected file as too big — falling back to MTProto', {
+        chatId: session.chatId, seq: item.seq, sourceType: item.sourceType,
+        channelId: target.chatId, messageId: target.messageId,
       });
       item.downloadMethod = 'mtproto';
-      return transfer.downloadViaMTProto(session.chatId, item.chatMessageId, inPath, { onProgress });
+      return transfer.downloadViaMTProto(target.chatId, target.messageId, inPath, { onProgress });
     }
     throw err;
   }
@@ -472,7 +524,10 @@ async function tickSessionUpload(session) {
 async function tryCopyPath(session, item) {
   item.attempts.copy += 1;
   item.status = 'copying';
-  log.info('tryCopyPath', 'Copy attempt started', { chatId: session.chatId, seq: item.seq, attempt: item.attempts.copy });
+  log.info('tryCopyPath', 'Pipeline selected', {
+    chatId: session.chatId, seq: item.seq, sourceType: item.sourceType, pipeline: 'copyMessage',
+    channelId: item.forwardChatId, messageId: item.forwardMessageId, attempt: item.attempts.copy,
+  });
   await session.onProgress(session);
 
   try {
@@ -482,6 +537,10 @@ async function tryCopyPath(session, item) {
 
     const episode = session.hasSeason ? (await resolveEpisodeBase(session)) + item.seq : null;
     item.episode = episode;
+    log.info('tryCopyPath', 'Episode number resolved', {
+      chatId: session.chatId, seq: item.seq, sourceType: item.sourceType, pipeline: 'copyMessage',
+      channelId: item.forwardChatId, messageId: item.forwardMessageId, episode,
+    });
 
     await writeFirestoreDoc(session, item, episode, {
       channelId: session.storageChannelId,
@@ -496,7 +555,10 @@ async function tryCopyPath(session, item) {
     await session.onProgress(session);
     return true;
   } catch (err) {
-    log.error('tryCopyPath', 'Copy not possible — falling back to download+compress+upload', err, { chatId: session.chatId, seq: item.seq, stack: err.stack });
+    log.error('tryCopyPath', 'Copy not possible — falling back to download+compress+upload', err, {
+      chatId: session.chatId, seq: item.seq, sourceType: item.sourceType,
+      channelId: item.forwardChatId, messageId: item.forwardMessageId, stack: err.stack,
+    });
     item.needsCopyAttempt = false;
     item.status = 'waiting';
     await session.onProgress(session);
@@ -511,11 +573,17 @@ async function uploadPreparedFile(session, item) {
     item.attempts.upload = attempt;
     try {
       item.status = 'uploading';
-      log.info('uploadPreparedFile', `Upload started (attempt ${attempt}/${MAX_ATTEMPTS})`, { chatId: session.chatId, seq: item.seq });
+      log.info('uploadPreparedFile', `Upload started (attempt ${attempt}/${MAX_ATTEMPTS})`, {
+        chatId: session.chatId, seq: item.seq, sourceType: item.sourceType, pipeline: 'mtproto-upload',
+      });
       await session.onProgress(session);
 
       const episode = session.hasSeason ? (await resolveEpisodeBase(session)) + item.seq : null;
       item.episode = episode;
+      log.info('uploadPreparedFile', 'Episode number resolved', {
+        chatId: session.chatId, seq: item.seq, sourceType: item.sourceType,
+        downloadMethod: item.downloadMethod, episode,
+      });
 
       const fileName = buildFileName(session, item, episode);
       const result = await transfer.uploadEpisode(session.storageChannelId, item.tempOut, {
