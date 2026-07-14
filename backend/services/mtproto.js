@@ -1,13 +1,20 @@
 /**
  * services/mtproto.js
  * ----------------------------------------------------------------------
- * True MTProto client (GramJS) used ONLY for streaming large video files.
+ * True MTProto client (GramJS), used for:
+ *   1. Streaming large video files out of the storage channel for playback
+ *      (streamRange, below).
+ *   2. Downloading source videos for the admin upload pipeline
+ *      (downloadToFile, below) — both compressed-source downloads and, as
+ *      of this change, videos uploaded directly to the bot that exceed
+ *      the Bot API's 20MB download cap (see services/telegramUpload.js
+ *      #downloadViaMTProto and queue/pipeline.js#downloadSourceFile).
  * The classic Telegram Bot API (`getFile`) caps downloads at 20MB, which
  * is why the old implementation broke on anything bigger than a short
  * clip. GramJS talks MTProto directly (the same protocol Telegram apps
- * use) and can pull arbitrary byte ranges out of a document without ever
- * loading the whole file into memory — exactly what HTTP Range streaming
- * needs.
+ * use) and can pull arbitrary byte ranges — or a full file — out of a
+ * document without that cap, whether the document lives in a channel or
+ * in a private chat the bot is part of.
  *
  * Setup (one-time):
  *   1. Get TELEGRAM_API_ID / TELEGRAM_API_HASH from https://my.telegram.org
@@ -232,7 +239,11 @@ async function resolveEntity(channelId, { retried = false } = {}) {
       }
       return resolveEntity(id, { retried: true });
     }
-    throw new SourceNotFoundError(`Cannot resolve channel ${channelId}: ${err.message}. Ensure the bot account is a member/admin of this channel.`);
+    throw new SourceNotFoundError(
+      `Cannot resolve Telegram peer ${channelId}: ${err.message}. If this is the storage channel, ensure the ` +
+      `bot account is a member/admin of it; if this is a private chat (a direct upload), the bot's MTProto ` +
+      `session may not have that dialog cached yet — it refreshes automatically and retries once.`
+    );
   }
 }
 
@@ -451,10 +462,14 @@ async function streamRange(channelId, messageId, start, end, res, { onAbort } = 
 
 /**
  * Downloads a full Telegram document to a local file path. Used by the
- * upload-pipeline compression worker (services/telegramTransfer.js) to
- * pull a source video onto disk before handing it to FFmpeg — this is a
- * plain sequential download (not range-based like streamRange), so it
- * does not share the streaming semaphore with live playback requests.
+ * upload-pipeline (services/telegramUpload.js) to pull a source video
+ * onto disk before handing it to FFmpeg — this is a plain sequential
+ * download (not range-based like streamRange), so it does not share the
+ * streaming semaphore with live playback requests. `channelId` here is
+ * really just "the peer the message lives in" — it works the same way
+ * for a storage channel and for a private chat (e.g. a video uploaded
+ * directly to the bot, downloaded via downloadViaMTProto for anything
+ * over the Bot API's 20MB cap).
  */
 async function downloadToFile(channelId, messageId, destPath, { onProgress } = {}) {
   const c = await connect();
