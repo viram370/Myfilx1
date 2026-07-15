@@ -48,62 +48,100 @@ const log = makeLogger('services/telegramUpload.js');
 const mtproto = require('./mtproto');
 
 const BOT_API_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024;
+const BOT_API_DOWNLOAD_MAX_RETRIES = 3;
+const BOT_API_DOWNLOAD_RETRY_BASE_DELAY_MS = 1500;
+
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 /**
  * Downloads a video uploaded DIRECTLY to the bot. file_id based, never
- * channelId/messageId — a direct upload has no channel at all.
+ * channelId/messageId — a direct upload has no channel at all. Retries
+ * transient network failures (timeouts, connection resets) automatically
+ * — a "file too big" rejection from the Bot API is never retried since it
+ * can never succeed.
  *
  * @param {import('node-telegram-bot-api')} bot
  * @param {string} fileId
  * @param {string} destPath
+ * @param {{onProgress?:(written:number, total:?number)=>void}} [opts]
  */
-async function downloadViaBotApi(bot, fileId, destPath) {
+async function downloadViaBotApi(bot, fileId, destPath, opts = {}) {
   if (!bot) throw new Error('downloadViaBotApi: no bot instance available.');
 
-  log.info('downloadViaBotApi', 'Requesting file path from Bot API', { fileId });
+  const startedAt = Date.now();
+  let lastErr;
 
-  let file;
-  try {
-    file = await bot.getFile(fileId);
-  } catch (err) {
-    log.error('downloadViaBotApi', 'bot.getFile failed', err, { fileId, stack: err.stack });
-    if (/file is too big/i.test(err.message || '')) {
-      throw new Error(
-        `File exceeds Telegram's Bot API 20MB download limit. Direct uploads have no other download path — ` +
-        `forward this video from a channel the bot is a member of instead.`
-      );
+  for (let attempt = 1; attempt <= BOT_API_DOWNLOAD_MAX_RETRIES; attempt++) {
+    try {
+      log.info('downloadViaBotApi', `Requesting file path from Bot API (attempt ${attempt}/${BOT_API_DOWNLOAD_MAX_RETRIES})`, { fileId });
+
+      let file;
+      try {
+        file = await bot.getFile(fileId);
+      } catch (err) {
+        if (/file is too big/i.test(err.message || '')) {
+          // Never retryable — fail fast with an actionable message.
+          throw new Error(
+            `File exceeds Telegram's Bot API 20MB download limit. Direct uploads have no other download path — ` +
+            `forward this video from a channel the bot is a member of instead.`
+          );
+        }
+        throw new Error(`Telegram getFile failed: ${err.message}`);
+      }
+
+      if (!file || !file.file_path) {
+        throw new Error('Telegram returned no file_path — the file may exceed the Bot API\'s 20MB download limit.');
+      }
+
+      const token = process.env.TELEGRAM_BOT_TOKEN;
+      if (!token) throw new Error('TELEGRAM_BOT_TOKEN is not set — cannot build the file download URL.');
+
+      const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+      const expectedSize = file.file_size || null;
+      log.info('downloadViaBotApi', 'Download started', { fileId, destPath, expectedSize, attempt });
+
+      const response = await axios.get(url, { responseType: 'stream', timeout: 0 });
+      const out = fs.createWriteStream(destPath);
+      let written = 0;
+
+      await new Promise((resolve, reject) => {
+        response.data.on('data', (chunk) => {
+          written += chunk.length;
+          if (opts.onProgress) {
+            try { opts.onProgress(written, expectedSize); } catch (_) { /* never let a UI callback break the download */ }
+          }
+        });
+        response.data.on('error', reject);
+        out.on('error', reject);
+        out.on('finish', resolve);
+        response.data.pipe(out);
+      });
+
+      if (written === 0) {
+        throw new Error('Downloaded file is empty (0 bytes) — Telegram returned no content.');
+      }
+
+      const elapsedMs = Date.now() - startedAt;
+      log.success('downloadViaBotApi', 'Download completed', {
+        fileId, destPath, bytes: written, attempt, elapsedMs, finishedAt: new Date().toISOString(),
+      });
+      return { path: destPath, size: written };
+    } catch (err) {
+      lastErr = err;
+      const nonRetryable = /20MB download limit/.test(err.message || '');
+      if (nonRetryable || attempt === BOT_API_DOWNLOAD_MAX_RETRIES) {
+        log.error('downloadViaBotApi', `Download failed${nonRetryable ? '' : ` after ${attempt} attempts`}`, err, { fileId, destPath });
+        throw err;
+      }
+      const delay = BOT_API_DOWNLOAD_RETRY_BASE_DELAY_MS * attempt;
+      log.warn('downloadViaBotApi', `Attempt ${attempt}/${BOT_API_DOWNLOAD_MAX_RETRIES} failed — retrying`, {
+        fileId, reason: err.message, retryInMs: delay,
+      });
+      await sleep(delay);
     }
-    throw new Error(`Telegram getFile failed: ${err.message}`);
   }
 
-  if (!file || !file.file_path) {
-    throw new Error('Telegram returned no file_path — the file may exceed the Bot API\'s 20MB download limit.');
-  }
-
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!token) throw new Error('TELEGRAM_BOT_TOKEN is not set — cannot build the file download URL.');
-
-  const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
-  log.info('downloadViaBotApi', 'Download started', { fileId, destPath, expectedSize: file.file_size || null });
-
-  const response = await axios.get(url, { responseType: 'stream', timeout: 0 });
-  const out = fs.createWriteStream(destPath);
-  let written = 0;
-
-  await new Promise((resolve, reject) => {
-    response.data.on('data', (chunk) => { written += chunk.length; });
-    response.data.on('error', reject);
-    out.on('error', reject);
-    out.on('finish', resolve);
-    response.data.pipe(out);
-  });
-
-  if (written === 0) {
-    throw new Error('Downloaded file is empty (0 bytes) — Telegram returned no content.');
-  }
-
-  log.success('downloadViaBotApi', 'Download completed', { fileId, destPath, bytes: written });
-  return { path: destPath, size: written };
+  throw lastErr;
 }
 
 /**
@@ -130,6 +168,7 @@ async function downloadFromChannel(channelId, messageId, destPath, opts = {}) {
     throw new Error(`downloadFromChannel: missing channelId/messageId (channelId=${channelId}, messageId=${messageId}).`);
   }
 
+  const startedAt = Date.now();
   log.info('downloadFromChannel', 'Channel download started', { channelId, messageId, destPath });
 
   let result;
@@ -138,6 +177,12 @@ async function downloadFromChannel(channelId, messageId, destPath, opts = {}) {
       onProgress: opts.onProgress,
     });
   } catch (err) {
+    if (err instanceof mtproto.SourceNotFoundError) {
+      // Preserve the specific reason (deleted / wrong channel / no media)
+      // instead of collapsing everything into a generic wrapper message.
+      log.error('downloadFromChannel', 'Source verification failed', err, { channelId, messageId, stack: err.stack });
+      throw err;
+    }
     log.error('downloadFromChannel', 'MTProto channel download failed', err, { channelId, messageId, stack: err.stack });
     throw new Error(`MTProto channel download failed: ${err.message}`);
   }
@@ -146,7 +191,10 @@ async function downloadFromChannel(channelId, messageId, destPath, opts = {}) {
     throw new Error('MTProto channel download returned no bytes.');
   }
 
-  log.success('downloadFromChannel', 'Download completed', { channelId, messageId, destPath, bytes: result.size });
+  const elapsedMs = Date.now() - startedAt;
+  log.success('downloadFromChannel', 'Download completed', {
+    channelId, messageId, destPath, bytes: result.size, elapsedMs, finishedAt: new Date().toISOString(),
+  });
   return { path: destPath, size: result.size };
 }
 
@@ -193,6 +241,7 @@ async function copyMessageToStorage(bot, fromChatId, fromMessageId, toChatId) {
  * @returns {{channelId:*, messageId:number, documentId:string, accessHash:string, size:number, mimeType:string}}
  */
 async function uploadEpisode(targetChannelId, filePath, opts = {}) {
+  const startedAt = Date.now();
   log.info('uploadEpisode', 'Upload started', { targetChannelId, filePath });
 
   const client = await mtproto.connect();
@@ -210,6 +259,9 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
     }),
   ];
 
+  // GramJS reports upload progress as a 0..1 fraction — convert to a
+  // plain 0-100 percent so callers (queue/pipeline.js) can bucket it into
+  // the same 10%-step reporting used for download/compress.
   const sent = await client.sendFile(entity, {
     file: filePath,
     fileName: opts.fileName || path.basename(filePath),
@@ -217,8 +269,11 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
     forceDocument: true,
     attributes,
     progressCallback: opts.onProgress
-      ? (progress) => {
-          try { opts.onProgress(progress); } catch (_) { /* never let a UI callback break the upload */ }
+      ? (fraction) => {
+          try {
+            const percent = Math.max(0, Math.min(100, Math.round(fraction * 100)));
+            opts.onProgress(percent);
+          } catch (_) { /* never let a UI callback break the upload */ }
         }
       : undefined,
   });
@@ -228,8 +283,9 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
     throw new Error('Telegram accepted the upload but returned no document — cannot record it.');
   }
 
+  const elapsedMs = Date.now() - startedAt;
   log.success('uploadEpisode', 'Upload completed', {
-    targetChannelId, messageId: sent.id, size: Number(doc.size),
+    targetChannelId, messageId: sent.id, size: Number(doc.size), elapsedMs, finishedAt: new Date().toISOString(),
   });
 
   return {
