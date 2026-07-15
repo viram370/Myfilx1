@@ -89,6 +89,31 @@ const TERMINAL_STATUSES = ['done', 'failed', 'skipped'];
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function isTerminal(status) { return TERMINAL_STATUSES.includes(status); }
 
+/**
+ * Rounds a 0-100 percent down to the nearest 10% step (0, 10, 20 ... 100).
+ * Used so progress-message edits only fire once per 10% of real progress
+ * (as requested), instead of on every 1% tick — that would spam Telegram's
+ * editMessageText rate limit for nothing.
+ */
+function bucket10(pct) {
+  if (typeof pct !== 'number' || Number.isNaN(pct)) return null;
+  return Math.max(0, Math.min(100, Math.floor(pct / 10) * 10));
+}
+
+/**
+ * Updates item[field] to the new 10%-bucketed value and, if (and only if)
+ * that bucket actually changed since the last report, asks the session to
+ * re-render/edit its single progress message. This is what turns raw
+ * byte-by-byte or frame-by-frame progress into the "every 10% only"
+ * single-message edit behavior.
+ */
+function reportBucketedProgress(session, item, field, rawPercent) {
+  const b = bucket10(rawPercent);
+  if (b === null || item[field] === b) return;
+  item[field] = b;
+  Promise.resolve(session.onProgress(session)).catch(() => {});
+}
+
 function slugify(str) {
   return String(str).toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-+|-+$)/g, '').slice(0, 80) || 'untitled';
 }
@@ -258,7 +283,11 @@ function addItem(session, media, msg, opts = {}) {
     // MTProto call (see file header).
     chatMessageId: msg.message_id || null,
     downloadMethod: null, // 'bot-api' | 'mtproto', set once a download starts
-    downloadProgress: null, // 0-100, only meaningful while status === 'downloading'
+    downloadProgress: null, // 0-100 (10% steps), only meaningful while status === 'downloading'
+    compressProgress: null, // 0-100 (10% steps), only meaningful while status === 'compressing'
+    uploadProgress: null, // 0-100 (10% steps), only meaningful while status === 'uploading'
+    startedAt: null, // Date.now() when this item's processing (download) began
+    finishedAt: null, // Date.now() when this item reached a terminal state
     durationHint: media.duration || 0,
     widthHint: media.width || 0,
     heightHint: media.height || 0,
@@ -445,28 +474,41 @@ async function runCompressJob({ chatId, seq }) {
     try {
       item.status = 'downloading';
       item.downloadProgress = 0;
+      item.compressProgress = null;
       item.downloadMethod = 'bot-api'; // 'direct' items ALWAYS use the Bot API — never MTProto
+      if (!item.startedAt) item.startedAt = Date.now();
       log.info('runCompressJob', `Download started (attempt ${attempt}/${MAX_ATTEMPTS})`, {
         chatId, seq, sourceType: item.sourceType, pipeline: 'bot-api', fileId: item.fileId, fileSizeBytes: item.fileSizeBytes,
       });
-      await session.onProgress(session);
+      await session.onProgress(session, { force: true });
 
-      await transfer.downloadViaBotApi(botInstance, item.fileId, inPath);
+      await transfer.downloadViaBotApi(botInstance, item.fileId, inPath, {
+        onProgress: (written, total) => {
+          if (!total) return;
+          reportBucketedProgress(session, item, 'downloadProgress', (written / total) * 100);
+        },
+      });
       item.tempIn = inPath;
+      item.downloadProgress = 100;
       log.success('runCompressJob', 'Download completed', { chatId, seq, path: inPath, method: 'bot-api' });
 
       item.status = 'compressing';
       item.downloadProgress = null;
+      item.compressProgress = 0;
       log.info('runCompressJob', 'Compression started', { chatId, seq });
-      await session.onProgress(session);
+      await session.onProgress(session, { force: true });
 
-      const info = await compress.processFile(inPath, outPath);
+      const info = await compress.processFile(inPath, outPath, ({ percent }) => {
+        reportBucketedProgress(session, item, 'compressProgress', percent);
+      });
       item.tempOut = outPath;
       item.probe = info;
+      item.compressProgress = 100;
       log.success('runCompressJob', 'Compression completed', { chatId, seq, mode: info.mode, duration: info.duration });
 
       item.status = 'ready';
-      await session.onProgress(session);
+      item.compressProgress = null;
+      await session.onProgress(session, { force: true });
       pumpUploadQueue();
       return;
     } catch (err) {
@@ -477,6 +519,7 @@ async function runCompressJob({ chatId, seq }) {
       item.tempIn = null;
       item.tempOut = null;
       item.downloadProgress = null;
+      item.compressProgress = null;
 
       // A "too big" rejection from the Bot API can never succeed on retry
       // (there is no MTProto fallback for a direct upload) — fail fast.
@@ -485,8 +528,9 @@ async function runCompressJob({ chatId, seq }) {
         // keep going (tickSessionUpload skips terminal-status items).
         item.status = 'failed';
         item.error = tooBig ? err.message : `Download/compression failed after ${MAX_ATTEMPTS} attempts: ${err.message}`;
+        item.finishedAt = Date.now();
         log.error('runCompressJob', 'Failed', new Error(item.error), { chatId, seq });
-        await session.onProgress(session);
+        await session.onProgress(session, { force: true });
         await maybeCompleteSession(session);
         pumpUploadQueue();
         return;
@@ -573,18 +617,32 @@ async function tryCopyPath(session, item) {
     log.success('tryCopyPath', 'Firestore updated', { chatId: session.chatId, seq: item.seq, episode: item.episode });
 
     item.status = 'done';
+    item.finishedAt = Date.now();
     log.success('tryCopyPath', 'Completed', { chatId: session.chatId, seq: item.seq });
     log.success('tryCopyPath', 'Cleanup completed (nothing to clean up — no local files were used)', { chatId: session.chatId, seq: item.seq });
-    await session.onProgress(session);
+    await session.onProgress(session, { force: true });
     return true;
   } catch (err) {
+    // A genuinely deleted source message will fail identically on the
+    // MTProto fallback below — fail fast with that specific reason
+    // instead of burning a retry cycle on something that can't recover.
+    if (/has been deleted/i.test(err.message || '')) {
+      item.status = 'failed';
+      item.error = err.message;
+      item.finishedAt = Date.now();
+      log.error('tryCopyPath', 'Failed — source message deleted', err, { chatId: session.chatId, seq: item.seq });
+      await session.onProgress(session, { force: true });
+      await maybeCompleteSession(session);
+      return true; // "handled" — do not enqueue a doomed fallback
+    }
+
     log.error('tryCopyPath', 'Copy not possible — falling back to download+compress+upload via MTProto', err, {
       chatId: session.chatId, seq: item.seq, sourceType: item.sourceType,
       channelId: item.forwardChatId, messageId: item.forwardMessageId, stack: err.stack,
     });
     item.needsCopyAttempt = false;
     item.status = 'waiting';
-    await session.onProgress(session);
+    await session.onProgress(session, { force: true });
     forwardedFallbackQueue.push({ chatId: session.chatId, seq: item.seq });
     pumpForwardedFallbackQueue();
     return false;
@@ -625,33 +683,41 @@ async function runForwardedFallbackJob({ chatId, seq }) {
     try {
       item.status = 'downloading';
       item.downloadProgress = 0;
+      item.compressProgress = null;
       item.downloadMethod = 'mtproto'; // 'forwarded' items ALWAYS use MTProto with the real channel
+      if (!item.startedAt) item.startedAt = Date.now();
       log.info('runForwardedFallbackJob', `Download started (attempt ${attempt}/${MAX_ATTEMPTS})`, {
         chatId, seq, sourceType: item.sourceType, pipeline: 'mtproto',
         channelId: item.forwardChatId, messageId: item.forwardMessageId,
       });
-      await session.onProgress(session);
+      await session.onProgress(session, { force: true });
 
       const onProgress = (written, total) => {
-        item.downloadProgress = total ? Math.min(100, Math.floor((written / total) * 100)) : null;
-        Promise.resolve(session.onProgress(session)).catch(() => {});
+        if (!total) return;
+        reportBucketedProgress(session, item, 'downloadProgress', (written / total) * 100);
       };
       await transfer.downloadFromChannel(item.forwardChatId, item.forwardMessageId, inPath, { onProgress });
       item.tempIn = inPath;
+      item.downloadProgress = 100;
       log.success('runForwardedFallbackJob', 'Download completed', { chatId, seq, path: inPath, method: 'mtproto' });
 
       item.status = 'compressing';
       item.downloadProgress = null;
+      item.compressProgress = 0;
       log.info('runForwardedFallbackJob', 'Compression started', { chatId, seq });
-      await session.onProgress(session);
+      await session.onProgress(session, { force: true });
 
-      const info = await compress.processFile(inPath, outPath);
+      const info = await compress.processFile(inPath, outPath, ({ percent }) => {
+        reportBucketedProgress(session, item, 'compressProgress', percent);
+      });
       item.tempOut = outPath;
       item.probe = info;
+      item.compressProgress = 100;
       log.success('runForwardedFallbackJob', 'Compression completed', { chatId, seq, mode: info.mode, duration: info.duration });
 
       item.status = 'ready';
-      await session.onProgress(session);
+      item.compressProgress = null;
+      await session.onProgress(session, { force: true });
       pumpUploadQueue();
       return;
     } catch (err) {
@@ -661,12 +727,20 @@ async function runForwardedFallbackJob({ chatId, seq }) {
       item.tempIn = null;
       item.tempOut = null;
       item.downloadProgress = null;
+      item.compressProgress = null;
 
-      if (attempt >= MAX_ATTEMPTS) {
+      // A verified-source failure (deleted message / wrong channel / no
+      // media) can never succeed on retry — fail fast with the SPECIFIC
+      // reason instead of retrying blindly and burying it under a
+      // generic "failed after N attempts" wrapper.
+      const isSourceError = err.name === 'SourceNotFoundError';
+
+      if (attempt >= MAX_ATTEMPTS || isSourceError) {
         item.status = 'failed';
-        item.error = `Download/compression failed after ${MAX_ATTEMPTS} attempts: ${err.message}`;
+        item.error = isSourceError ? err.message : `Download/compression failed after ${MAX_ATTEMPTS} attempts: ${err.message}`;
+        item.finishedAt = Date.now();
         log.error('runForwardedFallbackJob', 'Failed', new Error(item.error), { chatId, seq });
-        await session.onProgress(session);
+        await session.onProgress(session, { force: true });
         await maybeCompleteSession(session);
         pumpUploadQueue();
         return;
@@ -681,10 +755,12 @@ async function uploadPreparedFile(session, item) {
     item.attempts.upload = attempt;
     try {
       item.status = 'uploading';
+      item.uploadProgress = 0;
+      const uploadStartedAt = Date.now();
       log.info('uploadPreparedFile', `Upload started (attempt ${attempt}/${MAX_ATTEMPTS})`, {
         chatId: session.chatId, seq: item.seq, sourceType: item.sourceType, pipeline: 'mtproto-upload',
       });
-      await session.onProgress(session);
+      await session.onProgress(session, { force: true });
 
       const fileName = buildFileName(session, item, item.episode);
       const result = await transfer.uploadEpisode(session.storageChannelId, item.tempOut, {
@@ -692,31 +768,42 @@ async function uploadPreparedFile(session, item) {
         duration: item.probe?.duration || item.durationHint || 0,
         width: item.probe?.width || item.widthHint || 0,
         height: item.probe?.height || item.heightHint || 0,
+        onProgress: (percent) => reportBucketedProgress(session, item, 'uploadProgress', percent),
       });
-      log.success('uploadPreparedFile', 'Upload completed', { chatId: session.chatId, seq: item.seq, newMessageId: result.messageId });
+      item.uploadProgress = 100;
+      log.success('uploadPreparedFile', 'Upload completed', {
+        chatId: session.chatId, seq: item.seq, newMessageId: result.messageId, elapsedMs: Date.now() - uploadStartedAt,
+      });
 
       await writeFirestoreDoc(session, item, item.episode, result);
       log.success('uploadPreparedFile', 'Firestore updated', { chatId: session.chatId, seq: item.seq, episode: item.episode });
 
       item.status = 'done';
+      item.uploadProgress = null;
+      item.finishedAt = Date.now();
       cleanupFile(item.tempIn);
       cleanupFile(item.tempOut);
-      log.success('uploadPreparedFile', 'Completed', { chatId: session.chatId, seq: item.seq });
+      const totalElapsedMs = item.startedAt ? item.finishedAt - item.startedAt : null;
+      log.success('uploadPreparedFile', 'Completed', {
+        chatId: session.chatId, seq: item.seq, totalElapsedMs, finishedAt: new Date(item.finishedAt).toISOString(),
+      });
       log.success('uploadPreparedFile', 'Cleanup completed', { chatId: session.chatId, seq: item.seq });
 
-      await session.onProgress(session);
+      await session.onProgress(session, { force: true });
       return;
     } catch (err) {
       log.error('uploadPreparedFile', `Attempt ${attempt}/${MAX_ATTEMPTS} failed`, err, { chatId: session.chatId, seq: item.seq, stack: err.stack });
+      item.uploadProgress = null;
       if (attempt >= MAX_ATTEMPTS) {
         // Only THIS episode fails — the batch and every other episode
         // keep going (tickSessionUpload skips terminal-status items).
         item.status = 'failed';
         item.error = `Upload failed after ${MAX_ATTEMPTS} attempts: ${err.message}`;
+        item.finishedAt = Date.now();
         log.error('uploadPreparedFile', 'Failed', new Error(item.error), { chatId: session.chatId, seq: item.seq });
         cleanupFile(item.tempIn);
         cleanupFile(item.tempOut);
-        await session.onProgress(session);
+        await session.onProgress(session, { force: true });
         return;
       }
       await sleep(RETRY_BASE_DELAY_MS * attempt);
@@ -795,23 +882,23 @@ const STATUS_ICON = {
   waiting: '⏳',
   copying: '🔗',
   downloading: '📥',
-  compressing: '🔄',
+  compressing: '⚙',
   ready: '📦',
-  uploading: '⬆️',
+  uploading: '📤',
   done: '✅',
   failed: '❌',
   skipped: '⏭',
 };
 const STATUS_LABEL = {
-  buffered: 'buffered',
+  buffered: 'Waiting...',
   validated: 'Validated',
-  waiting: 'Waiting',
-  copying: 'Copying from channel',
-  downloading: 'Downloading',
-  compressing: 'Compressing',
-  ready: 'Queued',
-  uploading: 'Uploading',
-  done: 'Uploaded',
+  waiting: 'Waiting...',
+  copying: 'Copying from channel...',
+  downloading: 'Downloading...',
+  compressing: 'Compressing...',
+  ready: 'Queued...',
+  uploading: 'Uploading...',
+  done: 'Completed',
   failed: 'Failed',
   skipped: 'Skipped',
 };
@@ -819,6 +906,54 @@ const STATUS_LABEL = {
 function episodeLabel(session, item) {
   if (session.hasSeason) return `Episode ${item.episode ?? item.seq + 1}`;
   return item.seq > 0 ? `Part ${item.seq + 1}` : session.title;
+}
+
+/**
+ * Renders one item's block in the single, repeatedly-edited progress
+ * message, in the requested format:
+ *   📦 Episode 1
+ *   Downloading...
+ *   30%
+ * — only the phase name and the current 10%-stepped percent are shown
+ * (not a history of every percent it passed through), because this whole
+ * block gets replaced in place on every edit.
+ */
+function renderItemBlock(session, item) {
+  const icon = STATUS_ICON[item.status] || '❓';
+  const label = episodeLabel(session, item);
+  const lines = [`${icon} <b>${escapeHtml(label)}</b>`];
+
+  if (item.status === 'done') {
+    lines[0] = `✅ <b>${escapeHtml(label)} Completed</b>`;
+    return lines.join('\n');
+  }
+
+  if (item.status === 'failed') {
+    lines[0] = `❌ <b>${escapeHtml(label)} Failed</b>`;
+    lines.push('Reason:');
+    lines.push(escapeHtml((item.error || 'Unknown error').slice(0, 300)));
+    return lines.join('\n');
+  }
+
+  if (item.status === 'skipped') {
+    lines.push(`Skipped — ${escapeHtml((item.error || 'duplicate').slice(0, 200))}`);
+    return lines.join('\n');
+  }
+
+  const statusText = STATUS_LABEL[item.status] || item.status;
+  lines.push(statusText);
+
+  if (item.status === 'downloading' && typeof item.downloadProgress === 'number') {
+    lines.push(`${item.downloadProgress}%${item.downloadMethod === 'mtproto' ? ' (via channel)' : ''}`);
+  } else if (item.status === 'compressing' && typeof item.compressProgress === 'number') {
+    lines.push(`${item.compressProgress}%`);
+  } else if (item.status === 'uploading' && typeof item.uploadProgress === 'number') {
+    lines.push(`${item.uploadProgress}%`);
+  } else if (item.status === 'copying') {
+    lines.push('Please wait...');
+  }
+
+  return lines.join('\n');
 }
 
 function renderSessionText(session) {
@@ -831,28 +966,24 @@ function renderSessionText(session) {
     // Pre-lock view: exactly the simple checklist requested — nothing has
     // started processing yet, so there's nothing more to report.
     session.items.forEach((item) => {
-      lines.push(`📦 ${escapeHtml(episodeLabel(session, item))} buffered`);
+      lines.push(`📦 ${escapeHtml(episodeLabel(session, item))}`);
+      lines.push('Status: Waiting...');
+      lines.push('');
     });
-    lines.push('', 'ℹ️ Still buffering — send more episodes, or send <b>Done</b> (or /done) to start processing.');
+    lines.push('ℹ️ Still buffering — send more episodes, or send <b>Done</b> (or /done) to start processing.');
     return lines.join('\n');
   }
 
-  // Post-lock view: live per-item status.
+  // Post-lock view: live per-item status, one block per episode, all
+  // inside this SAME single message (never a new message per episode).
   session.items.forEach((item) => {
-    const icon = STATUS_ICON[item.status] || '❓';
-    const statusText = STATUS_LABEL[item.status] || item.status;
-    let line = `${escapeHtml(episodeLabel(session, item))} ${icon} ${statusText}`;
-    if (item.status === 'downloading' && typeof item.downloadProgress === 'number') {
-      line += item.downloadMethod === 'mtproto' ? ` (channel, ${item.downloadProgress}%)` : ` (${item.downloadProgress}%)`;
-    }
-    if ((item.status === 'failed' || item.status === 'skipped') && item.error) {
-      line += ` — ${escapeHtml(item.error.slice(0, 200))}`;
-    }
-    lines.push(line);
+    lines.push(renderItemBlock(session, item));
+    lines.push('');
   });
 
   const stillActive = session.items.some((it) => !isTerminal(it.status));
-  if (stillActive) lines.push('', '⏳ Processing…');
+  if (stillActive) lines.push('⏳ Processing…');
+  else lines.pop(); // drop the trailing blank line on the final render
 
   return lines.join('\n');
 }
