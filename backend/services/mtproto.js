@@ -25,6 +25,13 @@
  * instead (services/telegramUpload.js#downloadViaBotApi) — this file is
  * never involved in that path.
  *
+ * DC MIGRATION (FILE_MIGRATE_X / NETWORK_MIGRATE_X / USER_MIGRATE_X /
+ * PHONE_MIGRATE_X) is handled transparently for every manual RPC this
+ * file makes — see invokeWithMigration() below. A download or stream
+ * never fails just because the requested file happens to live on a
+ * different Telegram data center than the one the bot's main connection
+ * is on.
+ *
  * Setup (one-time):
  *   1. Get TELEGRAM_API_ID / TELEGRAM_API_HASH from https://my.telegram.org
  *   2. Run `node scripts/generateSession.js` once to mint a
@@ -51,9 +58,17 @@ const MAX_CONCURRENT_STREAMS = parseInt(process.env.MAX_CONCURRENT_STREAMS || '1
 const RECONNECT_CHECK_INTERVAL_MS = 30_000;
 const DEFAULT_CHUNK_SIZE = 512 * 1024; // 512KB — Telegram-friendly, aligned chunk size
 
+// ---- DC migration / retry tuning -----------------------------------
+const DC_MIGRATE_MAX_HOPS = 3;
+const CHUNK_MAX_RETRIES = parseInt(process.env.MTPROTO_CHUNK_MAX_RETRIES || '5', 10);
+const CHUNK_RETRY_BASE_DELAY_MS = 800;
+const CHUNK_RETRY_MAX_DELAY_MS = 8000;
+
 let client = null;
 let connecting = null;
 let lastError = null;
+/** DC id the primary connection is currently authorized against, once known. */
+let currentDcId = null;
 /** @type {Map<string, {doc:any, size:number, mimeType:string, fileName:?string, fetchedAt:number}>} */
 const entityCache = new Map();
 
@@ -113,6 +128,10 @@ function withTimeout(promise, ms, label) {
     timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -178,7 +197,12 @@ async function connect() {
 
       client = newClient;
       lastError = null;
-      log.success('connect', 'MTProto client connected');
+      try {
+        currentDcId = newClient.session?.dcId ?? null;
+      } catch (_) {
+        currentDcId = null;
+      }
+      log.success('connect', 'MTProto client connected', { homeDc: currentDcId });
       return client;
     } catch (err) {
       lastError = err;
@@ -232,6 +256,216 @@ class MTProtoValidationError extends Error {
   }
 }
 
+/**
+ * ---------------------------------------------------------------------
+ * DC MIGRATION HANDLING
+ * ---------------------------------------------------------------------
+ * Telegram tells clients that a piece of data (a file, or in rarer cases
+ * the whole account's home DC) actually lives on a different data center
+ * by failing the RPC with one of:
+ *   FILE_MIGRATE_X    - this specific file lives on DC X
+ *   NETWORK_MIGRATE_X - this connection should move to DC X
+ *   USER_MIGRATE_X    - this bot/user account's home DC is actually X
+ *   PHONE_MIGRATE_X   - (login-time) this phone number's home DC is X
+ * A raw client.invoke() call does NOT auto-follow these the way
+ * high-level helpers like sendFile/downloadMedia do internally, so every
+ * manual upload.GetFile RPC in this file is routed through
+ * invokeWithMigration() below, which:
+ *   1. Detects the *_MIGRATE_X error by parsing the RPC error message.
+ *   2. For FILE_MIGRATE/NETWORK_MIGRATE (only this request needs a
+ *      different DC — the session itself is fine): borrows an authorized
+ *      sender for that DC via GramJS's exported-sender pool. Internally
+ *      that performs auth.exportAuthorization on the current (home) DC
+ *      and auth.importAuthorization on the target DC — the "export and
+ *      import authorization" step this file needs — then the exact same
+ *      request is re-invoked against that sender.
+ *   3. For USER_MIGRATE/PHONE_MIGRATE (the whole session's home DC
+ *      changed): migrates the client's primary connection to the new DC
+ *      and re-invokes there.
+ *   4. Retries up to DC_MIGRATE_MAX_HOPS times (Telegram can, rarely,
+ *      redirect more than once), then gives up with a clear error
+ *      instead of ever surfacing a raw "FILE_MIGRATE_2" to a caller.
+ * Every hop is logged with the current DC, the target DC, and the reason,
+ * satisfying the "current DC / target DC" logging requirement.
+ * ---------------------------------------------------------------------
+ */
+function parseMigrateError(err) {
+  const msg = (err && (err.errorMessage || err.message)) || '';
+  const match = /^(FILE|NETWORK|USER|PHONE)_MIGRATE_(\d+)$/.exec(String(msg).trim());
+  if (!match) return null;
+  return { kind: match[1], dcId: parseInt(match[2], 10) };
+}
+
+function parseFloodWait(err) {
+  const msg = (err && (err.errorMessage || err.message)) || '';
+  const match = /^FLOOD_WAIT_(\d+)$/.exec(String(msg).trim());
+  if (!match) return null;
+  return parseInt(match[1], 10);
+}
+
+async function borrowDcSender(c, dcId) {
+  if (typeof c._borrowExportedSender === 'function') {
+    try {
+      return await c._borrowExportedSender(dcId);
+    } catch (err) {
+      log.warn('borrowDcSender', 'Failed to borrow exported sender for DC — will fall back to switching the primary connection', {
+        dcId, reason: err.message,
+      });
+      return null;
+    }
+  }
+  return null; // signals "no per-request sender support"; caller falls back to switching the whole client's DC
+}
+
+async function releaseDcSender(c, dcId, sender) {
+  if (!sender) return;
+  try {
+    if (typeof c._unborrowExportedSender === 'function') {
+      await c._unborrowExportedSender(dcId, sender);
+    } else if (typeof sender.disconnect === 'function') {
+      await sender.disconnect();
+    }
+  } catch (err) {
+    log.warn('releaseDcSender', 'Failed to release exported sender (non-fatal)', { dcId, reason: err.message });
+  }
+}
+
+async function switchPrimaryDc(c, dcId) {
+  if (typeof c._switchDC === 'function') {
+    await c._switchDC(dcId);
+    currentDcId = dcId;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Invokes `request` against `c`, transparently following any DC
+ * migration Telegram asks for, and transparently sleeping through
+ * FLOOD_WAIT_X responses above the client's floodSleepThreshold (GramJS
+ * already sleeps through short ones itself). `label`/`context` are only
+ * used for logging.
+ */
+async function invokeWithMigration(c, request, { label = 'invoke', context = {} } = {}) {
+  let sender = null;
+  let borrowedDcId = null;
+
+  try {
+    for (let hop = 0; hop <= DC_MIGRATE_MAX_HOPS; hop++) {
+      try {
+        return sender ? await c.invoke(request, sender) : await c.invoke(request);
+      } catch (err) {
+        const migrate = parseMigrateError(err);
+        const floodWaitSeconds = !migrate ? parseFloodWait(err) : null;
+
+        if (floodWaitSeconds) {
+          log.warn('invokeWithMigration', `${label}: Telegram asked us to wait (FLOOD_WAIT)`, {
+            ...context, waitSeconds: floodWaitSeconds,
+          });
+          await sleep(Math.min(floodWaitSeconds, 120) * 1000);
+          continue;
+        }
+
+        if (!migrate || hop === DC_MIGRATE_MAX_HOPS) throw err;
+
+        log.warn('invokeWithMigration', `${label}: Telegram requested a DC migration`, {
+          ...context,
+          migrateType: migrate.kind,
+          currentDc: currentDcId ?? 'unknown',
+          targetDc: migrate.dcId,
+          hop: hop + 1,
+        });
+
+        if (sender) {
+          await releaseDcSender(c, borrowedDcId, sender);
+          sender = null;
+          borrowedDcId = null;
+        }
+
+        if (migrate.kind === 'USER' || migrate.kind === 'PHONE') {
+          const switched = await switchPrimaryDc(c, migrate.dcId);
+          if (!switched) {
+            throw new Error(
+              `Telegram reported ${migrate.kind}_MIGRATE_${migrate.dcId} but this GramJS version does not ` +
+              `expose a DC-switch primitive — cannot follow the migration.`
+            );
+          }
+          log.success('invokeWithMigration', `${label}: primary connection switched to DC ${migrate.dcId}`, context);
+          continue;
+        }
+
+        // FILE_MIGRATE / NETWORK_MIGRATE — only this request needs a
+        // different DC; borrow (export/import authorization under the
+        // hood) an authorized sender for it instead of moving the whole
+        // client's primary connection.
+        const borrowed = await borrowDcSender(c, migrate.dcId);
+        if (!borrowed) {
+          const switched = await switchPrimaryDc(c, migrate.dcId);
+          if (!switched) {
+            throw new Error(
+              `Telegram reported ${migrate.kind}_MIGRATE_${migrate.dcId} but this GramJS version exposes ` +
+              `neither an exported-sender pool nor a DC-switch primitive — cannot follow the migration.`
+            );
+          }
+          log.success('invokeWithMigration', `${label}: no exported-sender support — switched primary connection to DC ${migrate.dcId} instead`, context);
+          continue;
+        }
+        sender = borrowed;
+        borrowedDcId = migrate.dcId;
+        log.success('invokeWithMigration', `${label}: borrowed authorized sender for DC ${migrate.dcId} (exported/imported authorization)`, context);
+      }
+    }
+  } finally {
+    if (sender) await releaseDcSender(c, borrowedDcId, sender);
+  }
+  // Unreachable in practice (the loop always returns or throws), but keeps
+  // control-flow analyzers happy.
+  throw new Error(`${label}: exhausted DC migration hops without success.`);
+}
+
+/**
+ * Requests one upload.GetFile chunk, transparently handling DC migration
+ * (invokeWithMigration) AND generic transient failures (timeouts, socket
+ * resets, temporary Telegram-side hiccups) with capped exponential
+ * backoff — so a single flaky chunk retries in place instead of failing
+ * (or restarting) the whole download.
+ */
+async function requestChunkWithRetry(c, fileLocation, offset, limit, context) {
+  const { Api } = require('telegram');
+  let lastErr;
+
+  for (let attempt = 1; attempt <= CHUNK_MAX_RETRIES; attempt++) {
+    try {
+      const result = await withTimeout(
+        invokeWithMigration(
+          c,
+          new Api.upload.GetFile({ location: fileLocation, offset, limit }),
+          { label: 'GetFile', context: { ...context, offset: offset.toString(), attempt } }
+        ),
+        CHUNK_REQUEST_TIMEOUT_MS,
+        `GetFile offset=${offset.toString()}`
+      );
+      if (attempt > 1) {
+        log.success('requestChunkWithRetry', 'Chunk succeeded after retry', { ...context, offset: offset.toString(), attempt });
+      }
+      return result;
+    } catch (err) {
+      lastErr = err;
+      if (attempt === CHUNK_MAX_RETRIES) break;
+      const delay = Math.min(CHUNK_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), CHUNK_RETRY_MAX_DELAY_MS);
+      log.warn('requestChunkWithRetry', `Chunk request failed — retrying (attempt ${attempt}/${CHUNK_MAX_RETRIES})`, {
+        ...context, offset: offset.toString(), reason: err.message, retryInMs: delay,
+      });
+      await sleep(delay);
+    }
+  }
+
+  log.error('requestChunkWithRetry', `Chunk request failed after ${CHUNK_MAX_RETRIES} attempts`, lastErr, {
+    ...context, offset: offset.toString(),
+  });
+  throw lastErr;
+}
+
 async function resolveEntity(channelId, { retried = false } = {}) {
   const c = await connect();
   if (!c) throw new MTProtoDisabledError();
@@ -248,10 +482,17 @@ async function resolveEntity(channelId, { retried = false } = {}) {
       }
       return resolveEntity(id, { retried: true });
     }
+    // This is the "wrong source channel" case — the channel/message pair
+    // itself may be perfectly valid, but the bot cannot see this chat at
+    // all (wrong id, not a member, kicked, etc). Deliberately NOT worded
+    // as "message not found" — that phrase is reserved for a genuinely
+    // deleted message inside a channel we CAN see (resolveVideoSource,
+    // below).
     throw new SourceNotFoundError(
-      `Cannot resolve Telegram channel ${channelId}: ${err.message}. Ensure the bot account is a member/admin ` +
-      `of this channel. (This function only ever resolves real channels — if you're seeing this for what should ` +
-      `be a direct upload to the bot, that's a bug: direct uploads must use the Bot API, not MTProto.)`
+      `Wrong source channel: cannot resolve Telegram channel ${channelId} (${err.message}). Ensure the bot ` +
+      `account is a member/admin of this channel and that the channel id is correct. (This function only ever ` +
+      `resolves real channels — if you're seeing this for what should be a direct upload to the bot, that's a ` +
+      `bug: direct uploads must use the Bot API, not MTProto.)`
     );
   }
 }
@@ -260,6 +501,13 @@ async function resolveEntity(channelId, { retried = false } = {}) {
  * Fetches message + document metadata for (channelId, messageId), with a
  * short TTL cache so repeated Range requests during one viewing session
  * don't re-hit Telegram's getMessages for every seek.
+ *
+ * Verifies the source message BEFORE any byte is downloaded, and takes
+ * care to only ever report "deleted" when Telegram genuinely says so
+ * (an explicit MessageEmpty). Every other failure mode — wrong channel,
+ * Telegram returning nothing at all for the id, a message with no video
+ * attached — gets its own distinct, actionable reason instead of being
+ * lumped into "Source message not found".
  */
 async function resolveVideoSource(channelId, messageId) {
   const cacheKey = `${channelId}:${messageId}`;
@@ -274,15 +522,44 @@ async function resolveVideoSource(channelId, messageId) {
     throw new MTProtoValidationError(`Invalid messageId: ${messageId}`);
   }
 
+  // Step 1: resolve the channel itself. If this fails, the problem is the
+  // CHANNEL (wrong id / bot not a member), not the message — resolveEntity
+  // already reports that distinctly.
   const entity = await resolveEntity(channelId);
-  const messages = await c.getMessages(entity, { ids: [messageIdNum] });
-  const message = messages && messages[0];
 
+  // Step 2: verify the message exists in that channel before attempting
+  // any download.
+  let messages;
+  try {
+    messages = await c.getMessages(entity, { ids: [messageIdNum] });
+  } catch (err) {
+    throw new SourceNotFoundError(
+      `Could not verify message ${messageId} in channel ${channelId}: Telegram getMessages failed (${err.message}).`
+    );
+  }
+
+  if (!messages || messages.length === 0) {
+    // Telegram returned nothing at all for this id — distinct from an
+    // explicit MessageEmpty placeholder (which really does mean deleted).
+    throw new SourceNotFoundError(
+      `Could not verify message ${messageId} exists in channel ${channelId} — Telegram returned no data for ` +
+      `this id. Double-check the message id and that it belongs to this channel.`
+    );
+  }
+
+  const message = messages[0];
   if (!message || message.className === 'MessageEmpty') {
-    throw new SourceNotFoundError(`Source message not found (channelId=${channelId}, messageId=${messageId}). It may have been deleted.`);
+    // The only case genuinely worded as "not found / deleted" — Telegram
+    // explicitly told us there's nothing at this id anymore.
+    throw new SourceNotFoundError(
+      `Source message not found (channelId=${channelId}, messageId=${messageId}) — it has been deleted.`
+    );
   }
   if (!message.media || (!message.media.document && !message.video && !message.document)) {
-    throw new SourceNotFoundError(`Message ${messageId} in channel ${channelId} has no video/document media (corrupted or wrong reference).`);
+    throw new SourceNotFoundError(
+      `Message ${messageId} in channel ${channelId} exists but has no video/document media attached ` +
+      `(wrong message id, or the media was stripped/edited out).`
+    );
   }
 
   const doc = message.media.document || message.document;
@@ -345,8 +622,9 @@ async function verifyMessage(channelId, messageId) {
  * caller (routes/stream.js) destroys the connection rather than ending it
  * normally, so the browser sees a hard failure instead of a silently
  * truncated "successful" download. Each chunk request also gets its own
- * timeout so a stuck RPC fails fast instead of hanging until the browser
- * gives up.
+ * timeout, automatic DC-migration handling, and retry-with-backoff, so a
+ * stuck/failed RPC recovers in place instead of hanging or aborting the
+ * whole stream.
  * ---------------------------------------------------------------------
  */
 async function streamRange(channelId, messageId, start, end, res, { onAbort } = {}) {
@@ -361,7 +639,6 @@ async function streamRange(channelId, messageId, start, end, res, { onAbort } = 
 
     const { doc } = await resolveVideoSource(channelId, messageId);
     const bigInt = require('big-integer');
-    const { Api } = require('telegram');
 
     const contentLength = end - start + 1;
 
@@ -384,13 +661,11 @@ async function streamRange(channelId, messageId, start, end, res, { onAbort } = 
 
       let result;
       try {
-        result = await withTimeout(
-          c.invoke(new Api.upload.GetFile({ location: fileLocation, offset, limit: DEFAULT_CHUNK_SIZE })),
-          CHUNK_REQUEST_TIMEOUT_MS,
-          `GetFile chunk#${chunkIndex} offset=${offset.toString()}`
-        );
+        result = await requestChunkWithRetry(c, fileLocation, offset, DEFAULT_CHUNK_SIZE, {
+          channelId, messageId, chunkIndex,
+        });
       } catch (err) {
-        log.error('streamRange', 'GetFile chunk request failed or timed out', err, {
+        log.error('streamRange', 'GetFile chunk request failed after retries', err, {
           channelId, messageId, chunkIndex, offset: offset.toString(),
         });
         throw err;
@@ -476,19 +751,26 @@ async function streamRange(channelId, messageId, start, end, res, { onAbort } = 
  * plain sequential download (not range-based like streamRange), so it
  * does not share the streaming semaphore with live playback requests.
  * `channelId` must be a REAL Telegram channel id — never a private chat
- * id (see the file header for why).
+ * id (see the file header for why). Every chunk goes through
+ * requestChunkWithRetry(), so a DC migration or a transient network blip
+ * is handled in place — the download only fails after Telegram/network
+ * problems persist past CHUNK_MAX_RETRIES attempts on the same chunk.
  */
 async function downloadToFile(channelId, messageId, destPath, { onProgress } = {}) {
+  const startedAt = Date.now();
   const c = await connect();
   if (!c) throw new MTProtoDisabledError();
 
   const fs = require('fs');
   const bigInt = require('big-integer');
-  const { Api } = require('telegram');
 
   const { doc, size } = await resolveVideoSource(channelId, messageId);
   const fileLocation = buildFileLocation(doc);
   const out = fs.createWriteStream(destPath);
+
+  log.info('downloadToFile', 'Download starting', {
+    channelId, messageId, destPath, sizeBytes: size, homeDc: currentDcId,
+  });
 
   let offset = bigInt(0);
   let written = 0;
@@ -497,11 +779,9 @@ async function downloadToFile(channelId, messageId, destPath, { onProgress } = {
   try {
     while (written < size) {
       chunkIndex += 1;
-      const result = await withTimeout(
-        c.invoke(new Api.upload.GetFile({ location: fileLocation, offset, limit: DEFAULT_CHUNK_SIZE })),
-        CHUNK_REQUEST_TIMEOUT_MS,
-        `downloadToFile chunk#${chunkIndex} offset=${offset.toString()}`
-      );
+      const result = await requestChunkWithRetry(c, fileLocation, offset, DEFAULT_CHUNK_SIZE, {
+        channelId, messageId, chunkIndex,
+      });
 
       if (result.className === 'upload.FileCdnRedirect') {
         throw new Error('TELEGRAM_CDN_REDIRECT_UNSUPPORTED');
@@ -527,6 +807,11 @@ async function downloadToFile(channelId, messageId, destPath, { onProgress } = {
     await new Promise((resolve) => out.end(resolve));
   }
 
+  const elapsedMs = Date.now() - startedAt;
+  log.success('downloadToFile', 'Download completed', {
+    channelId, messageId, destPath, bytes: written, elapsedMs, finishedAt: new Date().toISOString(),
+  });
+
   const fileNameAttr = (doc.attributes || []).find((a) => a.className === 'DocumentAttributeFilename');
   return { path: destPath, size: written, mimeType: doc.mimeType || 'video/mp4', fileName: fileNameAttr?.fileName || null };
 }
@@ -535,6 +820,7 @@ function health() {
   return {
     configured: CONFIGURED,
     connected: Boolean(client && client.connected),
+    homeDc: currentDcId,
     lastError: lastError?.message || null,
     activeStreams,
     queuedStreams: waitQueue.length,
