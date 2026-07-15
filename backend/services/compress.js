@@ -149,7 +149,15 @@ function parseTimemark(stderrChunk) {
   return { timemark: `${hh}:${mm}:${ss}`, seconds };
 }
 
-function runFfmpeg(inputPath, outputPath, mode, onProgress) {
+/**
+ * @param {string} inputPath
+ * @param {string} outputPath
+ * @param {'remux'|'transcode'} mode
+ * @param {(info:{timemark:string, seconds:number, percent:?number})=>void} [onProgress]
+ * @param {number} [totalDurationSeconds] source duration (from ffprobe's analyze()) used to
+ *   turn ffmpeg's raw "time=" timemark into a 0-100 percent for progress reporting.
+ */
+function runFfmpeg(inputPath, outputPath, mode, onProgress, totalDurationSeconds) {
   const args = ['-y', '-i', inputPath];
 
   if (mode === 'remux') {
@@ -182,7 +190,12 @@ function runFfmpeg(inputPath, outputPath, mode, onProgress) {
       stderrTail = (stderrTail + text).slice(-4000);
       if (onProgress) {
         const progress = parseTimemark(text);
-        if (progress) onProgress(progress);
+        if (progress) {
+          const percent = totalDurationSeconds > 0
+            ? Math.max(0, Math.min(100, Math.round((progress.seconds / totalDurationSeconds) * 100)))
+            : null;
+          onProgress({ ...progress, percent });
+        }
       }
     });
 
@@ -208,14 +221,19 @@ function runFfmpeg(inputPath, outputPath, mode, onProgress) {
  */
 async function processFile(inputPath, outputPath, onProgress) {
   const info = await analyze(inputPath);
+  log.info('processFile', 'Compression starting', {
+    inputPath, outputPath, mode: info.mode, durationSeconds: info.duration,
+  });
 
   try {
-    await runFfmpeg(inputPath, outputPath, info.mode, onProgress);
+    await runFfmpeg(inputPath, outputPath, info.mode, onProgress, info.duration);
+    log.success('processFile', 'Compression completed', { inputPath, outputPath, mode: info.mode });
     return info;
   } catch (err) {
     if (info.mode === 'remux') {
       log.warn('processFile', 'Remux failed — falling back to full transcode', { reason: err.message });
-      await runFfmpeg(inputPath, outputPath, 'transcode', onProgress);
+      await runFfmpeg(inputPath, outputPath, 'transcode', onProgress, info.duration);
+      log.success('processFile', 'Compression completed (transcode fallback)', { inputPath, outputPath });
       return { ...info, mode: 'transcode-fallback' };
     }
     throw err;
