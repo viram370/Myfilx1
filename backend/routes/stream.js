@@ -44,6 +44,7 @@ const router = express.Router();
 
 const { getDoc, updateDoc, addDoc } = require('../services/firebase');
 const mtproto = require('../services/mtproto');
+const playbackCompat = require('../services/playbackCompat');
 const { requireAuth, softAuth } = require('../middleware/auth');
 const { requireDocId, ApiValidationError, clampInt } = require('../utils/validators');
 const { makeLogger } = require('../utils/logger');
@@ -93,6 +94,9 @@ router.get('/:videoId', resolverLimiter, softAuth, async (req, res) => {
 
 router.get('/file/:videoId', fileLimiter, softAuth, async (req, res) => {
   const videoId = req.params.videoId;
+  const userAgent = req.headers['user-agent'] || 'unknown';
+  const range = req.headers.range;
+
   try {
     requireDocId(videoId, 'videoId');
 
@@ -124,15 +128,30 @@ router.get('/file/:videoId', fileLimiter, softAuth, async (req, res) => {
       updateDoc('videos', videoId, { fileSizeBytes: source.size, mimeType: source.mimeType }).catch(() => {});
     }
 
-    const mimeType = source.mimeType || video.mimeType || 'video/mp4';
-    const range = req.headers.range;
+    const mimeType = normalizeMimeType(source.mimeType || video.mimeType, source.fileName);
+    const resolution = extractResolution(source.doc);
+
+    // Never blocks this request — if the container/codec looks unsafe for
+    // inline HTML5 playback, this schedules a one-time background
+    // transcode (services/playbackCompat.js) that swaps the doc's
+    // channelId/messageId over to a guaranteed H.264/AAC/MP4 copy. This
+    // request still serves whatever's there right now, best effort.
+    playbackCompat.scheduleCompatibilityCheck(videoId, video, source);
+
+    log.info('fileStream', 'Stream request', {
+      videoId, mimeType, container: extractContainerGuess(mimeType, source.fileName), resolution,
+      range: range || 'none', userAgent, playbackCompatible: !!video.playbackCompatible, transcoding: !!video.transcoding,
+    });
 
     let start = 0;
     let end = fileSize - 1;
 
     if (range) {
       const match = /bytes=(\d*)-(\d*)/.exec(range);
-      if (!match) return res.status(416).set('Content-Range', `bytes */${fileSize}`).end();
+      if (!match) {
+        log.warn('fileStream', 'Malformed Range header', { videoId, range, userAgent });
+        return res.status(416).set('Content-Range', `bytes */${fileSize}`).end();
+      }
       const rangeStart = match[1] ? parseInt(match[1], 10) : null;
       const rangeEnd = match[2] ? parseInt(match[2], 10) : null;
 
@@ -146,6 +165,7 @@ router.get('/file/:videoId', fileLimiter, softAuth, async (req, res) => {
       }
 
       if (start >= fileSize || start > end || start < 0) {
+        log.warn('fileStream', 'Range not satisfiable', { videoId, range, fileSize, httpStatus: 416 });
         return res.status(416).set('Content-Range', `bytes */${fileSize}`).end();
       }
     }
@@ -154,12 +174,23 @@ router.get('/file/:videoId', fileLimiter, softAuth, async (req, res) => {
     // for the entire remainder of a multi-GB file.
     if (end - start + 1 > MAX_CHUNK_BYTES) end = start + MAX_CHUNK_BYTES - 1;
 
+    // Weak ETag tied to the video's actual source identity — automatically
+    // changes if playbackCompat swaps in a transcoded copy (different
+    // messageId), so browsers never serve a stale cached range from
+    // before a fix was applied.
+    const etag = `W/"${videoId}-${video.channelId}-${video.messageId}-${fileSize}"`;
     res.status(range ? 206 : 200);
     res.set({
       'Content-Type': mimeType,
       'Accept-Ranges': 'bytes',
       'Content-Length': end - start + 1,
-      'Cache-Control': 'private, max-age=0, no-cache',
+      // Byte ranges for a given channelId+messageId never change, so the
+      // same browser can safely reuse them across a seek/scrub within one
+      // session — cuts redundant re-fetches without risking stale bytes
+      // (the ETag changes the moment the underlying source does).
+      'Cache-Control': 'private, max-age=3600, immutable',
+      ETag: etag,
+      'X-Video-Compat': video.playbackCompatible ? 'compatible' : (video.transcoding ? 'transcoding' : 'unverified'),
     });
     if (range) res.set('Content-Range', `bytes ${start}-${end}/${fileSize}`);
 
@@ -178,7 +209,9 @@ router.get('/file/:videoId', fileLimiter, softAuth, async (req, res) => {
     // Only res.end() here, on the verified-good path.
     if (!res.writableEnded) res.end();
   } catch (err) {
-    log.error('fileStream', 'Streaming failed', err, { videoId, range: req.headers.range });
+    log.error('fileStream', 'Streaming failed', err, {
+      videoId, range: range || 'none', userAgent, httpStatus: res.headersSent ? res.statusCode : null, stack: err.stack,
+    });
     if (!res.headersSent) {
       if (err instanceof mtproto.MTProtoDisabledError) return res.status(501).json({ error: err.message });
       if (err instanceof ApiValidationError) return res.status(err.status).json({ error: err.message });
@@ -196,6 +229,45 @@ router.head('/file/:videoId', fileLimiter, softAuth, (req, res, next) => {
   req.method = 'HEAD';
   return router.handle(req, res, next);
 });
+
+// ── Content-Type / debug helpers ──────────────────────────────────────
+
+/**
+ * Telegram echoes back whatever mime type the uploading client declared,
+ * which is frequently wrong or generic (application/octet-stream is
+ * common). Rather than blindly trusting or blindly overriding it, map
+ * known container signatures (from the mime OR the file extension) to
+ * their correct standard type, and only fall back to video/mp4 as a last
+ * resort. Mislabeling a real MKV as "video/mp4" doesn't fix playback —
+ * it just hides the problem from the debugging logs — so this stays
+ * honest; services/playbackCompat.js is what actually fixes playback.
+ */
+function normalizeMimeType(rawMime, fileName) {
+  const mime = (rawMime || '').toLowerCase();
+  const name = (fileName || '').toLowerCase();
+
+  if (mime.startsWith('video/') && mime !== 'video/octet-stream') return rawMime;
+
+  if (/\.mkv$/.test(name) || /matroska/.test(mime)) return 'video/x-matroska';
+  if (/\.webm$/.test(name) || /webm/.test(mime)) return 'video/webm';
+  if (/\.mov$/.test(name) || /quicktime/.test(mime)) return 'video/quicktime';
+  if (/\.avi$/.test(name) || /x-msvideo/.test(mime)) return 'video/x-msvideo';
+  if (/\.(m4v|mp4)$/.test(name)) return 'video/mp4';
+  return 'video/mp4'; // safest default — most sources are already MP4-in-disguise
+}
+
+function extractContainerGuess(mimeType, fileName) {
+  const ext = (fileName || '').split('.').pop();
+  if (ext && ext.length <= 4) return ext.toLowerCase();
+  return (mimeType || '').split('/')[1] || 'unknown';
+}
+
+/** Pulls width/height straight out of Telegram's own document attributes — no download/ffprobe needed just for a debug log line. */
+function extractResolution(doc) {
+  const attr = (doc?.attributes || []).find((a) => a.className === 'DocumentAttributeVideo');
+  if (!attr) return 'unknown';
+  return `${attr.w || '?'}x${attr.h || '?'}`;
+}
 
 router.post('/:videoId/progress', requireAuth, async (req, res) => {
   try {
