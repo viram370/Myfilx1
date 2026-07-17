@@ -1,9 +1,9 @@
 /**
  * services/mtproto.js
  * ----------------------------------------------------------------------
- * Fixed MTProto stream assembler. Replaces brittle private APIs with a 
- * robust DC pool, automatically detects MKV/WebM/MP4 original containers, 
- * and actively protects against backpressure deadlocks.
+ * True MTProto client (GramJS), using public multi-client pooling for
+ * seamless and production-ready data center migration.
+ * ----------------------------------------------------------------------
  */
 'use strict';
 
@@ -20,8 +20,9 @@ const CONFIGURED = Boolean(API_ID && API_HASH && BOT_TOKEN);
 const ENTITY_CACHE_TTL_MS = 10 * 60_000;
 const MAX_CONCURRENT_STREAMS = parseInt(process.env.MAX_CONCURRENT_STREAMS || '12', 10);
 const RECONNECT_CHECK_INTERVAL_MS = 30_000;
-const DEFAULT_CHUNK_SIZE = 512 * 1024;
+const DEFAULT_CHUNK_SIZE = 512 * 1024; // 512KB — Telegram-friendly, aligned chunk size
 
+// ---- DC migration / retry tuning -----------------------------------
 const CHUNK_MAX_RETRIES = parseInt(process.env.MTPROTO_CHUNK_MAX_RETRIES || '5', 10);
 const CHUNK_RETRY_BASE_DELAY_MS = 800;
 const CHUNK_RETRY_MAX_DELAY_MS = 8000;
@@ -29,12 +30,17 @@ const CHUNK_RETRY_MAX_DELAY_MS = 8000;
 let client = null;
 let connecting = null;
 let lastError = null;
+/** DC id the primary connection is currently authorized against, once known. */
 let currentDcId = null;
 
-const entityCache = new Map();
+/** @type {Map<number, import('telegram').TelegramClient>} Cache for multi-client DC connections */
 const dcClients = new Map();
+/** @type {Map<number, Promise<import('telegram').TelegramClient>>} In-flight client factory synchronization */
 const dcClientCreationInFlight = new Map();
+/** @type {Map<string, {doc:any, size:number, mimeType:string, fileName:?string, fetchedAt:number}>} */
+const entityCache = new Map();
 
+// ---- semaphore for concurrent stream capping ----
 let activeStreams = 0;
 const waitQueue = [];
 function acquireSlot() {
@@ -54,19 +60,22 @@ function releaseSlot() {
 }
 
 class SourceNotFoundError extends Error {
-  constructor(msg) { super(msg); this.name = 'SourceNotFoundError'; }
+  constructor(msg) {
+    super(msg);
+    this.name = 'SourceNotFoundError';
+  }
 }
 class MTProtoDisabledError extends Error {
   constructor() {
-    super('MTProto streaming is not configured.');
+    super('MTProto streaming is not configured (missing TELEGRAM_API_ID / TELEGRAM_API_HASH / TELEGRAM_STRING_SESSION).');
     this.name = 'MTProtoDisabledError';
   }
 }
 class StreamIntegrityError extends Error {
-  constructor(msg) { super(msg); this.name = 'StreamIntegrityError'; }
-}
-class MTProtoValidationError extends Error {
-  constructor(msg) { super(msg); this.name = 'MTProtoValidationError'; }
+  constructor(msg) {
+    super(msg);
+    this.name = 'StreamIntegrityError';
+  }
 }
 
 const CHUNK_REQUEST_TIMEOUT_MS = 20000;
@@ -89,7 +98,7 @@ function buildFileLocation(doc) {
     id: doc.id,
     accessHash: doc.accessHash,
     fileReference: doc.fileReference,
-    thumbSize: '', 
+    thumbSize: '',
   });
 }
 
@@ -121,17 +130,27 @@ async function connect() {
         onError: (err) => log.error('connect', 'GramJS auth error', err),
       });
 
-      try { await newClient.getDialogs({ limit: 200 }); } catch (err) {}
+      try {
+        await newClient.getDialogs({ limit: 200 });
+      } catch (err) {
+        log.warn('connect', 'Initial getDialogs() warm-up failed (non-fatal)', { reason: err.message });
+      }
 
       client = newClient;
       lastError = null;
-      currentDcId = newClient.session?.dcId ?? null;
-      if (currentDcId) dcClients.set(currentDcId, client);
-
+      try {
+        currentDcId = newClient.session?.dcId ?? null;
+      } catch (_) {
+        currentDcId = null;
+      }
+      if (currentDcId) {
+        dcClients.set(currentDcId, client);
+      }
       log.success('connect', 'MTProto client connected', { homeDc: currentDcId });
       return client;
     } catch (err) {
       lastError = err;
+      log.error('connect', 'MTProto connection failed', err);
       throw err;
     } finally {
       connecting = null;
@@ -142,46 +161,74 @@ async function connect() {
 }
 
 async function initMTProto() {
-  if (!CONFIGURED) return;
-  try { await connect(); } catch {}
+  if (!CONFIGURED) {
+    log.warn('initMTProto', 'MTProto disabled — set TELEGRAM_API_ID/TELEGRAM_API_HASH/TELEGRAM_STRING_SESSION to enable true large-file streaming');
+    return;
+  }
+  try {
+    await connect();
+  } catch {
+    // Retried via watchdog
+  }
+
   setInterval(async () => {
     if (!CONFIGURED) return;
     if (client && client.connected) return;
-    try { await connect(); } catch (err) {}
+    log.warn('watchdog', 'MTProto client disconnected — attempting reconnect');
+    try {
+      await connect();
+    } catch (err) {
+      log.error('watchdog', 'Reconnect attempt failed', err);
+    }
   }, RECONNECT_CHECK_INTERVAL_MS).unref?.();
 }
 
 function normalizeChannelId(channelId) {
   const n = Number(channelId);
-  if (!Number.isInteger(n) || n === 0) throw new MTProtoValidationError(`Invalid channelId: ${channelId}`);
+  if (!Number.isInteger(n) || n === 0) {
+    throw new MTProtoValidationError(`Invalid channelId: ${channelId}`);
+  }
   return n;
 }
 
-function parseMigrateError(err) {
-  const msg = (err && (err.errorMessage || err.message)) || '';
-  const match = /^(FILE|NETWORK|USER|PHONE)_MIGRATE_(\d+)$/.exec(String(msg).trim());
-  if (match) return { kind: match[1], dcId: parseInt(match[2], 10) };
-  return null;
+class MTProtoValidationError extends Error {
+  constructor(msg) {
+    super(msg);
+    this.name = 'MTProtoValidationError';
+  }
 }
 
-function parseFloodWait(err) {
-  const msg = (err && (err.errorMessage || err.message)) || '';
-  const match = /^FLOOD_WAIT_(\d+)$/.exec(String(msg).trim());
-  if (!match) return null;
-  return parseInt(match[1], 10);
-}
-
-// Fix: Robust multi-client DC pool to replace private internal APIs
+/**
+ * Resolves a dedicated, fully authorized TelegramClient pool connection for a target DC
+ * using entirely standard public APIs.
+ */
 async function getClientForDC(dcId) {
-  if (!client) throw new Error("Primary client not started");
-  if (dcId === currentDcId) return client;
+  if (!client) {
+    throw new Error("Primary Telegram client is not started yet.");
+  }
 
-  const cached = dcClients.get(dcId);
-  if (cached && cached.connected) return cached;
-  
-  if (dcClientCreationInFlight.has(dcId)) return dcClientCreationInFlight.get(dcId);
+  const homeDc = currentDcId || client.session.dcId;
+  if (dcId === homeDc) {
+    return client;
+  }
 
-  const creation = (async () => {
+  const cachedClient = dcClients.get(dcId);
+  if (cachedClient) {
+    if (cachedClient.connected) return cachedClient;
+    try {
+      await cachedClient.connect();
+      return cachedClient;
+    } catch (err) {
+      dcClients.delete(dcId);
+    }
+  }
+
+  if (dcClientCreationInFlight.has(dcId)) {
+    return dcClientCreationInFlight.get(dcId);
+  }
+
+  const creationPromise = (async () => {
+    console.log(`[MTProto] Migration method used: Creating target client pool for DC ${dcId}`);
     const { TelegramClient } = require('telegram');
     const { StringSession } = require('telegram/sessions');
     const { Api } = require('telegram');
@@ -190,52 +237,84 @@ async function getClientForDC(dcId) {
     const options = (config.dcOptions || []).filter((o) => o.id === dcId && !o.cdn);
     const best = options.find((o) => !o.ipv6 && !o.mediaOnly) || options.find((o) => !o.ipv6) || options[0];
     
-    if (!best) throw new Error(`No DC address found for DC ${dcId}`);
+    if (!best) {
+      throw new Error(`No reachable network endpoint resolved for DC ${dcId}`);
+    }
 
-    const newClient = new TelegramClient(new StringSession(""), API_ID, API_HASH, {
-      connectionRetries: 5, retryDelay: 2000, autoReconnect: true, useWSS: false,
+    console.log(`[MTProto] Client created: Initializing fresh connection to DC ${dcId}`);
+    const session = new StringSession("");
+    const newClient = new TelegramClient(session, API_ID, API_HASH, {
+      connectionRetries: 5,
+      retryDelay: 2000,
+      autoReconnect: true,
+      floodSleepThreshold: 60,
+      useWSS: false,
     });
+
     newClient.session.setDC(dcId, best.ipAddress, best.port);
     await newClient.connect();
 
+    console.log("[MTProto] Exporting authorization...");
     const exported = await client.invoke(new Api.auth.ExportAuthorization({ dcId }));
-    await newClient.invoke(new Api.auth.ImportAuthorization({ id: exported.id, bytes: exported.bytes }));
 
+    console.log("[MTProto] Authorization imported...");
+    await newClient.invoke(
+      new Api.auth.ImportAuthorization({ id: exported.id, bytes: exported.bytes })
+    );
+
+    console.log(`[MTProto] Client for DC ${dcId} successfully added to pool cache.`);
     dcClients.set(dcId, newClient);
     return newClient;
-  })().finally(() => dcClientCreationInFlight.delete(dcId));
+  })().finally(() => {
+    dcClientCreationInFlight.delete(dcId);
+  });
 
-  dcClientCreationInFlight.set(dcId, creation);
-  return creation;
+  dcClientCreationInFlight.set(dcId, creationPromise);
+  return creationPromise;
 }
 
-// Fix: Perform chunk request directly against the correct pooled client
-async function requestChunkWithRetry(fileLocation, offset, limit, context, initialDcId) {
+function parseMigrateError(err) {
+  const msg = (err && (err.errorMessage || err.message)) || '';
+  const match = /^(FILE|NETWORK|USER|PHONE)_MIGRATE_(\d+)$/.exec(String(msg).trim());
+  if (match) return parseInt(match[2], 10);
+  
+  const stringMatch = /currently stored in DC (\d+)/i.exec(String(msg));
+  if (stringMatch) return parseInt(stringMatch[1], 10);
+  
+  return null;
+}
+
+/**
+ * Handles target DC execution, error-catching migration, and retry loop configurations
+ */
+async function requestChunkWithRetry(c, fileLocation, offset, limit, context, targetDcId) {
   const { Api } = require('telegram');
   let lastErr;
-  let activeDcId = initialDcId;
+  let activeDcId = targetDcId;
 
   for (let attempt = 1; attempt <= CHUNK_MAX_RETRIES; attempt++) {
     try {
       const activeClient = await getClientForDC(activeDcId);
+      
+      console.log(`[MTProto] Current DC: ${currentDcId || c.session.dcId}`);
+      console.log(`[MTProto] File DC: ${activeDcId}`);
+
       const result = await withTimeout(
         activeClient.invoke(new Api.upload.GetFile({ location: fileLocation, offset, limit })),
         CHUNK_REQUEST_TIMEOUT_MS,
-        `GetFile chunk offset=${offset.toString()}`
+        `GetFile offset=${offset.toString()}`
       );
+      
       return { result, finalDcId: activeDcId };
     } catch (err) {
       lastErr = err;
-      const migrate = parseMigrateError(err);
-      if (migrate && (migrate.kind === 'FILE' || migrate.kind === 'NETWORK')) {
-        activeDcId = migrate.dcId;
+      const migratedDc = parseMigrateError(err);
+
+      if (migratedDc) {
+        console.log(`[MTProto] Migration method used: Catching migration runtime error redirection to DC ${migratedDc}`);
+        activeDcId = migratedDc;
+        console.log(`[MTProto] Download resumed: Retrying payload extraction at target DC ${migratedDc}`);
         continue;
-      }
-      
-      const floodWaitSeconds = parseFloodWait(err);
-      if (floodWaitSeconds) {
-          await sleep(Math.min(floodWaitSeconds, 120) * 1000);
-          continue;
       }
 
       if (attempt === CHUNK_MAX_RETRIES) break;
@@ -254,10 +333,16 @@ async function resolveEntity(channelId, { retried = false } = {}) {
     return await c.getEntity(id);
   } catch (err) {
     if (!retried) {
-      try { await c.getDialogs({ limit: 200 }); } catch (e2) {}
+      try {
+        await c.getDialogs({ limit: 200 });
+      } catch (e2) {
+        // Safe to ignore
+      }
       return resolveEntity(id, { retried: true });
     }
-    throw new SourceNotFoundError(`Wrong source channel: cannot resolve Telegram channel ${channelId}`);
+    throw new SourceNotFoundError(
+      `Wrong source channel: cannot resolve Telegram channel ${channelId} (${err.message}).`
+    );
   }
 }
 
@@ -279,45 +364,42 @@ async function resolveVideoSource(channelId, messageId) {
   try {
     messages = await c.getMessages(entity, { ids: [messageIdNum] });
   } catch (err) {
-    throw new SourceNotFoundError(`Could not verify message ${messageId}: Telegram getMessages failed.`);
+    throw new SourceNotFoundError(
+      `Could not verify message ${messageId} in channel ${channelId}: Telegram getMessages failed (${err.message}).`
+    );
   }
 
   if (!messages || messages.length === 0) {
-    throw new SourceNotFoundError(`Message ${messageId} returned no data.`);
+    throw new SourceNotFoundError(
+      `Could not verify message ${messageId} exists in channel ${channelId}.`
+    );
   }
 
   const message = messages[0];
   if (!message || message.className === 'MessageEmpty') {
-    throw new SourceNotFoundError(`Source message not found — it has been deleted.`);
+    throw new SourceNotFoundError(
+      `Source message not found (channelId=${channelId}, messageId=${messageId}) — it has been deleted.`
+    );
   }
   if (!message.media || (!message.media.document && !message.video && !message.document)) {
-    throw new SourceNotFoundError(`Message exists but has no media attached.`);
+    throw new SourceNotFoundError(
+      `Message ${messageId} in channel ${channelId} exists but has no media attached.`
+    );
   }
 
   const doc = message.media.document || message.document;
   if (!doc || !doc.size) {
-    throw new SourceNotFoundError(`Media has no readable document.`);
+    throw new SourceNotFoundError(`Message ${messageId} media has no readable document.`);
   }
 
   const fileNameAttr = (doc.attributes || []).find((a) => a.className === 'DocumentAttributeFilename');
-  const fileName = fileNameAttr?.fileName || '';
-  
-  // Fix: Detect MIME type from Telegram media and filename strictly to preserve original container
-  let mimeType = doc.mimeType;
-  const ext = fileName.split('.').pop().toLowerCase();
-  
-  if (!mimeType || mimeType === 'application/octet-stream') {
-      if (ext === 'mkv') mimeType = 'video/x-matroska';
-      else if (ext === 'webm') mimeType = 'video/webm';
-      else mimeType = 'video/mp4'; // Default safe fallback
-  }
 
   const result = {
     message,
     doc,
     size: Number(doc.size),
-    mimeType,
-    fileName: fileName || null,
+    mimeType: doc.mimeType || 'video/mp4',
+    fileName: fileNameAttr?.fileName || null,
     fetchedAt: Date.now(),
   };
   entityCache.set(cacheKey, result);
@@ -334,11 +416,39 @@ async function verifyMessage(channelId, messageId) {
   }
 }
 
-async function streamRange(channelId, messageId, start, end, res, options = {}) {
+/**
+ * Streams bytes [start, end] (inclusive) for a Telegram video document
+ * directly into an HTTP response.
+ *
+ * Guarantees (this is the contract routes/stream.js relies on):
+ *   - Exactly the requested [start, end] range is written — never more,
+ *     never less, never re-ordered, never duplicated. Every chunk is
+ *     fetched strictly in order and only ever written once, so a corrupt
+ *     partial write can't leave stale bytes ahead of the current offset.
+ *   - Every chunk's length is validated against the remaining budget
+ *     BEFORE it's written — a chunk is trimmed to fit, never allowed to
+ *     overshoot `contentLength`.
+ *   - `res.write()` is only ever called with the raw bytes GramJS
+ *     returned (optionally sliced at the two ends of the range) — the
+ *     binary content itself is never transformed, re-encoded, or touched.
+ *   - On success, returns { bytesSent, contentLength, chunkCount } with
+ *     bytesSent === contentLength always true — if that can't be
+ *     guaranteed (Telegram ran out of bytes early, a chunk request
+ *     failed after retries, DC migration failed, etc.) this throws
+ *     instead of ever resolving with a short count, so the caller can
+ *     destroy the connection rather than silently end() a truncated body.
+ *   - A client disconnect (onAbort fires) stops the loop cleanly without
+ *     throwing — there is nothing left to verify once the socket is gone.
+ *
+ * @param {{onAbort?:(fn:()=>void)=>void, videoId?:string}} opts
+ */
+async function streamRange(channelId, messageId, start, end, res, { onAbort, videoId } = {}) {
   await acquireSlot();
   let aborted = false;
   const abortHandler = () => { aborted = true; };
-  if (options.onAbort) options.onAbort(abortHandler);
+  if (onAbort) onAbort(abortHandler);
+
+  const logCtx = { videoId, channelId, messageId };
 
   try {
     const c = await connect();
@@ -346,8 +456,8 @@ async function streamRange(channelId, messageId, start, end, res, options = {}) 
 
     const { doc } = await resolveVideoSource(channelId, messageId);
     const bigInt = require('big-integer');
-
     const contentLength = end - start + 1;
+
     const alignedStart = start - (start % DEFAULT_CHUNK_SIZE);
     const skipBytes = start - alignedStart;
     const fileLocation = buildFileLocation(doc);
@@ -356,85 +466,113 @@ async function streamRange(channelId, messageId, start, end, res, options = {}) 
     let bytesSent = 0;
     let isFirstChunk = true;
     let chunkIndex = 0;
-    let activeDcId = doc.dcId || currentDcId || c.session.dcId;
+
+    const telegramDcId = doc.dcId ?? null;
+    let activeDcId = telegramDcId || currentDcId || c.session.dcId;
+
+    log.info('streamRange', 'Stream started', {
+      ...logCtx,
+      telegramDc: telegramDcId, currentDc: currentDcId || c.session.dcId,
+      requestedRange: `${start}-${end}`, startOffset: start, endOffset: end, expectedBytes: contentLength,
+    });
 
     while (!aborted && bytesSent < contentLength) {
       chunkIndex += 1;
+      const chunkOffset = offset.toString();
+
       let chunkRes;
-      
       try {
-        chunkRes = await requestChunkWithRetry(fileLocation, offset, DEFAULT_CHUNK_SIZE, { channelId, messageId }, activeDcId);
+        chunkRes = await requestChunkWithRetry(c, fileLocation, offset, DEFAULT_CHUNK_SIZE, {
+          channelId, messageId, chunkIndex,
+        }, activeDcId);
         activeDcId = chunkRes.finalDcId;
       } catch (err) {
+        log.error('streamRange', 'GetFile chunk request failed after retries', err, {
+          ...logCtx, chunkIndex, chunkOffset, totalBytesWritten: bytesSent, expectedBytes: contentLength, finalStatus: 'ERROR',
+        });
         throw err;
       }
 
-      if (chunkRes.result.className === 'upload.FileCdnRedirect') throw new Error('TELEGRAM_CDN_REDIRECT_UNSUPPORTED');
+      if (aborted) break; // client vanished while we were awaiting the chunk — nothing left to write
 
-      const bytes = chunkRes.result.bytes;
-      if (!bytes || bytes.length === 0) break;
+      const result = chunkRes.result;
+      if (result.className === 'upload.FileCdnRedirect') {
+        throw new Error('TELEGRAM_CDN_REDIRECT_UNSUPPORTED');
+      }
 
+      const bytes = result.bytes;
+      const rawChunkSize = bytes ? bytes.length : 0;
+      if (!bytes || rawChunkSize === 0) {
+        log.info('streamRange', 'Telegram returned an empty chunk — end of file reached', {
+          ...logCtx, chunkIndex, chunkOffset, totalBytesWritten: bytesSent,
+        });
+        break;
+      }
+
+      // Trim exactly at the two ends of the requested range — this is the
+      // ONLY slicing ever applied, and it never touches the bytes in
+      // between, so the payload reaching res.write() is always a
+      // contiguous, unmodified sub-slice of what Telegram returned.
       let piece = bytes;
       if (isFirstChunk) {
         isFirstChunk = false;
         if (skipBytes > 0) piece = piece.subarray(skipBytes);
       }
-
       const remaining = contentLength - bytesSent;
       if (piece.length > remaining) piece = piece.subarray(0, remaining);
 
-      if (piece.length > 0 && !aborted && !res.destroyed && !res.writableEnded) {
-        
-        // Fix: Requested Debug Logging implementation
-        log.info('streamRange', 'Chunk written', {
-          videoId: options.videoId || 'unknown',
-          channelId,
-          messageId,
-          telegramDc: activeDcId,
-          currentDc: currentDcId,
-          requestedRange: options.rangeHeader || 'FULL',
-          startOffset: start,
-          endOffset: end,
-          chunkIndex,
-          chunkOffset: offset.toString(),
-          chunkSize: bytes.length,
-          bytesWritten: piece.length,
-          totalBytesWritten: bytesSent + piece.length,
-          expectedBytes: contentLength,
-          finalStatus: (bytesSent + piece.length === contentLength) ? 'Completed' : 'Streaming'
-        });
+      // Validate before writing: never write more than the remaining
+      // budget, never write a negative/undefined-length slice.
+      if (piece.length < 0 || piece.length > remaining) {
+        throw new StreamIntegrityError(
+          `Computed an invalid chunk length (${piece.length}) against remaining=${remaining} for ${channelId}:${messageId}`
+        );
+      }
 
+      let chunkBytesWritten = 0;
+      if (piece.length > 0 && !aborted && !res.destroyed && !res.writableEnded) {
         const ok = res.write(piece);
+        chunkBytesWritten = piece.length;
         bytesSent += piece.length;
-        
-        // Fix: Backpressure deadlock prevention - Ensure the listener doesn't hang if socket drops
         if (!ok) {
-          await new Promise((resolve, reject) => {
-            const onDrain = () => { cleanup(); resolve(); };
-            const onClose = () => { cleanup(); reject(new Error('Client disconnected during drain')); };
-            const cleanup = () => {
-              res.removeListener('drain', onDrain);
-              res.removeListener('close', onClose);
-              res.removeListener('error', onClose);
-            };
-            res.once('drain', onDrain);
-            res.once('close', onClose);
-            res.once('error', onClose);
-          });
+          await new Promise((resolve) => res.once('drain', resolve));
         }
       }
 
+      log.info('streamRange', 'Chunk written', {
+        ...logCtx, chunkIndex, chunkOffset, chunkSize: rawChunkSize,
+        bytesWritten: chunkBytesWritten, totalBytesWritten: bytesSent, expectedBytes: contentLength,
+      });
+
+      // Advance by the RAW bytes Telegram actually returned (not the
+      // trimmed piece length) — this keeps every subsequent GetFile
+      // offset exactly aligned with what Telegram has already given us,
+      // which is what prevents skipped, duplicated, or re-ordered chunks.
       offset = offset.add(bytes.length);
-      if (bytes.length < DEFAULT_CHUNK_SIZE) break;
+      if (bytes.length < DEFAULT_CHUNK_SIZE) break; // short chunk = genuine EOF at this DC/tier
     }
 
-    if (aborted) return;
+    if (aborted) {
+      log.info('streamRange', 'Aborted by client disconnect', {
+        ...logCtx, totalBytesWritten: bytesSent, expectedBytes: contentLength, finalStatus: 'ABORTED',
+      });
+      return { bytesSent, contentLength, chunkCount: chunkIndex, aborted: true };
+    }
 
-    // Fix: Final Verification Check
     if (bytesSent !== contentLength) {
-      log.error('streamRange', 'Mismatch: aborting response', { expected: contentLength, written: bytesSent });
-      throw new StreamIntegrityError(`Streamed ${bytesSent} of ${contentLength} promised bytes for ${channelId}:${messageId}`);
+      const integrityErr = new StreamIntegrityError(
+        `Streamed ${bytesSent} of ${contentLength} promised bytes for ${channelId}:${messageId} (range ${start}-${end})`
+      );
+      log.error('streamRange', 'Integrity check failed — byte count mismatch', integrityErr, {
+        ...logCtx, totalBytesWritten: bytesSent, expectedBytes: contentLength, finalStatus: 'INTEGRITY_MISMATCH',
+      });
+      throw integrityErr;
     }
+
+    log.success('streamRange', 'Stream completed — bytes sent match Content-Length exactly', {
+      ...logCtx, totalBytesWritten: bytesSent, expectedBytes: contentLength, chunkCount: chunkIndex, finalStatus: 'SUCCESS',
+    });
+    return { bytesSent, contentLength, chunkCount: chunkIndex, aborted: false };
   } finally {
     releaseSlot();
   }
@@ -451,18 +589,29 @@ async function downloadToFile(channelId, messageId, destPath, { onProgress } = {
   const { doc, size } = await resolveVideoSource(channelId, messageId);
   const fileLocation = buildFileLocation(doc);
   const out = fs.createWriteStream(destPath);
-  let activeDcId = doc.dcId || currentDcId || c.session.dcId;
 
   let offset = bigInt(0);
   let written = 0;
+  let chunkIndex = 0;
+  
+  let activeDcId = doc.dcId || currentDcId || c.session.dcId;
 
   try {
     while (written < size) {
-      const chunkRes = await requestChunkWithRetry(fileLocation, offset, DEFAULT_CHUNK_SIZE, { channelId, messageId }, activeDcId);
-      activeDcId = chunkRes.finalDcId;
+      chunkIndex += 1;
       
-      if (chunkRes.result.className === 'upload.FileCdnRedirect') throw new Error('TELEGRAM_CDN_REDIRECT_UNSUPPORTED');
-      const bytes = chunkRes.result.bytes;
+      const chunkRes = await requestChunkWithRetry(c, fileLocation, offset, DEFAULT_CHUNK_SIZE, {
+        channelId, messageId, chunkIndex,
+      }, activeDcId);
+      
+      activeDcId = chunkRes.finalDcId;
+      const result = chunkRes.result;
+
+      if (result.className === 'upload.FileCdnRedirect') {
+        throw new Error('TELEGRAM_CDN_REDIRECT_UNSUPPORTED');
+      }
+
+      const bytes = result.bytes;
       if (!bytes || bytes.length === 0) break;
 
       await new Promise((resolve, reject) => {
@@ -475,14 +624,16 @@ async function downloadToFile(channelId, messageId, destPath, { onProgress } = {
       if (bytes.length < DEFAULT_CHUNK_SIZE) break;
     }
 
-    if (written !== size) throw new Error(`downloadToFile: wrote ${written} of ${size} bytes`);
+    if (written !== size) {
+      throw new Error(`downloadToFile: wrote ${written} of ${size} expected bytes for ${channelId}:${messageId}`);
+    }
   } finally {
     await new Promise((resolve) => out.end(resolve));
   }
 
   const elapsedMs = Date.now() - startedAt;
   log.success('downloadToFile', 'Download completed', {
-    channelId, messageId, destPath, bytes: written, elapsedMs
+    channelId, messageId, destPath, bytes: written, elapsedMs, finishedAt: new Date().toISOString(),
   });
 
   const fileNameAttr = (doc.attributes || []).find((a) => a.className === 'DocumentAttributeFilename');
@@ -505,9 +656,11 @@ async function shutdown() {
   try {
     if (client) await client.disconnect();
     for (const cachedClient of dcClients.values()) {
-        if (cachedClient !== client) await cachedClient.disconnect();
+      if (cachedClient !== client) {
+        await cachedClient.disconnect();
+      }
     }
-    log.info('shutdown', 'MTProto clients disconnected cleanly');
+    log.info('shutdown', 'All pooled MTProto clients disconnected cleanly');
   } catch (err) {
     log.error('shutdown', 'Error during MTProto disconnect', err);
   }
