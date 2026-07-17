@@ -285,12 +285,45 @@ function parseMigrateError(err) {
 }
 
 /**
- * Handles target DC execution, error-catching migration, and retry loop configurations
+ * Telegram file references (the opaque `fileReference` byte-blob baked
+ * into every InputDocumentFileLocation) expire — typically after roughly
+ * an hour, sometimes sooner if the source message is edited/forwarded
+ * elsewhere. A long-running download or a video that's been paused/
+ * resumed can easily outlive that window mid-stream, and Telegram's
+ * answer at that point is a hard RPC error rather than a graceful
+ * degrade. This has to be detected and the reference refreshed — retrying
+ * the same expired bytes forever just burns the retry budget and fails.
+ */
+function isFileReferenceExpiredError(err) {
+  const msg = (err && (err.errorMessage || err.message)) || '';
+  return /FILE_REFERENCE_EXPIRED|FILEREF_EXPIRED|FILE_REFERENCE_INVALID|FILE_REFERENCE_EMPTY/i.test(String(msg));
+}
+
+function parseFloodWaitSeconds(err) {
+  if (!err) return null;
+  if (typeof err.seconds === 'number') return err.seconds;
+  const msg = (err.errorMessage || err.message || '').toString();
+  const match = /FLOOD_WAIT_(\d+)/i.exec(msg);
+  return match ? parseInt(match[1], 10) : null;
+}
+
+/**
+ * Handles target DC execution, error-catching migration, fileReference
+ * refresh, and retry loop configuration.
+ *
+ * `context.channelId`/`context.messageId` (always supplied by callers)
+ * let this function re-resolve the source document — bypassing the
+ * entity cache — and rebuild a fresh InputDocumentFileLocation whenever
+ * Telegram reports the current one's fileReference has expired. The
+ * refreshed location is handed back as `finalFileLocation` so the caller's
+ * loop keeps using it for every subsequent chunk instead of re-hitting the
+ * same stale reference.
  */
 async function requestChunkWithRetry(c, fileLocation, offset, limit, context, targetDcId) {
   const { Api } = require('telegram');
   let lastErr;
   let activeDcId = targetDcId;
+  let activeLocation = fileLocation;
 
   for (let attempt = 1; attempt <= CHUNK_MAX_RETRIES; attempt++) {
     try {
@@ -300,12 +333,12 @@ async function requestChunkWithRetry(c, fileLocation, offset, limit, context, ta
       console.log(`[MTProto] File DC: ${activeDcId}`);
 
       const result = await withTimeout(
-        activeClient.invoke(new Api.upload.GetFile({ location: fileLocation, offset, limit })),
+        activeClient.invoke(new Api.upload.GetFile({ location: activeLocation, offset, limit })),
         CHUNK_REQUEST_TIMEOUT_MS,
         `GetFile offset=${offset.toString()}`
       );
       
-      return { result, finalDcId: activeDcId };
+      return { result, finalDcId: activeDcId, finalFileLocation: activeLocation };
     } catch (err) {
       lastErr = err;
       const migratedDc = parseMigrateError(err);
@@ -314,6 +347,39 @@ async function requestChunkWithRetry(c, fileLocation, offset, limit, context, ta
         console.log(`[MTProto] Migration method used: Catching migration runtime error redirection to DC ${migratedDc}`);
         activeDcId = migratedDc;
         console.log(`[MTProto] Download resumed: Retrying payload extraction at target DC ${migratedDc}`);
+        continue;
+      }
+
+      if (isFileReferenceExpiredError(err) && context && context.channelId && context.messageId) {
+        log.warn('requestChunkWithRetry', 'fileReference expired mid-stream — refreshing from Telegram', {
+          channelId: context.channelId, messageId: context.messageId, chunkIndex: context.chunkIndex, attempt,
+        });
+        try {
+          const fresh = await resolveVideoSource(context.channelId, context.messageId, { forceRefresh: true });
+          activeLocation = buildFileLocation(fresh.doc);
+          log.success('requestChunkWithRetry', 'fileReference refreshed — retrying chunk', {
+            channelId: context.channelId, messageId: context.messageId, chunkIndex: context.chunkIndex,
+          });
+          continue; // retry immediately with the fresh reference, doesn't need a backoff sleep
+        } catch (refreshErr) {
+          log.error('requestChunkWithRetry', 'Failed to refresh expired fileReference', refreshErr, {
+            channelId: context.channelId, messageId: context.messageId,
+          });
+          lastErr = refreshErr;
+          if (attempt === CHUNK_MAX_RETRIES) break;
+          const delay = Math.min(CHUNK_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), CHUNK_RETRY_MAX_DELAY_MS);
+          await sleep(delay);
+          continue;
+        }
+      }
+
+      const floodWaitSeconds = parseFloodWaitSeconds(err);
+      if (floodWaitSeconds !== null) {
+        log.warn('requestChunkWithRetry', `FLOOD_WAIT hit — sleeping ${floodWaitSeconds}s before retry`, {
+          chunkIndex: context?.chunkIndex, attempt,
+        });
+        if (attempt === CHUNK_MAX_RETRIES) break;
+        await sleep(floodWaitSeconds * 1000);
         continue;
       }
 
@@ -346,10 +412,18 @@ async function resolveEntity(channelId, { retried = false } = {}) {
   }
 }
 
-async function resolveVideoSource(channelId, messageId) {
+async function resolveVideoSource(channelId, messageId, { forceRefresh = false } = {}) {
   const cacheKey = `${channelId}:${messageId}`;
-  const cached = entityCache.get(cacheKey);
-  if (cached && Date.now() - cached.fetchedAt < ENTITY_CACHE_TTL_MS) return cached;
+  if (forceRefresh) {
+    // A caller hit FILE_REFERENCE_EXPIRED against the cached doc — the
+    // cache entry is now known-stale regardless of its TTL, so drop it
+    // before re-fetching rather than risk handing back the same expired
+    // fileReference again.
+    entityCache.delete(cacheKey);
+  } else {
+    const cached = entityCache.get(cacheKey);
+    if (cached && Date.now() - cached.fetchedAt < ENTITY_CACHE_TTL_MS) return cached;
+  }
 
   const c = await connect();
   if (!c) throw new MTProtoDisabledError();
@@ -460,7 +534,11 @@ async function streamRange(channelId, messageId, start, end, res, { onAbort, vid
 
     const alignedStart = start - (start % DEFAULT_CHUNK_SIZE);
     const skipBytes = start - alignedStart;
-    const fileLocation = buildFileLocation(doc);
+    // `let`, not `const` — requestChunkWithRetry() rebuilds this and hands
+    // back a fresh InputDocumentFileLocation whenever Telegram reports the
+    // current fileReference has expired mid-stream, and every subsequent
+    // chunk in this loop must use that refreshed location.
+    let fileLocation = buildFileLocation(doc);
 
     let offset = bigInt(alignedStart);
     let bytesSent = 0;
@@ -486,6 +564,7 @@ async function streamRange(channelId, messageId, start, end, res, { onAbort, vid
           channelId, messageId, chunkIndex,
         }, activeDcId);
         activeDcId = chunkRes.finalDcId;
+        fileLocation = chunkRes.finalFileLocation;
       } catch (err) {
         log.error('streamRange', 'GetFile chunk request failed after retries', err, {
           ...logCtx, chunkIndex, chunkOffset, totalBytesWritten: bytesSent, expectedBytes: contentLength, finalStatus: 'ERROR',
@@ -587,7 +666,7 @@ async function downloadToFile(channelId, messageId, destPath, { onProgress } = {
   const bigInt = require('big-integer');
 
   const { doc, size } = await resolveVideoSource(channelId, messageId);
-  const fileLocation = buildFileLocation(doc);
+  let fileLocation = buildFileLocation(doc); // refreshed in-place below on FILE_REFERENCE_EXPIRED
   const out = fs.createWriteStream(destPath);
 
   let offset = bigInt(0);
@@ -605,6 +684,7 @@ async function downloadToFile(channelId, messageId, destPath, { onProgress } = {
       }, activeDcId);
       
       activeDcId = chunkRes.finalDcId;
+      fileLocation = chunkRes.finalFileLocation;
       const result = chunkRes.result;
 
       if (result.className === 'upload.FileCdnRedirect') {
