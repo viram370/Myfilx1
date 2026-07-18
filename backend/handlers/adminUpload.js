@@ -397,11 +397,35 @@ async function renderProgressBySession(session, id, { force = false } = {}) {
   try {
     if (session.progressMessageId) {
       await sharedSafeEditMessageText(text, { chat_id: id, message_id: session.progressMessageId, parse_mode: 'HTML' });
-    } else {
+      return;
+    }
+
+    // Two videos captured close enough together (or a status change
+    // firing while the very first message is still being sent) could
+    // both reach this point before either has set session.progressMessageId
+    // — without this guard each would send its own NEW message instead of
+    // sharing one edited message for the whole batch. Whichever call gets
+    // here first "owns" creating the message; everyone else waits for it
+    // and then edits the message that was actually created.
+    if (session.creatingProgressMessage) {
+      await session.creatingProgressMessage;
+      if (session.progressMessageId) {
+        await sharedSafeEditMessageText(text, { chat_id: id, message_id: session.progressMessageId, parse_mode: 'HTML' });
+      }
+      return;
+    }
+
+    session.creatingProgressMessage = (async () => {
       const sent = await sharedSafeSendMessage(id, text, { parse_mode: 'HTML' });
       session.progressMessageId = sent?.message_id || null;
+    })();
+    try {
+      await session.creatingProgressMessage;
+    } finally {
+      session.creatingProgressMessage = null;
     }
   } catch (err) {
+    session.creatingProgressMessage = null;
     log.error('renderProgressBySession', 'Failed to render progress message', err, { chatId: id });
   }
 }
