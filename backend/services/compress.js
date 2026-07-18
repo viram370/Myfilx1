@@ -407,6 +407,18 @@ function buildFfmpegArgs(inputPath, outputPath, tier, info) {
       '-crf', '23',
       '-pix_fmt', 'yuv420p',
       '-profile:v', 'high',
+      // Constant frame rate: many MKV/phone-camera/screen-recording
+      // sources are variable-frame-rate (frames stored irregularly in
+      // time). VFR H.264 is legal but several players — Telegram's
+      // inline player among them — handle it poorly (stutter, audio
+      // drift, or duration/seek-bar mismatches). `-vsync cfr` re-times
+      // every re-encoded output to the source's average frame rate,
+      // duplicating/dropping frames as needed so the output timeline is
+      // perfectly even. Only applied when a real re-encode is already
+      // happening — a stream-copy tier can't change frame timing without
+      // decoding, and analyze()/verifyOutputFile() don't require CFR for
+      // the (already H.264) sources that qualify for a copy.
+      '-vsync', 'cfr',
       // Deliberately NOT forcing a fixed -level here. A hardcoded level
       // (e.g. "4.1") is only valid up to a certain resolution/bitrate —
       // anything above that (a 1440p/4K source, or just a higher-bitrate
@@ -496,6 +508,13 @@ async function verifyOutputFile(outputPath) {
   if (outVideoCodec !== 'h264') {
     return { valid: false, reason: `output video codec is "${outVideoCodec || 'unknown'}", not H.264 — Telegram's inline player will reject this` };
   }
+  const outPixFmt = (videoStream.pix_fmt || '').toLowerCase();
+  if (outPixFmt && !/^yuvj?420p$/.test(outPixFmt)) {
+    return { valid: false, reason: `output pixel format is "${outPixFmt}", not yuv420p — many decoders (including Telegram's inline player) reject 4:2:2/4:4:4/10-bit output` };
+  }
+  if (!(videoStream.width > 0) || !(videoStream.height > 0)) {
+    return { valid: false, reason: `output reports an invalid resolution (${videoStream.width || 0}x${videoStream.height || 0})` };
+  }
   const badAudio = audioStreams.find((s) => (s.codec_name || '').toLowerCase() !== 'aac');
   if (badAudio) {
     return { valid: false, reason: `output has a non-AAC audio track ("${badAudio.codec_name || 'unknown'}") — Telegram's inline player will reject this` };
@@ -542,6 +561,10 @@ async function generateThumbnail(videoPath, outputJpgPath, durationSeconds) {
     throw new Error('Thumbnail generation produced an empty file');
   }
   return outputJpgPath;
+}
+
+function cleanupTierOutput(outputPath) {
+  try { fs.unlinkSync(outputPath); } catch (err) { if (err.code !== 'ENOENT') log.warn('cleanupTierOutput', 'Failed to remove invalid output file', { outputPath, reason: err.message }); }
 }
 
 /**
@@ -619,6 +642,12 @@ async function processFile(inputPath, outputPath, onProgress) {
       // never plays.
       const verified = await verifyOutputFile(outputPath);
       if (!verified.valid) {
+        // Never leave an invalid file sitting on disk where a later step
+        // could accidentally pick it up — delete immediately, then either
+        // the next (more conservative) tier retries from scratch or, if
+        // this was the last tier, processFile() throws and the caller
+        // fails the item outright instead of falling back to shipping it.
+        cleanupTierOutput(outputPath);
         throw new Error(`FFmpeg exited cleanly but the output failed verification: ${verified.reason}`);
       }
 
@@ -648,6 +677,7 @@ async function processFile(inputPath, outputPath, onProgress) {
   }
 
   log.error('processFile', 'All compression strategies exhausted', lastErr, { inputPath, outputPath, attempts: tiers.length });
+  cleanupTierOutput(outputPath); // belt-and-suspenders — every tier already cleans up its own failed attempt, but never leave a stray file behind on the final failure either
   throw new Error(`FFmpeg compression failed after ${tiers.length} attempt(s): ${lastErr ? lastErr.message : 'unknown error'}`);
 }
 
