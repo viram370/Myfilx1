@@ -300,7 +300,7 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
   // GramJS reports upload progress as a 0..1 fraction — convert to a
   // plain 0-100 percent so callers (queue/pipeline.js) can bucket it into
   // the same 10%-step reporting used for download/compress.
-  const sent = await client.sendFile(entity, {
+  const sendOnce = (thumbPath) => client.sendFile(entity, {
     file: filePath,
     fileName: opts.fileName || path.basename(filePath),
     caption: opts.caption || '',
@@ -313,6 +313,16 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
     // so GramJS sends it as real video media: Telegram then generates
     // its own thumbnail/preview and enables in-app streaming playback.
     forceDocument: false,
+    // Set both as a top-level convenience flag AND on the attribute
+    // above — belt and suspenders against GramJS/Telegram version
+    // differences in which one it actually reads.
+    supportsStreaming: true,
+    // A real thumbnail (see services/compress.js#generateThumbnail)
+    // removes any dependency on Telegram's own server-side auto-
+    // thumbnail generation, which isn't fully reliable and can silently
+    // leave a video-tagged upload looking like a plain attachment with
+    // no preview. Entirely optional — omitted if generation failed.
+    thumb: thumbPath || undefined,
     attributes,
     progressCallback: opts.onProgress
       ? (fraction) => {
@@ -323,6 +333,15 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
         }
       : undefined,
   });
+
+  let sent;
+  try {
+    sent = await sendOnce(opts.thumbPath);
+  } catch (err) {
+    if (!opts.thumbPath) throw err;
+    log.warn('uploadEpisode', 'Upload with thumbnail failed — retrying once without it', { targetChannelId, filePath, reason: err.message });
+    sent = await sendOnce(null);
+  }
 
   const doc = sent?.media?.document;
   if (!doc) {
