@@ -990,10 +990,24 @@ async function writeFirestoreDoc(session, item, episode, uploadResult) {
     file_unique_id: item.fileUniqueId,
     channelId: Number(uploadResult.channelId),
     messageId: uploadResult.messageId,
+    // Supplementary/debug metadata only — the MTProto streaming route
+    // (routes/stream.js -> services/mtproto.js#resolveVideoSource) never
+    // reads accessHash/fileReference/dcId from Firestore. It always
+    // re-resolves a live document straight from Telegram by channelId +
+    // messageId at request time, because fileReference expires
+    // (~1 hour) and a value saved here would just go stale. dcId is kept
+    // as an optional fast-path hint only.
+    documentId: uploadResult.documentId,
+    accessHash: uploadResult.accessHash || null,
+    fileReference: uploadResult.fileReference || null,
+    dcId: uploadResult.dcId ?? null,
+    mimeType: uploadResult.mimeType || 'video/mp4',
+    width: uploadResult.width || item.probe?.width || item.widthHint || 0,
+    height: uploadResult.height || item.probe?.height || item.heightHint || 0,
     language: session.language,
     quality: session.quality || null,
     year: session.year || null,
-    duration: item.probe?.duration || item.durationHint || 0,
+    duration: uploadResult.duration || item.probe?.duration || item.durationHint || 0,
     fileSizeBytes: uploadResult.size,
     published: true,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
