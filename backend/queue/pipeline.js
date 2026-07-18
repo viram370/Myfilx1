@@ -278,6 +278,12 @@ function addItem(session, media, msg, opts = {}) {
     fileId: media.file_id,
     fileUniqueId: media.file_unique_id,
     fileSizeBytes: media.file_size || null,
+    // Only present for genuine Documents (Telegram videos never carry a
+    // filename of their own) — used purely as a fallback file extension
+    // hint if compression fails outright and the original file has to be
+    // uploaded as-is instead (see runCompressJob/runForwardedFallbackJob).
+    originalFileName: media.file_name || null,
+    originalMimeType: media.mime_type || null,
     // The message the direct upload itself lives in (the admin's private
     // chat). Kept for logging/debugging only — NEVER used to drive an
     // MTProto call (see file header).
@@ -303,6 +309,7 @@ function addItem(session, media, msg, opts = {}) {
     probe: null,
     error: null,
     uploading: false,
+    usedOriginalFallback: false, // true if compression failed outright and the raw source file was uploaded instead
   };
   session.items.push(item);
 
@@ -498,13 +505,42 @@ async function runCompressJob({ chatId, seq }) {
       log.info('runCompressJob', 'Compression started', { chatId, seq });
       await session.onProgress(session, { force: true });
 
-      const info = await compress.processFile(inPath, outPath, ({ percent }) => {
-        reportBucketedProgress(session, item, 'compressProgress', percent);
-      });
-      item.tempOut = outPath;
+      let info;
+      try {
+        info = await compress.processFile(inPath, outPath, ({ percent }) => {
+          reportBucketedProgress(session, item, 'compressProgress', percent);
+        });
+        item.tempOut = outPath;
+        item.usedOriginalFallback = false;
+      } catch (compressErr) {
+        // Every FFmpeg fallback tier inside compress.processFile has
+        // already been tried and verified (see services/compress.js) —
+        // retrying the exact same conversion from scratch won't produce
+        // a different result. Rather than fail an otherwise-fine
+        // download, upload the untouched original file the admin
+        // actually sent, so at least a playable-if-uncompressed video
+        // reaches the channel instead of nothing at all.
+        log.error('runCompressJob', 'Compression failed after exhausting all strategies — falling back to uploading the original file', compressErr, {
+          chatId, seq, stack: compressErr.stack,
+        });
+        cleanupFile(outPath);
+        try {
+          info = await compress.analyze(inPath);
+        } catch (analyzeErr) {
+          log.warn('runCompressJob', 'Could not even probe the original file — using Telegram-provided hints for its metadata', {
+            chatId, seq, reason: analyzeErr.message,
+          });
+          info = { duration: item.durationHint || 0, width: item.widthHint || 0, height: item.heightHint || 0, videoCodec: null, audioCodec: null, container: null };
+        }
+        info = { ...info, mode: 'original-fallback' };
+        item.tempOut = inPath;
+        item.usedOriginalFallback = true;
+      }
       item.probe = info;
       item.compressProgress = 100;
-      log.success('runCompressJob', 'Compression completed', { chatId, seq, mode: info.mode, duration: info.duration });
+      log.success('runCompressJob', 'Compression stage finished', {
+        chatId, seq, mode: info.mode, duration: info.duration, usedOriginalFallback: item.usedOriginalFallback,
+      });
 
       item.status = 'ready';
       item.compressProgress = null;
@@ -707,13 +743,35 @@ async function runForwardedFallbackJob({ chatId, seq }) {
       log.info('runForwardedFallbackJob', 'Compression started', { chatId, seq });
       await session.onProgress(session, { force: true });
 
-      const info = await compress.processFile(inPath, outPath, ({ percent }) => {
-        reportBucketedProgress(session, item, 'compressProgress', percent);
-      });
-      item.tempOut = outPath;
+      let info;
+      try {
+        info = await compress.processFile(inPath, outPath, ({ percent }) => {
+          reportBucketedProgress(session, item, 'compressProgress', percent);
+        });
+        item.tempOut = outPath;
+        item.usedOriginalFallback = false;
+      } catch (compressErr) {
+        log.error('runForwardedFallbackJob', 'Compression failed after exhausting all strategies — falling back to uploading the original file', compressErr, {
+          chatId, seq, stack: compressErr.stack,
+        });
+        cleanupFile(outPath);
+        try {
+          info = await compress.analyze(inPath);
+        } catch (analyzeErr) {
+          log.warn('runForwardedFallbackJob', 'Could not even probe the original file — using Telegram-provided hints for its metadata', {
+            chatId, seq, reason: analyzeErr.message,
+          });
+          info = { duration: item.durationHint || 0, width: item.widthHint || 0, height: item.heightHint || 0, videoCodec: null, audioCodec: null, container: null };
+        }
+        info = { ...info, mode: 'original-fallback' };
+        item.tempOut = inPath;
+        item.usedOriginalFallback = true;
+      }
       item.probe = info;
       item.compressProgress = 100;
-      log.success('runForwardedFallbackJob', 'Compression completed', { chatId, seq, mode: info.mode, duration: info.duration });
+      log.success('runForwardedFallbackJob', 'Compression stage finished', {
+        chatId, seq, mode: info.mode, duration: info.duration, usedOriginalFallback: item.usedOriginalFallback,
+      });
 
       item.status = 'ready';
       item.compressProgress = null;
@@ -757,8 +815,11 @@ async function uploadPreparedFile(session, item) {
       item.status = 'uploading';
       item.uploadProgress = 0;
       const uploadStartedAt = Date.now();
+      let localFileSizeBytes = null;
+      try { localFileSizeBytes = fs.statSync(item.tempOut).size; } catch (_) { /* logged as null, uploadEpisode will hard-fail if the file is truly gone */ }
       log.info('uploadPreparedFile', `Upload started (attempt ${attempt}/${MAX_ATTEMPTS})`, {
         chatId: session.chatId, seq: item.seq, sourceType: item.sourceType, pipeline: 'mtproto-upload',
+        usedOriginalFallback: item.usedOriginalFallback, localFileSizeBytes,
       });
       await session.onProgress(session, { force: true });
 
@@ -772,7 +833,8 @@ async function uploadPreparedFile(session, item) {
       });
       item.uploadProgress = 100;
       log.success('uploadPreparedFile', 'Upload completed', {
-        chatId: session.chatId, seq: item.seq, newMessageId: result.messageId, elapsedMs: Date.now() - uploadStartedAt,
+        chatId: session.chatId, seq: item.seq, newMessageId: result.messageId,
+        localFileSizeBytes, telegramDocumentSizeBytes: result.size, elapsedMs: Date.now() - uploadStartedAt,
       });
 
       await writeFirestoreDoc(session, item, item.episode, result);
@@ -811,13 +873,34 @@ async function uploadPreparedFile(session, item) {
   }
 }
 
+/** Maps a probed container format name to a reasonable file extension for the original-file fallback path. */
+function extensionForContainer(containerFormat) {
+  const f = (containerFormat || '').toLowerCase();
+  if (f.includes('matroska') || f.includes('webm')) return f.includes('webm') ? '.webm' : '.mkv';
+  if (f.includes('quicktime') || f.includes('mov')) return '.mov';
+  if (f.includes('avi')) return '.avi';
+  if (f.includes('mpegts')) return '.ts';
+  if (f.includes('mp4') || f.includes('m4a') || f.includes('3gp')) return '.mp4';
+  return null;
+}
+
+function resolveExtension(item) {
+  if (!item.usedOriginalFallback) return '.mp4'; // normal path — compress.js always produces a real MP4
+  if (item.originalFileName) {
+    const ext = path.extname(item.originalFileName);
+    if (ext) return ext;
+  }
+  return extensionForContainer(item.probe && item.probe.container) || '.mp4';
+}
+
 function buildFileName(session, item, episode) {
   const base = session.title.replace(/[/\\?%*:|"<>]/g, '');
+  const ext = resolveExtension(item);
   if (session.hasSeason) {
-    return `${base} S${String(session.season).padStart(2, '0')}E${String(episode).padStart(2, '0')}.mp4`;
+    return `${base} S${String(session.season).padStart(2, '0')}E${String(episode).padStart(2, '0')}${ext}`;
   }
   const part = item.seq > 0 ? ` Part ${item.seq + 1}` : '';
-  return `${base}${part}.mp4`;
+  return `${base}${part}${ext}`;
 }
 
 // ============================================================================
