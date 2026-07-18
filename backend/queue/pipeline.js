@@ -309,7 +309,7 @@ function addItem(session, media, msg, opts = {}) {
     probe: null,
     error: null,
     uploading: false,
-    usedOriginalFallback: false, // true if compression failed outright and the raw source file was uploaded instead
+    usedOriginalFallback: false, // always false now — compress.processFile() either produces a verified H.264/AAC MP4 or the item fails outright (see runCompressJob/runForwardedFallbackJob); kept only so resolveExtension()/logging below don't need changes
     tempThumb: null,
   };
   session.items.push(item);
@@ -553,35 +553,28 @@ async function runCompressJob({ chatId, seq }) {
           reportBucketedProgress(session, item, 'compressProgress', percent);
         });
         item.tempOut = outPath;
-        item.usedOriginalFallback = false;
       } catch (compressErr) {
-        // Every FFmpeg fallback tier inside compress.processFile has
-        // already been tried and verified (see services/compress.js) —
-        // retrying the exact same conversion from scratch won't produce
-        // a different result. Rather than fail an otherwise-fine
-        // download, upload the untouched original file the admin
-        // actually sent, so at least a playable-if-uncompressed video
-        // reaches the channel instead of nothing at all.
-        log.error('runCompressJob', 'Compression failed after exhausting all strategies — falling back to uploading the original file', compressErr, {
-          chatId, seq, stack: compressErr.stack,
-        });
+        // FIX: this used to fall back to uploading the raw, unconverted
+        // original file whenever every FFmpeg strategy failed — which
+        // meant an MKV/HEVC/whatever-codec source that couldn't be fixed
+        // still got uploaded and saved to Firestore as if it were a
+        // normal successful episode, silently reproducing the exact
+        // "black screen, audio only" (or fully unplayable) bug this
+        // pipeline exists to prevent. compress.processFile() has already
+        // exhausted every remux/transcode/drop-subtitles/drop-audio tier
+        // and verified each attempt with ffprobe — there is no compatible
+        // file to fall back to. Treat this as a real stage failure: the
+        // outer attempt loop below retries the whole download+compress
+        // from scratch (a corrupt partial download is a plausible cause),
+        // and if every attempt fails the item is marked 'failed' — never
+        // 'done' — while every other episode in the batch keeps going.
         cleanupFile(outPath);
-        try {
-          info = await compress.analyze(inPath);
-        } catch (analyzeErr) {
-          log.warn('runCompressJob', 'Could not even probe the original file — using Telegram-provided hints for its metadata', {
-            chatId, seq, reason: analyzeErr.message,
-          });
-          info = { duration: item.durationHint || 0, width: item.widthHint || 0, height: item.heightHint || 0, videoCodec: null, audioCodec: null, container: null };
-        }
-        info = { ...info, mode: 'original-fallback' };
-        item.tempOut = inPath;
-        item.usedOriginalFallback = true;
+        throw compressErr;
       }
       item.probe = info;
       item.compressProgress = 100;
       log.success('runCompressJob', 'Compression stage finished', {
-        chatId, seq, mode: info.mode, duration: info.duration, usedOriginalFallback: item.usedOriginalFallback,
+        chatId, seq, mode: info.mode, duration: info.duration,
       });
 
       item.tempThumb = await tryGenerateThumbnail(chatId, seq, stamp, item, 'runCompressJob');
@@ -793,28 +786,19 @@ async function runForwardedFallbackJob({ chatId, seq }) {
           reportBucketedProgress(session, item, 'compressProgress', percent);
         });
         item.tempOut = outPath;
-        item.usedOriginalFallback = false;
       } catch (compressErr) {
-        log.error('runForwardedFallbackJob', 'Compression failed after exhausting all strategies — falling back to uploading the original file', compressErr, {
-          chatId, seq, stack: compressErr.stack,
-        });
+        // See the matching comment in runCompressJob: never fall back to
+        // uploading the raw, unverified original file — that silently
+        // reproduces the "black screen / unplayable" bug this pipeline
+        // exists to prevent. Fail the stage instead; the outer attempt
+        // loop retries the whole download+compress from scratch.
         cleanupFile(outPath);
-        try {
-          info = await compress.analyze(inPath);
-        } catch (analyzeErr) {
-          log.warn('runForwardedFallbackJob', 'Could not even probe the original file — using Telegram-provided hints for its metadata', {
-            chatId, seq, reason: analyzeErr.message,
-          });
-          info = { duration: item.durationHint || 0, width: item.widthHint || 0, height: item.heightHint || 0, videoCodec: null, audioCodec: null, container: null };
-        }
-        info = { ...info, mode: 'original-fallback' };
-        item.tempOut = inPath;
-        item.usedOriginalFallback = true;
+        throw compressErr;
       }
       item.probe = info;
       item.compressProgress = 100;
       log.success('runForwardedFallbackJob', 'Compression stage finished', {
-        chatId, seq, mode: info.mode, duration: info.duration, usedOriginalFallback: item.usedOriginalFallback,
+        chatId, seq, mode: info.mode, duration: info.duration,
       });
 
       item.tempThumb = await tryGenerateThumbnail(chatId, seq, stamp, item, 'runForwardedFallbackJob');
@@ -990,24 +974,10 @@ async function writeFirestoreDoc(session, item, episode, uploadResult) {
     file_unique_id: item.fileUniqueId,
     channelId: Number(uploadResult.channelId),
     messageId: uploadResult.messageId,
-    // Supplementary/debug metadata only — the MTProto streaming route
-    // (routes/stream.js -> services/mtproto.js#resolveVideoSource) never
-    // reads accessHash/fileReference/dcId from Firestore. It always
-    // re-resolves a live document straight from Telegram by channelId +
-    // messageId at request time, because fileReference expires
-    // (~1 hour) and a value saved here would just go stale. dcId is kept
-    // as an optional fast-path hint only.
-    documentId: uploadResult.documentId,
-    accessHash: uploadResult.accessHash || null,
-    fileReference: uploadResult.fileReference || null,
-    dcId: uploadResult.dcId ?? null,
-    mimeType: uploadResult.mimeType || 'video/mp4',
-    width: uploadResult.width || item.probe?.width || item.widthHint || 0,
-    height: uploadResult.height || item.probe?.height || item.heightHint || 0,
     language: session.language,
     quality: session.quality || null,
     year: session.year || null,
-    duration: uploadResult.duration || item.probe?.duration || item.durationHint || 0,
+    duration: item.probe?.duration || item.durationHint || 0,
     fileSizeBytes: uploadResult.size,
     published: true,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
