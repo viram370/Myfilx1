@@ -50,6 +50,13 @@ const mtproto = require('./mtproto');
 const BOT_API_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024;
 const BOT_API_DOWNLOAD_MAX_RETRIES = 3;
 const BOT_API_DOWNLOAD_RETRY_BASE_DELAY_MS = 1500;
+// axios is given `timeout: 0` (no fixed request timeout) below because a
+// large file can legitimately take a long time end-to-end — but that
+// also means a connection that stalls (TCP stays open, no bytes ever
+// arrive again) would hang forever with no error, which silently starves
+// the retry loop below of any chance to run. This watchdog resets on
+// every chunk of data received and only fires on genuine inactivity.
+const BOT_API_STALL_TIMEOUT_MS = 30000;
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
@@ -105,15 +112,40 @@ async function downloadViaBotApi(bot, fileId, destPath, opts = {}) {
       let written = 0;
 
       await new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (fn, arg) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(stallTimer);
+          fn(arg);
+        };
+
+        let stallTimer = setTimeout(() => {
+          const err = new Error(`Download stalled — no data received for ${BOT_API_STALL_TIMEOUT_MS}ms`);
+          response.data.destroy(err);
+          out.destroy();
+          finish(reject, err);
+        }, BOT_API_STALL_TIMEOUT_MS);
+        const resetStallTimer = () => {
+          clearTimeout(stallTimer);
+          stallTimer = setTimeout(() => {
+            const err = new Error(`Download stalled — no data received for ${BOT_API_STALL_TIMEOUT_MS}ms`);
+            response.data.destroy(err);
+            out.destroy();
+            finish(reject, err);
+          }, BOT_API_STALL_TIMEOUT_MS);
+        };
+
         response.data.on('data', (chunk) => {
           written += chunk.length;
+          resetStallTimer();
           if (opts.onProgress) {
             try { opts.onProgress(written, expectedSize); } catch (_) { /* never let a UI callback break the download */ }
           }
         });
-        response.data.on('error', reject);
-        out.on('error', reject);
-        out.on('finish', resolve);
+        response.data.on('error', (err) => finish(reject, err));
+        out.on('error', (err) => finish(reject, err));
+        out.on('finish', () => finish(resolve));
         response.data.pipe(out);
       });
 
@@ -242,7 +274,13 @@ async function copyMessageToStorage(bot, fromChatId, fromMessageId, toChatId) {
  */
 async function uploadEpisode(targetChannelId, filePath, opts = {}) {
   const startedAt = Date.now();
-  log.info('uploadEpisode', 'Upload started', { targetChannelId, filePath });
+  let localSizeBytes = null;
+  try {
+    localSizeBytes = fs.statSync(filePath).size;
+  } catch (err) {
+    throw new Error(`uploadEpisode: cannot stat local file before upload (${err.message}) — refusing to upload a file that may not exist/be fully written.`);
+  }
+  log.info('uploadEpisode', 'Upload started', { targetChannelId, filePath, localSizeBytes });
 
   const client = await mtproto.connect();
   if (!client) throw new mtproto.MTProtoDisabledError();
@@ -266,7 +304,15 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
     file: filePath,
     fileName: opts.fileName || path.basename(filePath),
     caption: opts.caption || '',
-    forceDocument: true,
+    // THE BUG: this used to be `forceDocument: true`, which tells
+    // Telegram to store the upload as a generic file attachment (the
+    // blue download-icon "97.2 MB .mp4" seen in Telegram, no thumbnail,
+    // no inline player) no matter how correctly the MP4 itself was
+    // encoded — forceDocument overrides everything else, including the
+    // DocumentAttributeVideo/supportsStreaming below. Explicitly false
+    // so GramJS sends it as real video media: Telegram then generates
+    // its own thumbnail/preview and enables in-app streaming playback.
+    forceDocument: false,
     attributes,
     progressCallback: opts.onProgress
       ? (fraction) => {
@@ -283,17 +329,31 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
     throw new Error('Telegram accepted the upload but returned no document — cannot record it.');
   }
 
+  const remoteSizeBytes = Number(doc.size);
   const elapsedMs = Date.now() - startedAt;
   log.success('uploadEpisode', 'Upload completed', {
-    targetChannelId, messageId: sent.id, size: Number(doc.size), elapsedMs, finishedAt: new Date().toISOString(),
+    targetChannelId, messageId: sent.id, localSizeBytes, remoteSizeBytes, elapsedMs, finishedAt: new Date().toISOString(),
   });
+
+  if (Number.isFinite(remoteSizeBytes) && remoteSizeBytes !== localSizeBytes) {
+    // Not thrown as a hard failure — GramJS already confirmed the upload
+    // RPC succeeded — but a mismatch here means what Telegram actually
+    // stored doesn't match what's on disk, which is worth surfacing
+    // loudly rather than silently trusting a "success".
+    log.error(
+      'uploadEpisode',
+      'Uploaded document size does not match the local file size — investigate before trusting this upload',
+      new Error(`local=${localSizeBytes} remote=${remoteSizeBytes}`),
+      { targetChannelId, filePath }
+    );
+  }
 
   return {
     channelId: targetChannelId,
     messageId: sent.id,
     documentId: doc.id.toString(),
     accessHash: doc.accessHash ? doc.accessHash.toString() : null,
-    size: Number(doc.size),
+    size: remoteSizeBytes,
     mimeType: doc.mimeType || 'video/mp4',
   };
 }
