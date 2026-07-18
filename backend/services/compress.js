@@ -482,6 +482,40 @@ async function verifyOutputFile(outputPath) {
 }
 
 /**
+ * Extracts a single JPEG frame to use as the video's Telegram thumbnail.
+ * Telegram's own server-side auto-thumbnail generation for MTProto
+ * uploads isn't fully reliable — it can silently fail or time out, which
+ * looks exactly like a video that got sent as a plain attachment (no
+ * preview, no play button) even when it's correctly tagged as video
+ * media. Supplying a real thumbnail ourselves removes that dependency
+ * entirely. Failure here is never fatal to the upload — callers should
+ * treat a thrown/rejected result as "skip the thumbnail", not "fail the
+ * whole item".
+ */
+async function generateThumbnail(videoPath, outputJpgPath, durationSeconds) {
+  // A frame ~10% into the video (capped at 3s) is far more likely to be a
+  // real representative frame than 0:00, which is frequently a black/
+  // fade-in frame for movies and openings.
+  const seekSeconds = durationSeconds > 1 ? Math.min(3, Math.max(0, Math.floor(durationSeconds * 0.1))) : 0;
+  const args = [
+    '-y',
+    '-ss', String(seekSeconds),
+    '-i', videoPath,
+    '-frames:v', '1',
+    '-vf', 'scale=320:-2',
+    '-q:v', '4',
+    outputJpgPath,
+  ];
+  await runFfmpeg(args, null, 0);
+
+  const stat = fs.statSync(outputJpgPath);
+  if (!stat.size) {
+    throw new Error('Thumbnail generation produced an empty file');
+  }
+  return outputJpgPath;
+}
+
+/**
  * Converts a downloaded source file — MP4, MKV, WebM, AVI, MOV, MPEG-TS,
  * FLV, or anything else FFmpeg can demux — into a browser-streamable MP4
  * (H.264/AAC) at outputPath. Automatically detects the container and
@@ -588,4 +622,4 @@ async function processFile(inputPath, outputPath, onProgress) {
   throw new Error(`FFmpeg compression failed after ${tiers.length} attempt(s): ${lastErr ? lastErr.message : 'unknown error'}`);
 }
 
-module.exports = { probe, analyze, processFile, verifyOutputFile, ensureAvailable };
+module.exports = { probe, analyze, processFile, verifyOutputFile, generateThumbnail, ensureAvailable };
