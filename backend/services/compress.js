@@ -80,6 +80,7 @@
 'use strict';
 
 const { spawn } = require('child_process');
+const fs = require('fs');
 const { makeLogger } = require('../utils/logger');
 const log = makeLogger('services/compress.js');
 
@@ -351,6 +352,7 @@ function runFfmpeg(args, onProgress, totalDurationSeconds) {
     });
 
     child.on('close', (code, signal) => {
+      log.info('runFfmpeg', 'FFmpeg process exited', { code, signal: signal || null });
       if (code === 0) resolve();
       else reject(new Error(describeFfmpegFailure(code, stderrTail, signal)));
     });
@@ -432,6 +434,54 @@ function buildFfmpegArgs(inputPath, outputPath, tier, info) {
 }
 
 /**
+ * Confirms a finished FFmpeg run actually produced a working MP4 on disk
+ * — not just that the process exited 0. Checks (in order): the file
+ * exists and isn't suspiciously tiny, ffprobe can actually open it
+ * (a file with a truncated/missing moov atom fails right here), it
+ * contains a real video stream, and it reports a sane (>0) duration.
+ * Also used by the upload pipeline as a final gate immediately before
+ * upload, and to decide whether to fall back to uploading the original
+ * source file instead of a broken compressed one.
+ */
+async function verifyOutputFile(outputPath) {
+  let stat;
+  try {
+    stat = fs.statSync(outputPath);
+  } catch (err) {
+    return { valid: false, reason: `output file is missing on disk: ${err.message}` };
+  }
+  if (!stat.size || stat.size < 1024) {
+    return { valid: false, reason: `output file is suspiciously small (${stat.size} bytes) — likely truncated` };
+  }
+
+  let meta;
+  try {
+    meta = await probe(outputPath);
+  } catch (err) {
+    return { valid: false, reason: `ffprobe could not read the output (likely a corrupt/incomplete file): ${err.message}` };
+  }
+
+  const streams = meta.streams || [];
+  const videoStream = pickVideoStream(streams);
+  const duration = Number(meta.format?.duration) || 0;
+
+  if (!videoStream) {
+    return { valid: false, reason: 'output has no video stream' };
+  }
+  if (!(duration > 0)) {
+    return { valid: false, reason: 'output reports zero/invalid duration (likely a truncated or missing moov atom)' };
+  }
+
+  return {
+    valid: true,
+    sizeBytes: stat.size,
+    duration: Math.round(duration),
+    width: videoStream.width || 0,
+    height: videoStream.height || 0,
+  };
+}
+
+/**
  * Converts a downloaded source file — MP4, MKV, WebM, AVI, MOV, MPEG-TS,
  * FLV, or anything else FFmpeg can demux — into a browser-streamable MP4
  * (H.264/AAC) at outputPath. Automatically detects the container and
@@ -445,8 +495,10 @@ function buildFfmpegArgs(inputPath, outputPath, tier, info) {
  */
 async function processFile(inputPath, outputPath, onProgress) {
   const info = await analyze(inputPath);
+  let inputSizeBytes = null;
+  try { inputSizeBytes = fs.statSync(inputPath).size; } catch (_) { /* logged as null below, not fatal */ }
   log.info('processFile', 'Compression starting', {
-    inputPath, outputPath, mode: info.mode, container: info.container,
+    inputPath, outputPath, inputSizeBytes, mode: info.mode, container: info.container,
     videoCodec: info.videoCodec, audioCodec: info.audioCodec,
     audioTracks: info.audioStreamIndexes.length,
     subtitleTracks: info.subtitleStreamIndexes.length, droppedSubtitles: info.droppedSubtitleCount,
@@ -493,6 +545,20 @@ async function processFile(inputPath, outputPath, onProgress) {
     try {
       const args = buildFfmpegArgs(inputPath, outputPath, tier, info);
       await runFfmpeg(args, onProgress, info.duration);
+
+      // FFmpeg exiting 0 only means the process didn't crash — it does
+      // NOT guarantee a playable file (a killed disk, a race with disk
+      // space, or an edge-case source can still produce a file with no
+      // moov atom / zero duration). Re-probe the actual output on disk
+      // before trusting this attempt, so a broken file is caught here and
+      // retried under the next fallback tier instead of reaching the
+      // upload step and shipping something that shows a duration but
+      // never plays.
+      const verified = await verifyOutputFile(outputPath);
+      if (!verified.valid) {
+        throw new Error(`FFmpeg exited cleanly but the output failed verification: ${verified.reason}`);
+      }
+
       if (tier.dropAudio) {
         log.warn('processFile', 'Compression succeeded but audio had to be dropped — source audio track(s) were not decodable/encodable', {
           inputPath, outputPath,
@@ -500,12 +566,14 @@ async function processFile(inputPath, outputPath, onProgress) {
       }
       log.success('processFile', 'Compression completed', {
         inputPath, outputPath, strategy: tier.label, attempt: i + 1, totalAttempts: tiers.length,
+        inputSizeBytes, outputSizeBytes: verified.sizeBytes, outputDurationSeconds: verified.duration,
       });
       return {
         ...info,
         mode: tier.label,
         subtitlesIncluded: !!tier.includeSubtitles,
         audioDropped: !!tier.dropAudio,
+        outputSizeBytes: verified.sizeBytes,
       };
     } catch (err) {
       lastErr = err;
@@ -520,4 +588,4 @@ async function processFile(inputPath, outputPath, onProgress) {
   throw new Error(`FFmpeg compression failed after ${tiers.length} attempt(s): ${lastErr ? lastErr.message : 'unknown error'}`);
 }
 
-module.exports = { probe, analyze, processFile, ensureAvailable };
+module.exports = { probe, analyze, processFile, verifyOutputFile, ensureAvailable };
