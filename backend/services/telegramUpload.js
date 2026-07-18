@@ -288,6 +288,7 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
   const entity = await mtproto.resolveEntity(targetChannelId);
   const { Api } = require('telegram');
 
+  const fileName = opts.fileName || path.basename(filePath);
   const attributes = [
     new Api.DocumentAttributeVideo({
       duration: opts.duration || 0,
@@ -295,6 +296,12 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
       h: opts.height || 0,
       supportsStreaming: true,
     }),
+    // Explicit filename attribute alongside the video attribute — some
+    // Telegram clients use this (rather than re-deriving it from the
+    // upload's mimeType alone) when deciding how to render/play a
+    // document, so it's worth setting directly instead of relying purely
+    // on extension-based mimeType inference.
+    new Api.DocumentAttributeFilename({ fileName }),
   ];
 
   // GramJS reports upload progress as a 0..1 fraction — convert to a
@@ -302,7 +309,7 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
   // the same 10%-step reporting used for download/compress.
   const sendOnce = (thumbPath) => client.sendFile(entity, {
     file: filePath,
-    fileName: opts.fileName || path.basename(filePath),
+    fileName,
     caption: opts.caption || '',
     // THE BUG: this used to be `forceDocument: true`, which tells
     // Telegram to store the upload as a generic file attachment (the
