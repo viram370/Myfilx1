@@ -310,6 +310,7 @@ function addItem(session, media, msg, opts = {}) {
     error: null,
     uploading: false,
     usedOriginalFallback: false, // true if compression failed outright and the raw source file was uploaded instead
+    tempThumb: null,
   };
   session.items.push(item);
 
@@ -342,9 +343,30 @@ async function startBatch(chatId) {
   session.locked = true;
   log.info('startBatch', 'Batch started', { chatId, itemCount: session.items.length, title: session.title });
 
-  await validateItems(session);
-  await detectDuplicates(session);
-  await assignEpisodeNumbers(session);
+  try {
+    await validateItems(session);
+    await detectDuplicates(session);
+    await assignEpisodeNumbers(session);
+  } catch (err) {
+    // A failure here (e.g. a Firestore query error during dedup/episode
+    // numbering) must never leave the batch silently "locked" with
+    // nothing visibly happening — that looks exactly like "the bot isn't
+    // doing anything" from the admin's side. Fail every non-terminal item
+    // with the real reason and still let the batch reach its normal
+    // "complete" state so a clear error is shown instead of dead silence.
+    log.error('startBatch', 'Validation/dedup/numbering stage failed — failing the whole batch', err, {
+      chatId, stack: err.stack,
+    });
+    for (const item of session.items) {
+      if (isTerminal(item.status)) continue;
+      item.status = 'failed';
+      item.error = `Batch setup failed: ${err.message}`;
+      item.finishedAt = Date.now();
+    }
+    await session.onProgress(session, { force: true });
+    await maybeCompleteSession(session);
+    return { started: true };
+  }
 
   await session.onProgress(session, { force: true });
 
@@ -466,6 +488,26 @@ function cleanupFile(p) {
   });
 }
 
+/**
+ * Best-effort thumbnail extraction — NEVER fatal to the item. Telegram's
+ * own server-side auto-thumbnail generation for MTProto uploads isn't
+ * fully reliable, and a video that ends up with no preview looks
+ * identical to one that was sent as a plain document. A failure here
+ * just means the upload proceeds without a custom thumbnail (Telegram
+ * still gets a chance to generate its own).
+ */
+async function tryGenerateThumbnail(chatId, seq, stamp, item, callerLabel) {
+  const thumbPath = path.join(CONVERTED_DIR, `${stamp}.jpg`);
+  try {
+    await compress.generateThumbnail(item.tempOut, thumbPath, (item.probe && item.probe.duration) || item.durationHint || 0);
+    return thumbPath;
+  } catch (err) {
+    log.warn(callerLabel, 'Thumbnail generation failed — uploading without a custom thumbnail', { chatId, seq, reason: err.message });
+    cleanupFile(thumbPath);
+    return null;
+  }
+}
+
 async function runCompressJob({ chatId, seq }) {
   const session = sessions.get(chatId);
   if (!session || session.closed) return;
@@ -541,6 +583,8 @@ async function runCompressJob({ chatId, seq }) {
       log.success('runCompressJob', 'Compression stage finished', {
         chatId, seq, mode: info.mode, duration: info.duration, usedOriginalFallback: item.usedOriginalFallback,
       });
+
+      item.tempThumb = await tryGenerateThumbnail(chatId, seq, stamp, item, 'runCompressJob');
 
       item.status = 'ready';
       item.compressProgress = null;
@@ -773,6 +817,8 @@ async function runForwardedFallbackJob({ chatId, seq }) {
         chatId, seq, mode: info.mode, duration: info.duration, usedOriginalFallback: item.usedOriginalFallback,
       });
 
+      item.tempThumb = await tryGenerateThumbnail(chatId, seq, stamp, item, 'runForwardedFallbackJob');
+
       item.status = 'ready';
       item.compressProgress = null;
       await session.onProgress(session, { force: true });
@@ -829,6 +875,7 @@ async function uploadPreparedFile(session, item) {
         duration: item.probe?.duration || item.durationHint || 0,
         width: item.probe?.width || item.widthHint || 0,
         height: item.probe?.height || item.heightHint || 0,
+        thumbPath: item.tempThumb || undefined,
         onProgress: (percent) => reportBucketedProgress(session, item, 'uploadProgress', percent),
       });
       item.uploadProgress = 100;
@@ -845,6 +892,7 @@ async function uploadPreparedFile(session, item) {
       item.finishedAt = Date.now();
       cleanupFile(item.tempIn);
       cleanupFile(item.tempOut);
+      cleanupFile(item.tempThumb);
       const totalElapsedMs = item.startedAt ? item.finishedAt - item.startedAt : null;
       log.success('uploadPreparedFile', 'Completed', {
         chatId: session.chatId, seq: item.seq, totalElapsedMs, finishedAt: new Date(item.finishedAt).toISOString(),
@@ -865,6 +913,7 @@ async function uploadPreparedFile(session, item) {
         log.error('uploadPreparedFile', 'Failed', new Error(item.error), { chatId: session.chatId, seq: item.seq });
         cleanupFile(item.tempIn);
         cleanupFile(item.tempOut);
+        cleanupFile(item.tempThumb);
         await session.onProgress(session, { force: true });
         return;
       }
