@@ -300,8 +300,7 @@ function addItem(session, media, msg, opts = {}) {
     sourceType: channelOrigin ? 'forwarded' : 'direct',
     forwardChatId: channelOrigin ? channelOrigin.chatId : null,
     forwardMessageId: channelOrigin ? channelOrigin.messageId : null,
-    needsCopyAttempt: !!channelOrigin,
-    status: 'buffered', // buffered -> [validation: failed|skipped|waiting] -> [copying ->] downloading -> compressing -> ready -> uploading -> done | failed
+    status: 'buffered', // buffered -> [validation: failed|skipped|waiting] -> downloading -> compressing -> ready -> uploading -> done | failed
     attempts: { copy: 0, compress: 0, upload: 0 },
     episode: null,
     tempIn: null,
@@ -373,13 +372,27 @@ async function startBatch(chatId) {
   for (const item of session.items) {
     if (item.status !== 'validated') continue;
     item.status = 'waiting';
+    // FIX ("bot always uploads the exact same file the user uploaded"):
+    // this used to send 'forwarded' items (i.e. the common case — a video
+    // forwarded to the bot from a channel) straight to 'ready' so the
+    // publish step could try a zero-download Telegram server-side
+    // copyMessage() first. That copy is literally byte-identical to the
+    // source message — it never runs FFmpeg, never re-encodes, never
+    // regenerates a thumbnail, and never goes through the
+    // verifyOutputFile()/DocumentAttributeVideo checks the rest of this
+    // pipeline relies on. Since most admin uploads ARE forwards, that
+    // fast path was silently skipping compression for the majority of
+    // episodes — exactly the bug reported. Every item, forwarded or
+    // direct, now always goes through download -> compress (FFmpeg,
+    // verified) -> upload. See runForwardedFallbackJob/runCompressJob.
     if (item.sourceType === 'forwarded') {
-      item.status = 'ready'; // copy is attempted in the strictly-ordered publish step
+      forwardedFallbackQueue.push({ chatId: session.chatId, seq: item.seq });
     } else {
       compressQueue.push({ chatId: session.chatId, seq: item.seq });
     }
   }
   pumpCompressQueue();
+  pumpForwardedFallbackQueue();
   pumpUploadQueue();
   await maybeCompleteSession(session); // covers the edge case where every item failed/was skipped in validation
 
@@ -575,6 +588,7 @@ async function runCompressJob({ chatId, seq }) {
       item.compressProgress = 100;
       log.success('runCompressJob', 'Compression stage finished', {
         chatId, seq, mode: info.mode, duration: info.duration,
+        originalFile: inPath, compressedFile: outPath,
       });
 
       item.tempThumb = await tryGenerateThumbnail(chatId, seq, stamp, item, 'runCompressJob');
@@ -649,82 +663,18 @@ async function tickSessionUpload(session) {
 
   next.uploading = true;
   try {
-    if (next.needsCopyAttempt) {
-      const copied = await tryCopyPath(session, next);
-      if (!copied) {
-        // Fell back to download+compress — pumpUploadQueue() will revisit
-        // this same item once compression marks it 'ready' again.
-        next.uploading = false;
-        return;
-      }
-    } else {
-      await uploadPreparedFile(session, next);
-    }
+    await uploadPreparedFile(session, next);
   } finally {
     next.uploading = false;
   }
   pumpUploadQueue(); // immediately check whether the next item is also ready
 }
 
-/** @returns {boolean} true if the copy succeeded and the item is fully done */
-async function tryCopyPath(session, item) {
-  item.attempts.copy += 1;
-  item.status = 'copying';
-  log.info('tryCopyPath', 'Upload started (server-side copy)', {
-    chatId: session.chatId, seq: item.seq, sourceType: item.sourceType, pipeline: 'copyMessage',
-    channelId: item.forwardChatId, messageId: item.forwardMessageId, attempt: item.attempts.copy,
-  });
-  await session.onProgress(session);
-
-  try {
-    const { messageId } = await transfer.copyMessageToStorage(
-      botInstance, item.forwardChatId, item.forwardMessageId, session.storageChannelId
-    );
-
-    await writeFirestoreDoc(session, item, item.episode, {
-      channelId: session.storageChannelId,
-      messageId,
-      documentId: item.fileId,
-      size: item.fileSizeBytes || 0,
-    });
-    log.success('tryCopyPath', 'Firestore updated', { chatId: session.chatId, seq: item.seq, episode: item.episode });
-
-    item.status = 'done';
-    item.finishedAt = Date.now();
-    log.success('tryCopyPath', 'Completed', { chatId: session.chatId, seq: item.seq });
-    log.success('tryCopyPath', 'Cleanup completed (nothing to clean up — no local files were used)', { chatId: session.chatId, seq: item.seq });
-    await session.onProgress(session, { force: true });
-    return true;
-  } catch (err) {
-    // A genuinely deleted source message will fail identically on the
-    // MTProto fallback below — fail fast with that specific reason
-    // instead of burning a retry cycle on something that can't recover.
-    if (/has been deleted/i.test(err.message || '')) {
-      item.status = 'failed';
-      item.error = err.message;
-      item.finishedAt = Date.now();
-      log.error('tryCopyPath', 'Failed — source message deleted', err, { chatId: session.chatId, seq: item.seq });
-      await session.onProgress(session, { force: true });
-      await maybeCompleteSession(session);
-      return true; // "handled" — do not enqueue a doomed fallback
-    }
-
-    log.error('tryCopyPath', 'Copy not possible — falling back to download+compress+upload via MTProto', err, {
-      chatId: session.chatId, seq: item.seq, sourceType: item.sourceType,
-      channelId: item.forwardChatId, messageId: item.forwardMessageId, stack: err.stack,
-    });
-    item.needsCopyAttempt = false;
-    item.status = 'waiting';
-    await session.onProgress(session, { force: true });
-    forwardedFallbackQueue.push({ chatId: session.chatId, seq: item.seq });
-    pumpForwardedFallbackQueue();
-    return false;
-  }
-}
-
-// ---- fallback download for 'forwarded' items whose copy attempt failed ----
-// Always uses the REAL source channel (item.forwardChatId/forwardMessageId)
-// via MTProto — never Bot API, never a private chat id.
+// ---- download+compress for 'forwarded' items (videos forwarded to the ----
+// bot from a channel) — always via MTProto, using the REAL source channel
+// (item.forwardChatId/forwardMessageId), never Bot API, never a private
+// chat id. This is the ONLY path forwarded items take now — there is no
+// more zero-compression server-side copy shortcut (see startBatch).
 const forwardedFallbackQueue = [];
 let forwardedFallbackActive = 0;
 
@@ -799,6 +749,7 @@ async function runForwardedFallbackJob({ chatId, seq }) {
       item.compressProgress = 100;
       log.success('runForwardedFallbackJob', 'Compression stage finished', {
         chatId, seq, mode: info.mode, duration: info.duration,
+        originalFile: inPath, compressedFile: outPath,
       });
 
       item.tempThumb = await tryGenerateThumbnail(chatId, seq, stamp, item, 'runForwardedFallbackJob');
@@ -839,6 +790,24 @@ async function runForwardedFallbackJob({ chatId, seq }) {
 }
 
 async function uploadPreparedFile(session, item) {
+  // DEFENSIVE GUARD: uploadEpisode() must never receive the original
+  // downloaded file. item.tempOut is only ever assigned the FFmpeg output
+  // path (see runCompressJob/runForwardedFallbackJob) — this is a hard
+  // stop, not a soft warning, in case some future change reintroduces a
+  // path that sets tempOut back to tempIn (which is exactly the bug that
+  // was reported: a code path setting tempOut = inPath after compression
+  // "failed" and silently uploading the untouched source).
+  if (item.tempOut && item.tempIn && path.resolve(item.tempOut) === path.resolve(item.tempIn)) {
+    item.status = 'failed';
+    item.error = 'Internal error: the compressed output path was identical to the original download path — refusing to upload the original file.';
+    item.finishedAt = Date.now();
+    log.error('uploadPreparedFile', 'BUG GUARD TRIPPED — tempOut === tempIn, refusing to upload the original file', new Error(item.error), {
+      chatId: session.chatId, seq: item.seq, tempIn: item.tempIn, tempOut: item.tempOut,
+    });
+    await session.onProgress(session, { force: true });
+    return;
+  }
+
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     item.attempts.upload = attempt;
     try {
@@ -847,9 +816,20 @@ async function uploadPreparedFile(session, item) {
       const uploadStartedAt = Date.now();
       let localFileSizeBytes = null;
       try { localFileSizeBytes = fs.statSync(item.tempOut).size; } catch (_) { /* logged as null, uploadEpisode will hard-fail if the file is truly gone */ }
+
+      // Exactly what was requested for debugging this class of bug: the
+      // original downloaded path, the FFmpeg-compressed path, and —
+      // explicitly labeled — which one is actually about to be uploaded.
+      // If "Uploading" here ever shows the original path, that's the bug.
+      log.info('uploadPreparedFile', 'Path check before upload', {
+        chatId: session.chatId, seq: item.seq,
+        originalFile: item.tempIn,
+        compressedFile: item.tempOut,
+        uploading: item.tempOut,
+      });
       log.info('uploadPreparedFile', `Upload started (attempt ${attempt}/${MAX_ATTEMPTS})`, {
         chatId: session.chatId, seq: item.seq, sourceType: item.sourceType, pipeline: 'mtproto-upload',
-        usedOriginalFallback: item.usedOriginalFallback, localFileSizeBytes,
+        localFileSizeBytes,
       });
       await session.onProgress(session, { force: true });
 
