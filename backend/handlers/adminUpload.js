@@ -199,10 +199,10 @@ function registerAdminUpload(bot, { isAdmin, safeSendMessage, safeEditMessageTex
   });
 
   // ---- video capture (buffer-only) during batch mode -------------------
-  bot.on('video', (msg) => captureEpisode(chatIdOf(msg), msg, msg.video).catch((err) => log.error('video handler', 'capture failed', err)));
+  bot.on('video', (msg) => captureEpisode(chatIdOf(msg), msg, msg.video).catch((err) => notifyCaptureFailure(chatIdOf(msg), 'video handler', err)));
   bot.on('document', (msg) => {
     const media = extractVideoMedia(msg);
-    if (media) captureEpisode(chatIdOf(msg), msg, media).catch((err) => log.error('document handler', 'capture failed', err));
+    if (media) captureEpisode(chatIdOf(msg), msg, media).catch((err) => notifyCaptureFailure(chatIdOf(msg), 'document handler', err));
   });
 
   // ---- videos posted straight into a private storage channel ----------
@@ -212,8 +212,22 @@ function registerAdminUpload(bot, { isAdmin, safeSendMessage, safeEditMessageTex
   // itself IS the source), so they need their own capture path that flags
   // channelNative so pipeline.js treats msg.chat/msg.message_id as the
   // origin instead of expecting forward_origin.
-  bot.on('channel_post', (msg) => captureChannelEpisode(msg, 'channel_post').catch((err) => log.error('channel_post handler', 'capture failed', err)));
-  bot.on('edited_channel_post', (msg) => captureChannelEpisode(msg, 'edited_channel_post').catch((err) => log.error('edited_channel_post handler', 'capture failed', err)));
+  bot.on('channel_post', (msg) => captureChannelEpisode(msg, 'channel_post').catch((err) => log.error('channel_post handler', 'capture failed', err, { stack: err.stack })));
+  bot.on('edited_channel_post', (msg) => captureChannelEpisode(msg, 'edited_channel_post').catch((err) => log.error('edited_channel_post handler', 'capture failed', err, { stack: err.stack })));
+}
+
+/**
+ * A video/document buffer failure used to be logged server-side ONLY —
+ * from the admin's side that looked exactly like nothing happened at
+ * all (no progress messages, no error, just silence) when in fact
+ * addItem() had thrown. Always tell the admin something went wrong.
+ */
+async function notifyCaptureFailure(chatId, source, err) {
+  log.error(source, 'capture failed', err, { stack: err.stack });
+  if (!sharedSafeSendMessage) return;
+  try {
+    await sharedSafeSendMessage(chatId, `⚠️ Failed to buffer that video: ${err.message}`);
+  } catch (_) { /* best effort — don't throw out of an error handler */ }
 }
 
 function chatIdOf(msg) { return msg.chat.id; }
@@ -370,13 +384,20 @@ async function lockAndStartBatch(id, safeSendMessage) {
     return;
   }
 
-  const result = await pipeline.startBatch(id);
-  if (!result.started && result.reason === 'already-locked') {
-    await safeSendMessage(id, 'ℹ️ This batch is already locked and processing.');
-    return;
+  try {
+    const result = await pipeline.startBatch(id);
+    if (!result.started && result.reason === 'already-locked') {
+      await safeSendMessage(id, 'ℹ️ This batch is already locked and processing.');
+      return;
+    }
+    await renderProgressBySession(session, id, { force: true });
+  } catch (err) {
+    // pipeline.startBatch() already guards its own internals, but this
+    // is a last-resort net: an unexpected throw here must never leave
+    // the admin looking at silence with no idea anything went wrong.
+    log.error('lockAndStartBatch', 'Unexpected failure starting batch', err, { chatId: id, stack: err.stack });
+    await safeSendMessage(id, `❌ Something went wrong starting this batch: ${err.message}`);
   }
-
-  await renderProgressBySession(session, id, { force: true });
 }
 
 // ============================================================================
