@@ -407,7 +407,19 @@ function buildFfmpegArgs(inputPath, outputPath, tier, info) {
       '-crf', '23',
       '-pix_fmt', 'yuv420p',
       '-profile:v', 'high',
-      '-level', '4.1'
+      // Deliberately NOT forcing a fixed -level here. A hardcoded level
+      // (e.g. "4.1") is only valid up to a certain resolution/bitrate —
+      // anything above that (a 1440p/4K source, or just a higher-bitrate
+      // 1080p one) produces a technically non-conformant bitstream tagged
+      // with a level it doesn't actually satisfy. Some decoders tolerate
+      // that; Telegram's inline player is one of the ones that doesn't,
+      // and falls back to "Use external video player" for exactly this
+      // reason. Omitting -level lets libx264 pick the correct minimum
+      // level for the actual output automatically.
+      // Also guards against odd (non-even) source dimensions, which
+      // libx264 otherwise refuses outright (yuv420p requires even width/
+      // height) — a no-op scale for anything already even.
+      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2'
     );
   }
 
@@ -434,14 +446,22 @@ function buildFfmpegArgs(inputPath, outputPath, tier, info) {
 }
 
 /**
- * Confirms a finished FFmpeg run actually produced a working MP4 on disk
- * — not just that the process exited 0. Checks (in order): the file
- * exists and isn't suspiciously tiny, ffprobe can actually open it
- * (a file with a truncated/missing moov atom fails right here), it
- * contains a real video stream, and it reports a sane (>0) duration.
- * Also used by the upload pipeline as a final gate immediately before
- * upload, and to decide whether to fall back to uploading the original
- * source file instead of a broken compressed one.
+ * Confirms a finished FFmpeg run actually produced a working, Telegram-
+ * playable MP4 on disk — not just that the process exited 0. Checks (in
+ * order): the file exists and isn't suspiciously tiny, ffprobe can
+ * actually open it (a file with a truncated/missing moov atom fails
+ * right here), it contains a real video stream, it reports a sane (>0)
+ * duration, AND — the check that used to be missing — the video is
+ * actually H.264 and the audio (if any) is actually AAC. A stream-copy
+ * tier can only ever produce those codecs by construction (buildFfmpegArgs
+ * only allows `-c:v copy` when analyze() already confirmed h264/aac), but
+ * this re-verifies it directly against the file that's actually about to
+ * be uploaded rather than trusting that chain of assumptions — codec
+ * mismatches are exactly what make Telegram fall back to "Use external
+ * video player" while still showing a normal-looking .mp4 file. Also
+ * used by the upload pipeline as a final gate immediately before upload,
+ * and to decide whether to fall back to uploading the original source
+ * file instead of a broken/incompatible compressed one.
  */
 async function verifyOutputFile(outputPath) {
   let stat;
@@ -463,6 +483,7 @@ async function verifyOutputFile(outputPath) {
 
   const streams = meta.streams || [];
   const videoStream = pickVideoStream(streams);
+  const audioStreams = pickAudioStreams(streams);
   const duration = Number(meta.format?.duration) || 0;
 
   if (!videoStream) {
@@ -470,6 +491,14 @@ async function verifyOutputFile(outputPath) {
   }
   if (!(duration > 0)) {
     return { valid: false, reason: 'output reports zero/invalid duration (likely a truncated or missing moov atom)' };
+  }
+  const outVideoCodec = (videoStream.codec_name || '').toLowerCase();
+  if (outVideoCodec !== 'h264') {
+    return { valid: false, reason: `output video codec is "${outVideoCodec || 'unknown'}", not H.264 — Telegram's inline player will reject this` };
+  }
+  const badAudio = audioStreams.find((s) => (s.codec_name || '').toLowerCase() !== 'aac');
+  if (badAudio) {
+    return { valid: false, reason: `output has a non-AAC audio track ("${badAudio.codec_name || 'unknown'}") — Telegram's inline player will reject this` };
   }
 
   return {
