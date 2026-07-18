@@ -342,46 +342,124 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
   });
 
   let sent;
-  try {
-    sent = await sendOnce(opts.thumbPath);
-  } catch (err) {
-    if (!opts.thumbPath) throw err;
-    log.warn('uploadEpisode', 'Upload with thumbnail failed — retrying once without it', { targetChannelId, filePath, reason: err.message });
-    sent = await sendOnce(null);
-  }
+  let attempt = 0;
+  const maxAttempts = 2;
+  let lastVerificationErr;
 
-  const doc = sent?.media?.document;
-  if (!doc) {
-    throw new Error('Telegram accepted the upload but returned no document — cannot record it.');
-  }
+  while (attempt < maxAttempts) {
+    attempt += 1;
+    log.info('uploadEpisode', `Sending via MTProto sendFile (attempt ${attempt}/${maxAttempts})`, {
+      targetChannelId, filePath, fileName, mimeTypeSent: 'video/mp4 (inferred from .mp4 extension)',
+      attributesSent: attributes.map((a) => a.className),
+      forceDocument: false, supportsStreaming: true, hasThumb: Boolean(opts.thumbPath),
+    });
 
-  const remoteSizeBytes = Number(doc.size);
-  const elapsedMs = Date.now() - startedAt;
-  log.success('uploadEpisode', 'Upload completed', {
-    targetChannelId, messageId: sent.id, localSizeBytes, remoteSizeBytes, elapsedMs, finishedAt: new Date().toISOString(),
-  });
+    try {
+      sent = await sendOnce(opts.thumbPath);
+    } catch (err) {
+      if (!opts.thumbPath) throw err;
+      log.warn('uploadEpisode', 'Upload with thumbnail failed — retrying once without it', { targetChannelId, filePath, reason: err.message });
+      sent = await sendOnce(null);
+    }
 
-  if (Number.isFinite(remoteSizeBytes) && remoteSizeBytes !== localSizeBytes) {
-    // Not thrown as a hard failure — GramJS already confirmed the upload
-    // RPC succeeded — but a mismatch here means what Telegram actually
-    // stored doesn't match what's on disk, which is worth surfacing
-    // loudly rather than silently trusting a "success".
-    log.error(
-      'uploadEpisode',
-      'Uploaded document size does not match the local file size — investigate before trusting this upload',
-      new Error(`local=${localSizeBytes} remote=${remoteSizeBytes}`),
-      { targetChannelId, filePath }
+    const doc = sent?.media?.document;
+    if (!doc) {
+      throw new Error('Telegram accepted the upload but returned no document — cannot record it.');
+    }
+
+    // ---- Post-upload verification: does Telegram actually see this as a
+    // playable VIDEO, or did it land as a generic document? ------------
+    // `sent.video` is GramJS's own getter — it only returns the document
+    // when the message's media is a document carrying a
+    // DocumentAttributeVideo (and isn't a round/voice note). That's the
+    // most direct signal available of what Telegram itself thinks this
+    // upload is, so it's checked first; the attribute/mimeType checks
+    // beneath it are a fallback for GramJS versions where that getter
+    // might behave differently.
+    const attributeClassNames = Array.isArray(doc.attributes) ? doc.attributes.map((a) => a.className) : [];
+    const hasVideoAttribute = attributeClassNames.includes('DocumentAttributeVideo');
+    const mimeType = doc.mimeType || '';
+    const isVideoMime = mimeType.toLowerCase().startsWith('video/');
+    const recognizedByGetter = Boolean(sent.video);
+    const recognizedAsVideo = recognizedByGetter || (hasVideoAttribute && isVideoMime);
+    const thumbCount = Array.isArray(doc.thumbs) ? doc.thumbs.length : 0;
+
+    log.info('uploadEpisode', 'Post-upload verification', {
+      targetChannelId, messageId: sent.id,
+      mediaClassName: sent.media?.className || null,
+      mimeType, attributeClassNames, hasVideoAttribute, isVideoMime,
+      recognizedByVideoGetter: recognizedByGetter, thumbCount, recognizedAsVideo,
+    });
+
+    if (recognizedAsVideo) {
+      log.success('uploadEpisode', 'Verified: Telegram recognizes this upload as a playable video', {
+        targetChannelId, messageId: sent.id, thumbCount,
+      });
+
+      const remoteSizeBytes = Number(doc.size);
+      const elapsedMs = Date.now() - startedAt;
+      log.success('uploadEpisode', 'Upload completed', {
+        targetChannelId, messageId: sent.id, localSizeBytes, remoteSizeBytes, elapsedMs, finishedAt: new Date().toISOString(),
+      });
+
+      if (Number.isFinite(remoteSizeBytes) && remoteSizeBytes !== localSizeBytes) {
+        // Not thrown as a hard failure — GramJS already confirmed the
+        // upload RPC succeeded — but a mismatch here means what Telegram
+        // actually stored doesn't match what's on disk, worth surfacing
+        // loudly rather than silently trusting a "success".
+        log.error(
+          'uploadEpisode',
+          'Uploaded document size does not match the local file size — investigate before trusting this upload',
+          new Error(`local=${localSizeBytes} remote=${remoteSizeBytes}`),
+          { targetChannelId, filePath }
+        );
+      }
+
+      return {
+        channelId: targetChannelId,
+        messageId: sent.id,
+        documentId: doc.id.toString(),
+        accessHash: doc.accessHash ? doc.accessHash.toString() : null,
+        // `fileReference` and `dcId` are saved to Firestore purely as
+        // reference/debug metadata (per the requested schema) — NOT used
+        // by the streaming path. fileReference expires (~1hr) and
+        // mtproto.js's resolveVideoSource() always re-resolves a live one
+        // by channelId+messageId at request time; a stored copy here
+        // would just go stale. `dcId` is the DC that stores THIS
+        // document's bytes (a real per-document field, independent of
+        // the client's home DC) and could be used as a fast-path initial
+        // guess to skip one FILE_MIGRATE round-trip, but is optional.
+        fileReference: doc.fileReference ? Buffer.from(doc.fileReference).toString('base64') : null,
+        dcId: typeof doc.dcId === 'number' ? doc.dcId : null,
+        width: opts.width || 0,
+        height: opts.height || 0,
+        duration: opts.duration || 0,
+        size: remoteSizeBytes,
+        mimeType: mimeType || 'video/mp4',
+      };
+    }
+
+    // Verification failed — this upload technically succeeded as an RPC
+    // call but Telegram is treating it as a generic file, which is
+    // exactly the "Use external video player" failure mode. Don't leave
+    // a broken duplicate sitting in the storage channel: remove it before
+    // retrying (or giving up) so a caller-level retry never accumulates
+    // junk messages.
+    lastVerificationErr = new Error(
+      `Telegram stored this upload as a generic document, not a playable video ` +
+      `(mimeType="${mimeType}", attributes=[${attributeClassNames.join(', ')}], messageId=${sent.id}).`
     );
+    log.error('uploadEpisode', `Verification failed on attempt ${attempt}/${maxAttempts} — removing the bad message`, lastVerificationErr, {
+      targetChannelId, messageId: sent.id,
+    });
+    try {
+      await client.deleteMessages(entity, [sent.id], { revoke: true });
+    } catch (delErr) {
+      log.warn('uploadEpisode', 'Could not remove the non-video message after failed verification', { targetChannelId, messageId: sent.id, reason: delErr.message });
+    }
   }
 
-  return {
-    channelId: targetChannelId,
-    messageId: sent.id,
-    documentId: doc.id.toString(),
-    accessHash: doc.accessHash ? doc.accessHash.toString() : null,
-    size: remoteSizeBytes,
-    mimeType: doc.mimeType || 'video/mp4',
-  };
+  throw lastVerificationErr || new Error('uploadEpisode: verification failed for an unknown reason.');
 }
 
 module.exports = {
