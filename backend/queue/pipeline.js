@@ -858,8 +858,10 @@ async function uploadPreparedFile(session, item) {
       cleanupFile(item.tempOut);
       cleanupFile(item.tempThumb);
       const totalElapsedMs = item.startedAt ? item.finishedAt - item.startedAt : null;
+      const mem = process.memoryUsage();
       log.success('uploadPreparedFile', 'Completed', {
         chatId: session.chatId, seq: item.seq, totalElapsedMs, finishedAt: new Date(item.finishedAt).toISOString(),
+        memoryRssMB: Math.round(mem.rss / 1024 / 1024), memoryHeapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
       });
       log.success('uploadPreparedFile', 'Cleanup completed', { chatId: session.chatId, seq: item.seq });
 
