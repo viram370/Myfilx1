@@ -321,7 +321,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 .player-ov{position:fixed;inset:0;z-index:800;background:#000;opacity:0;pointer-events:none;transition:opacity .28s ease}
 .player-ov.vis{opacity:1;pointer-events:auto}
 .ply-scroll{width:100%;height:100%;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior-y:contain}
-.ply-stage{position:relative;width:100%;aspect-ratio:16/9;background:#000;overflow:hidden;touch-action:none}
+.ply-stage{position:relative;width:100%;aspect-ratio:16/9;background:#000;overflow:hidden;touch-action:none;transition:width .25s var(--ease),height .25s var(--ease)}
 /* Portrait video: vertical layout, stage grows tall like Shorts/Reels */
 .ply-stage.portrait{aspect-ratio:9/16;max-height:100vh}
 .ply-stage.fs-active{position:fixed;inset:0;aspect-ratio:unset;z-index:850;max-height:100vh}
@@ -369,7 +369,6 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 .ply-top-info{flex:1;min-width:0}
 .ply-title{font-size:14px;font-weight:700;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ply-subtitle{font-size:11px;color:rgba(255,255,255,.55);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.ply-quality-badge{flex-shrink:0;font-size:10px;font-weight:800;letter-spacing:.3px;color:#0a0a0a;background:linear-gradient(135deg,#ffd54a,#f5c518);padding:5px 9px;border-radius:6px;box-shadow:0 2px 8px rgba(245,197,24,.35)}
 
 /* ── Skip Intro / Skip Credits ── */
 .ply-skip-btn{position:absolute;right:14px;bottom:96px;z-index:13;padding:10px 16px;font-size:12.5px;font-weight:700;color:#fff;background:rgba(20,20,26,.72);border:1.5px solid rgba(255,255,255,.22);backdrop-filter:blur(12px);border-radius:9px;display:flex;align-items:center;gap:6px;opacity:0;transform:translateY(8px);pointer-events:none;transition:opacity .22s,transform .22s}
@@ -434,10 +433,24 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 .ply-below .row-t{font-size:15px;font-weight:800;color:var(--t1)}
 .ply-below .eps-sec{padding:0 16px}
 
-/* ── Fullscreen (native + CSS-driven) ── */
-.player-ov:fullscreen .ply-scroll,.player-ov:-webkit-full-screen .ply-scroll{overflow:hidden}
-.player-ov:fullscreen .ply-stage,.player-ov:-webkit-full-screen .ply-stage{height:100%;aspect-ratio:unset}
-.player-ov:fullscreen .ply-below,.player-ov:-webkit-full-screen .ply-below{display:none}
+/* ── Fullscreen: native (Fullscreen API requested ON #ply-stage itself,
+   so the correct selector is #ply-stage:fullscreen, not an ancestor) ── */
+.ply-stage:fullscreen,.ply-stage:-webkit-full-screen{width:100%;height:100%;aspect-ratio:unset}
+.ply-stage:fullscreen .vid-el,.ply-stage:-webkit-full-screen .vid-el{object-fit:contain}
+
+/* ── Pseudo-fullscreen fallback: the native Fullscreen API is silently
+   blocked in many embedded WebViews (notably Telegram's in-app browser
+   on iOS/Android), which is why the fullscreen button previously did
+   nothing there. This CSS-only fixed overlay works everywhere with no
+   browser-API dependency. When the device is still physically portrait
+   and the content is landscape, it's rotated 90deg via transform so it
+   fills the screen properly (the width/height swap is intentional - a
+   100vh x 100vw box rotated 90deg occupies exactly 100vw x 100vh of the
+   viewport). Toggled by JS (enterPseudoFullscreen/exitPseudoFullscreen);
+   never fights the transition used for normal stage resizing. ── */
+.ply-stage.pseudo-fs{position:fixed;top:0;left:0;width:100vw;height:100vh;max-height:none;aspect-ratio:unset;z-index:9999;transition:none}
+.ply-stage.pseudo-fs.pseudo-fs-rot{width:100vh;height:100vw;top:50%;left:50%;transform:translate(-50%,-50%) rotate(90deg);transform-origin:center}
+.ply-scroll.locked{overflow:hidden}
 
 
 
@@ -851,7 +864,6 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
           <div class="ply-title" id="ply-title"></div>
           <div class="ply-subtitle" id="ply-subtitle"></div>
         </div>
-        <span class="ply-quality-badge">720p HD</span>
         <button class="ply-iconbtn" id="ply-pip" title="Picture in Picture"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><rect x="12" y="12" width="8" height="6" fill="currentColor"/></svg></button>
       </div>
 
@@ -1150,6 +1162,40 @@ function renderHero(){
 function startHeroLoop(){clearInterval(S.heroT);if(S.featured.length<2)return;S.heroT=setInterval(()=>{S.heroIdx=(S.heroIdx+1)%S.featured.length;renderHero();},5500);}
 
 // ── Detail Modal ──────────────────────────────────
+// ── Continue Watching: dedup + refresh ─────────────
+// FIX (duplicate entries / stale progress): previously this list was only
+// ever fetched once, at app boot, in loadAll(). Watching (or resuming)
+// something and returning home left the Continue Watching row showing
+// whatever it showed at boot until the ENTIRE app was reloaded - which is
+// exactly the "progress not updating" / "incorrect episode" symptoms
+// (the row wasn't wrong, it was just stale). refreshContinueWatching() is
+// now also called right after closePlayer() saves progress, so the row
+// reflects the just-watched position immediately. applyContinueWatching()
+// also defensively de-dupes by video id (keeping the first/most-recent
+// entry per backend ordering) so even a backend hiccup can't show the
+// same title twice.
+function applyContinueWatching(items){
+  const seen=new Set();
+  const deduped=[];
+  for(const item of (items||[])){
+    const id=item?.video?.id;
+    if(!id||seen.has(id)) continue;
+    seen.add(id);
+    deduped.push(item);
+  }
+  S.cont=deduped.map((item,i)=>({...normalize(item.video,i),watchProgress:item.video.watchProgress||0}));
+  $('cont-row').style.display=S.cont.length?'':'none';
+  fillCar('cont-car',S.cont,true);
+}
+async function refreshContinueWatching(){
+  try{
+    const {items}=await Api.continueWatching();
+    applyContinueWatching(items);
+  }catch(err){
+    console.warn('[MYFLIX] Continue Watching refresh failed (non-fatal)',err.message);
+  }
+}
+
 function showDetail(v){
   S.curVid=v;hap('medium');
   const ov=$('modal-ov');ov.classList.remove('hidden');requestAnimationFrame(()=>ov.classList.add('vis'));
@@ -1226,9 +1272,17 @@ function buildEps(v){
       }
       const epNum=document.createElement('div');epNum.className='ep-n';epNum.textContent=`E${e.ep}`;
       thd.appendChild(epNum);
+      const prog=e.prog||0;
+      if(prog>=95){
+        const watchedBadge=document.createElement('div');
+        watchedBadge.style.cssText='position:absolute;top:3px;right:4px;width:16px;height:16px;border-radius:50%;background:var(--red);display:flex;align-items:center;justify-content:center';
+        watchedBadge.innerHTML='<svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>';
+        thd.appendChild(watchedBadge);
+      }
       const inf=document.createElement('div');inf.className='ep-inf';
-      inf.innerHTML=`<div class="ep-ttl">${esc(e.title||`Episode ${e.ep}`)}</div><div class="ep-dur">${fmtD(e.duration)||'~24m'}</div>`;
-      if((e.prog||0)>0){const pg=document.createElement('div');pg.className='ep-prog';pg.innerHTML=`<div class="ep-prog-fill" style="width:${e.prog}%"></div>`;inf.appendChild(pg);}
+      const durOrProg = prog>0 ? `${fmtD(e.duration)||'~24m'} • ${Math.min(100,Math.round(prog))}% watched` : (fmtD(e.duration)||'~24m');
+      inf.innerHTML=`<div class="ep-ttl">${esc(e.title||`Episode ${e.ep}`)}</div><div class="ep-dur">${durOrProg}</div>`;
+      if(prog>0){const pg=document.createElement('div');pg.className='ep-prog';pg.innerHTML=`<div class="ep-prog-fill" style="width:${prog}%"></div>`;inf.appendChild(pg);}
       const ico=document.createElement('svg');ico.setAttribute('width','14');ico.setAttribute('height','14');ico.setAttribute('viewBox','0 0 24 24');ico.setAttribute('fill','currentColor');ico.style.color='var(--t3)';ico.innerHTML='<polygon points="5,3 19,12 5,21"/>';
       row.appendChild(thd);row.appendChild(inf);row.appendChild(ico);
       // Play THIS episode's own video (videoId), falling back to parent if missing
@@ -1257,6 +1311,7 @@ const PLY={
   introEnd:0, creditsStart:null,
   nextInterval:null, previewVideo:null,
   _lastTapAt:0, _lastTapHalf:null, _tapTimer:null,
+  pseudoFs:false,
 };
 let _progTimer=null;
 let _curPlayVid=null;
@@ -1365,6 +1420,19 @@ async function playVideo(v){
       // fill-the-player landscape layout. Only lock screen orientation
       // for landscape content, so portrait clips are left free to stay
       // in the device's natural (usually portrait) orientation.
+      //
+      // FIX (black bars / letterboxing on landscape content): the stage
+      // used to be pinned to a FIXED aspect-ratio guess (16/9 landscape,
+      // 9/16 portrait) via CSS, regardless of the source's actual ratio.
+      // Any video that wasn't exactly that ratio (4:3, ultrawide, a
+      // slightly different vertical crop, etc.) got double-letterboxed:
+      // once by the mismatched container, then again by object-fit:contain
+      // inside it - showing as large unwanted black bars. Setting the
+      // container's aspect-ratio to the video's REAL width/height makes
+      // it fit exactly, with no stretching and no unnecessary black space.
+      if(vid.videoWidth && vid.videoHeight){
+        stage.style.aspectRatio=`${vid.videoWidth}/${vid.videoHeight}`;
+      }
       if(vid.videoHeight>vid.videoWidth){
         stage.classList.add('portrait');
       } else {
@@ -1488,10 +1556,13 @@ function closePlayer(){
   $('ply-next-card').classList.remove('show');
   $('ply-speed-menu').classList.remove('show');
   if(_curPlayVid && vid.currentTime>5 && !vid.ended){
-    Api.saveProgress(_curPlayVid.id,Math.floor(vid.currentTime),Math.floor(vid.duration||0)).catch(()=>{});
+    Api.saveProgress(_curPlayVid.id,Math.floor(vid.currentTime),Math.floor(vid.duration||0))
+      .then(()=>refreshContinueWatching())
+      .catch(()=>{});
   }
   if(document.pictureInPictureElement){try{document.exitPictureInPicture();}catch(_){}}
   if(document.fullscreenElement){try{document.exitFullscreen();}catch(_){}}
+  exitPseudoFullscreen();
   vid.pause();vid.removeAttribute('src');vid.load();
   vid.style.transform='';vid.style.filter='';PLY.scale=1;PLY.brightness=1;
   ov.classList.remove('vis');
@@ -1503,6 +1574,7 @@ function closePlayer(){
     vid.style.display='none';
     $('ply-scroll').scrollTo({top:0});
     $('ply-stage').classList.remove('portrait');
+    $('ply-stage').style.aspectRatio='';
   },300);
   try{screen.orientation?.unlock()}catch{}
   _curPlayVid=null;
@@ -1580,13 +1652,65 @@ async function togglePiP(){
     else{toast('Picture-in-Picture is not supported on this device');}
   }catch(_){toast('Unable to start Picture-in-Picture');}
 }
+function isPortraitViewport(){ return window.innerHeight>=window.innerWidth; }
+
+// FIX ("horizontal/fullscreen button not working"): the native Fullscreen
+// API (Element.requestFullscreen) is frequently unavailable or silently
+// rejected inside embedded WebViews - which is exactly what a Telegram
+// Mini App runs in, on both iOS and Android. Previously the button's
+// only behavior was requestFullscreen() wrapped in an empty catch, so on
+// any device where that API is blocked, tapping it visibly did nothing.
+// This now tries the real API first (best UX where it works, e.g. desktop
+// browsers) and falls back to a pure-CSS fixed overlay - rotated 90deg via
+// transform when the device is still physically portrait - that works
+// with zero browser-API dependency.
 async function toggleFullscreen(){
   const stage=$('ply-stage');
+
+  if(stage.classList.contains('pseudo-fs')){ exitPseudoFullscreen(); return; }
+  if(document.fullscreenElement){ try{ await document.exitFullscreen(); }catch(_){} return; }
+
+  let nativeOk=false;
   try{
-    if(document.fullscreenElement){await document.exitFullscreen();}
-    else{await (stage.requestFullscreen ? stage.requestFullscreen() : stage.webkitRequestFullscreen?.());}
-  }catch(_){/* some mobile browsers restrict programmatic fullscreen outside a direct tap - ignore */}
+    await (stage.requestFullscreen ? stage.requestFullscreen() : stage.webkitRequestFullscreen?.());
+    nativeOk=!!(document.fullscreenElement||document.webkitFullscreenElement);
+  }catch(_){ nativeOk=false; }
+
+  if(nativeOk){
+    // Screen Orientation Lock generally requires the document to already
+    // be in fullscreen to succeed - only worth trying now that it is.
+    if(!stage.classList.contains('portrait')){
+      try{ await screen.orientation?.lock('landscape'); }catch(_){}
+    }
+    return;
+  }
+
+  enterPseudoFullscreen();
 }
+
+function enterPseudoFullscreen(){
+  const stage=$('ply-stage');
+  const needsRotate=!stage.classList.contains('portrait') && isPortraitViewport();
+  stage.classList.add('pseudo-fs');
+  stage.classList.toggle('pseudo-fs-rot',needsRotate);
+  $('ply-scroll').classList.add('locked');
+  PLY.pseudoFs=true;
+}
+function exitPseudoFullscreen(){
+  const stage=$('ply-stage');
+  stage.classList.remove('pseudo-fs','pseudo-fs-rot');
+  $('ply-scroll').classList.remove('locked');
+  PLY.pseudoFs=false;
+}
+// If the device is physically rotated while pseudo-fullscreen is active,
+// re-evaluate whether the rotate-transform is still needed - keeps
+// landscape content filling the screen correctly either way, with no
+// flicker (single class toggle, GPU-accelerated transform only).
+window.addEventListener('resize',()=>{
+  if(!PLY.pseudoFs) return;
+  const stage=$('ply-stage');
+  stage.classList.toggle('pseudo-fs-rot',!stage.classList.contains('portrait') && isPortraitViewport());
+});
 
 // ── Skip Intro / Skip Credits ──────────────────────
 // Real, content-length-derived windows rather than fixed guesses: only
@@ -2129,9 +2253,8 @@ async function loadAll() {
     ]);
 
     if (cwRes.status === 'fulfilled') {
-      S.cont = (cwRes.value.items || []).map((item, i) => ({ ...normalize(item.video, i), watchProgress: item.video.watchProgress || 0 }));
+      applyContinueWatching(cwRes.value.items);
     }
-    if (S.cont.length) { $('cont-row').style.display = ''; fillCar('cont-car', S.cont, true); }
 
     if (favRes.status === 'fulfilled') {
       (favRes.value.favorites || []).forEach(f => S.favs.add(f.videoId));
