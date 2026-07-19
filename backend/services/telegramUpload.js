@@ -280,7 +280,11 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
   } catch (err) {
     throw new Error(`uploadEpisode: cannot stat local file before upload (${err.message}) — refusing to upload a file that may not exist/be fully written.`);
   }
-  log.info('uploadEpisode', 'Upload started', { targetChannelId, filePath, localSizeBytes });
+  log.info('uploadEpisode', 'Upload started', {
+    targetChannelId, filePath, localSizeBytes,
+    videoAttributesSent: { duration: opts.duration || 0, w: opts.width || 0, h: opts.height || 0, supportsStreaming: true, nosound: false, roundMessage: false },
+    mimeType: 'video/mp4', forceDocument: false, hasThumb: !!opts.thumbPath,
+  });
 
   const client = await mtproto.connect();
   if (!client) throw new mtproto.MTProtoDisabledError();
@@ -295,6 +299,31 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
       w: opts.width || 0,
       h: opts.height || 0,
       supportsStreaming: true,
+      // THE LIKELY ROOT CAUSE of "tapping the video doesn't play it
+      // correctly, sometimes only plays in a small PiP-style window
+      // without audio" on Android: `nosound` is a real TL flag on
+      // DocumentAttributeVideo (flags.5, "this video has no audio
+      // track"). When it's true, EVERY Telegram client — Android
+      // included — renders the video exactly like an animated GIF: it
+      // auto-plays muted, often minimized/looping, with no audio
+      // control at all. That is a precise match for the reported
+      // symptom. This constructor call never set `nosound` at all
+      // before, leaving it `undefined` — and depending on the exact
+      // GramJS/gramjs-core version's TL-flag serialization, an
+      // `undefined` optional boolean is not guaranteed to serialize
+      // identically to an explicit `false` in the flags bitmask that
+      // gets sent over the wire. Explicitly forcing `false` removes
+      // that ambiguity entirely: every file this pipeline uploads has
+      // already been verified (verifyOutputFile in compress.js) to
+      // contain a real AAC audio stream, so `nosound` must always be
+      // `false` here, never left to chance.
+      nosound: false,
+      // Also explicit for the same reason — round "video message"
+      // bubbles (the circular player) are a completely different UI
+      // from what's reported here, but leaving this undefined instead
+      // of an explicit false is the same category of ambiguity as
+      // `nosound` above, so it's pinned down too.
+      roundMessage: false,
     }),
     // Explicit filename attribute alongside the video attribute — some
     // Telegram clients use this (rather than re-deriving it from the
@@ -320,10 +349,22 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
     // so GramJS sends it as real video media: Telegram then generates
     // its own thumbnail/preview and enables in-app streaming playback.
     forceDocument: false,
-    // Set both as a top-level convenience flag AND on the attribute
-    // above — belt and suspenders against GramJS/Telegram version
-    // differences in which one it actually reads.
-    supportsStreaming: true,
+    // FIX: `supportsStreaming` is NOT a documented top-level option on
+    // GramJS's sendFile() — the only place Telegram actually reads it
+    // from is the DocumentAttributeVideo attribute above. This line
+    // used to be here as a (non-functional) "belt and suspenders" —
+    // GramJS silently ignores unknown option keys, so it did nothing at
+    // all and just implied a safety net that didn't exist. Removed
+    // rather than left in as false reassurance; explicitly setting
+    // `mimeType` below is the actual belt-and-suspenders that matters.
+    //
+    // Explicit mimeType instead of relying purely on GramJS deriving it
+    // from the `fileName` extension via its internal mime-type lookup.
+    // Every file this pipeline ever hands to sendFile is guaranteed
+    // (verifyOutputFile) to be H.264/AAC in an MP4 container, so this is
+    // always exactly correct — and removes any dependency on filename
+    // extension parsing succeeding for every possible generated name.
+    mimeType: 'video/mp4',
     // A real thumbnail (see services/compress.js#generateThumbnail)
     // removes any dependency on Telegram's own server-side auto-
     // thumbnail generation, which isn't fully reliable and can silently
@@ -386,6 +427,19 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
       targetChannelId, filePath, messageId: sent.id,
     });
   }
+  if (videoAttr.nosound) {
+    // Telegram's own confirmation that it will render this as a silent,
+    // GIF-style auto-playing clip instead of a normal video with
+    // controls and audio — exactly the reported Android symptom. If this
+    // ever fires despite explicitly sending `nosound: false` above, the
+    // source file itself has no audio stream (verifyOutputFile in
+    // compress.js should have already caught that before upload) or
+    // Telegram's server-side media analysis overrode the flag based on
+    // its own inspection of the actual bytes.
+    log.error('uploadEpisode', 'Telegram stored this video with nosound=true — it will play muted/minimized like a GIF, not as a normal video', new Error('nosound flag set on stored document'), {
+      targetChannelId, filePath, messageId: sent.id,
+    });
+  }
   if (!/^video\//i.test(doc.mimeType || '')) {
     log.warn('uploadEpisode', 'Stored document has a non-video mimeType despite carrying DocumentAttributeVideo', {
       targetChannelId, filePath, messageId: sent.id, mimeType: doc.mimeType,
@@ -396,7 +450,8 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
   const elapsedMs = Date.now() - startedAt;
   log.success('uploadEpisode', 'Upload completed and verified as playable video', {
     targetChannelId, messageId: sent.id, localSizeBytes, remoteSizeBytes, elapsedMs, finishedAt: new Date().toISOString(),
-    verifiedDuration: videoAttr.duration, verifiedWidth: videoAttr.w, verifiedHeight: videoAttr.h, supportsStreaming: !!videoAttr.supportsStreaming,
+    verifiedDuration: videoAttr.duration, verifiedWidth: videoAttr.w, verifiedHeight: videoAttr.h,
+    supportsStreaming: !!videoAttr.supportsStreaming, nosound: !!videoAttr.nosound,
   });
 
   if (Number.isFinite(remoteSizeBytes) && remoteSizeBytes !== localSizeBytes) {
