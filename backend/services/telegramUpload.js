@@ -417,6 +417,21 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
       new Error(`attributes=[${sentAttributes.map((a) => a.className).join(', ') || 'none'}]`),
       { targetChannelId, filePath, messageId: sent.id, mimeType: doc.mimeType }
     );
+    // Never leave a failed/misrecognized upload sitting in the storage
+    // channel as orphaned junk while the caller retries — delete it
+    // immediately. Best-effort: if the delete itself fails, the retry
+    // still proceeds (the caller's next attempt sends a brand-new
+    // message either way), but we log it loudly since it means a stray
+    // document is now sitting in the channel that a human may need to
+    // clean up manually.
+    try {
+      await client.deleteMessages(entity, [sent.id], { revoke: true });
+      log.warn('uploadEpisode', 'Deleted the failed upload from the storage channel', { targetChannelId, messageId: sent.id });
+    } catch (delErr) {
+      log.error('uploadEpisode', 'Failed to delete the bad upload — a stray non-video document may remain in the storage channel', delErr, {
+        targetChannelId, messageId: sent.id, stack: delErr.stack,
+      });
+    }
     throw new Error(
       'Telegram did not recognize the uploaded file as playable video media (no DocumentAttributeVideo on the ' +
       'stored document) — it would show up as a plain file attachment with no inline player. Not saving this as a successful upload.'
@@ -430,15 +445,26 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
   if (videoAttr.nosound) {
     // Telegram's own confirmation that it will render this as a silent,
     // GIF-style auto-playing clip instead of a normal video with
-    // controls and audio — exactly the reported Android symptom. If this
-    // ever fires despite explicitly sending `nosound: false` above, the
-    // source file itself has no audio stream (verifyOutputFile in
-    // compress.js should have already caught that before upload) or
-    // Telegram's server-side media analysis overrode the flag based on
-    // its own inspection of the actual bytes.
+    // controls and audio — exactly the reported Android symptom. The
+    // local file is already guaranteed (verifyOutputFile in compress.js)
+    // to contain a real AAC stream, and this call explicitly sent
+    // `nosound: false` — if Telegram's server-side analysis still came
+    // back with nosound=true, something is genuinely wrong with this
+    // specific upload (not just a logging concern), so it's treated the
+    // same as the missing-DocumentAttributeVideo case: delete it and let
+    // the caller's retry loop try again with a fresh upload.
     log.error('uploadEpisode', 'Telegram stored this video with nosound=true — it will play muted/minimized like a GIF, not as a normal video', new Error('nosound flag set on stored document'), {
       targetChannelId, filePath, messageId: sent.id,
     });
+    try {
+      await client.deleteMessages(entity, [sent.id], { revoke: true });
+      log.warn('uploadEpisode', 'Deleted the nosound=true upload from the storage channel', { targetChannelId, messageId: sent.id });
+    } catch (delErr) {
+      log.error('uploadEpisode', 'Failed to delete the nosound=true upload — a stray silent-playback document may remain in the storage channel', delErr, {
+        targetChannelId, messageId: sent.id, stack: delErr.stack,
+      });
+    }
+    throw new Error('Telegram stored this upload with nosound=true (silent/GIF-style playback) despite a verified AAC audio track locally — not saving this as a successful upload.');
   }
   if (!/^video\//i.test(doc.mimeType || '')) {
     log.warn('uploadEpisode', 'Stored document has a non-video mimeType despite carrying DocumentAttributeVideo', {

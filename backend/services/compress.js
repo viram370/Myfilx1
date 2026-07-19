@@ -378,6 +378,26 @@ function runFfmpeg(args, onProgress, totalDurationSeconds) {
 }
 
 /**
+ * Adaptive quality target instead of one fixed CRF for every input. Lower
+ * CRF = higher quality/bitrate. x264's perceptual quality-per-CRF-step
+ * isn't resolution-independent — the same CRF looks visibly softer on a
+ * small frame than a large one relative to its own detail level, and a
+ * fixed "safe" CRF for 4K content wastes enormous bitrate on a 480p
+ * source. Bucketed by pixel count instead of a magic single number:
+ *   - small (≤480p): CRF 20 — near-source quality; the frame is small
+ *     enough that the bitrate cost of doing so is trivial.
+ *   - medium (≤1080p): CRF 22 — minimal, essentially imperceptible loss.
+ *   - large (>1080p, i.e. 1440p/4K): CRF 24 — still visually
+ *     transparent at that pixel density while avoiding an enormous file.
+ */
+function pickCrf(info) {
+  const pixels = (info.width || 0) * (info.height || 0);
+  if (pixels > 0 && pixels <= 720 * 480) return 20; // small
+  if (pixels <= 1920 * 1080) return 22; // medium
+  return 24; // large (1440p/4K+)
+}
+
+/**
  * Builds a full FFmpeg argument list for one conversion attempt. Every
  * mapped stream is explicit — this is the core of the MKV fix: FFmpeg
  * never gets to guess which streams belong in the output.
@@ -422,7 +442,7 @@ function buildFfmpegArgs(inputPath, outputPath, tier, info) {
     args.push(
       '-c:v', 'libx264',
       '-preset', 'veryfast',
-      '-crf', '23',
+      '-crf', String(pickCrf(info)),
       '-pix_fmt', 'yuv420p',
       '-profile:v', 'high',
       // Constant frame rate: many MKV/phone-camera/screen-recording
@@ -537,6 +557,14 @@ async function verifyOutputFile(outputPath) {
   if (badAudio) {
     return { valid: false, reason: `output has a non-AAC audio track ("${badAudio.codec_name || 'unknown'}") — Telegram's inline player will reject this` };
   }
+  const frameRate = parseFrameRate(videoStream.avg_frame_rate) || parseFrameRate(videoStream.r_frame_rate);
+  if (!(frameRate > 0)) {
+    return { valid: false, reason: `output reports an invalid/zero frame rate ("${videoStream.avg_frame_rate || videoStream.r_frame_rate || 'unknown'}")` };
+  }
+  const faststart = checkFaststart(outputPath);
+  if (!faststart.ok) {
+    return { valid: false, reason: `output is not faststart (moov atom is not before mdat: ${faststart.reason}) — many players won't start playback until the whole file downloads` };
+  }
 
   return {
     valid: true,
@@ -544,7 +572,64 @@ async function verifyOutputFile(outputPath) {
     duration: Math.round(duration),
     width: videoStream.width || 0,
     height: videoStream.height || 0,
+    frameRate,
   };
+}
+
+function parseFrameRate(raw) {
+  if (!raw || typeof raw !== 'string') return 0;
+  const [num, den] = raw.split('/').map(Number);
+  if (!num || !den) return 0;
+  return num / den;
+}
+
+/**
+ * Reads just enough of the MP4's top-level box structure to confirm
+ * `moov` appears before `mdat` — the actual, structural definition of
+ * "faststart". `-movflags +faststart` normally guarantees this, but
+ * FFmpeg can silently fail to apply it in a handful of edge cases (some
+ * odd stream-copy combinations, certain muxer/codec pairings), and
+ * nothing was ever actually checking that the flag took effect. This is
+ * a real, on-disk verification instead of trusting the command-line flag
+ * was honored. MP4 boxes are simply [4-byte size][4-byte fourcc][data...]
+ * at the top level, so this only needs to walk the top-level box list —
+ * no full MP4 parser required.
+ */
+function checkFaststart(filePath) {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const stat = fs.fstatSync(fd);
+    let offset = 0;
+    const buf = Buffer.alloc(8);
+    // Cap how far we scan — a well-formed faststart file has moov within
+    // the first handful of boxes; if we haven't seen either box within a
+    // few MB, something's structurally unusual and we bail out honestly
+    // rather than scanning gigabytes of mdat looking for a moov that
+    // isn't there (i.e. not-faststart), or spinning forever.
+    const scanLimit = Math.min(stat.size, 8 * 1024 * 1024);
+    while (offset < scanLimit) {
+      const bytesRead = fs.readSync(fd, buf, 0, 8, offset);
+      if (bytesRead < 8) break;
+      let boxSize = buf.readUInt32BE(0);
+      const fourcc = buf.toString('ascii', 4, 8);
+      if (boxSize === 1) {
+        // 64-bit extended size — read the next 8 bytes.
+        const bigBuf = Buffer.alloc(8);
+        fs.readSync(fd, bigBuf, 0, 8, offset + 8);
+        const big = bigBuf.readBigUInt64BE(0);
+        boxSize = Number(big);
+      }
+      if (fourcc === 'moov') return { ok: true };
+      if (fourcc === 'mdat') return { ok: false, reason: 'mdat encountered before moov' };
+      if (!(boxSize > 0)) return { ok: false, reason: `unreadable box size at offset ${offset}` };
+      offset += boxSize;
+    }
+    return { ok: false, reason: 'moov box not found within the first 8MB — file is not faststart' };
+  } catch (err) {
+    return { ok: false, reason: `could not inspect box structure: ${err.message}` };
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 /**
