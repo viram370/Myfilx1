@@ -252,7 +252,25 @@ async function analyze(filePath) {
   // format) is treated as needing a real re-encode.
   const videoOk = videoCodec === 'h264' && (pixFmt === '' || /^yuvj?420p$/.test(pixFmt));
   const audioOk = audioStreams.length === 0
-    || audioStreams.every((s) => (s.codec_name || '').toLowerCase() === 'aac');
+    || audioStreams.every((s) => {
+      if ((s.codec_name || '').toLowerCase() !== 'aac') return false;
+      // A remux (audioMode 'copy') carries the source's audio stream
+      // through byte-for-byte, unprofiled by codec_name alone. Two real-
+      // world shapes of "aac" both survive that check but are routinely
+      // rejected by Telegram's inline player (and plenty of browsers)
+      // even though the container/video are perfectly fine:
+      //   - more than stereo (5.1/7.1 surround — common in MKV rips)
+      //   - the HE-AAC/HE-AACv2 profile (common in older phone-camera
+      //     and some screen-recording exports) rather than plain LC-AAC
+      // Either one forces this file down the transcode tier instead,
+      // where `-c:a aac -ac 2` (no -profile:a flag) always produces
+      // plain stereo LC-AAC — see buildFfmpegArgs.
+      const channels = Number(s.channels) || 0;
+      if (channels > 2) return false;
+      const profile = (s.profile || '').toUpperCase();
+      if (profile.includes('HE-AAC')) return false;
+      return true;
+    });
 
   const rotation = detectRotation(videoStream);
 
