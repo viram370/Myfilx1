@@ -43,6 +43,7 @@ const { getDB, getAdmin } = require('./firebase');
 const { parseMediaInfo } = require('./parser');
 const mtproto = require('./mtproto');
 const { registerAdminUpload, isSessionActive: isAddSessionActive } = require('../handlers/adminUpload');
+const { registerBrowseAdmin, isAwaitingMedia: isBrowseAwaitingMedia } = require('../handlers/browseAdmin');
 
 // ============================================================================
 // SECTION 1 — CONFIG & CONSTANTS
@@ -475,6 +476,7 @@ function surfaceIndexLink(chatId, err) {
 // Separate module (handlers/adminUpload.js + queue/pipeline.js) — registered
 // here, alongside the existing /saveanime family, not replacing it.
 registerAdminUpload(bot, { isAdmin, safeSendMessage, safeEditMessageText });
+registerBrowseAdmin(bot, { isAdmin, safeSendMessage, safeEditMessageText, isAddSessionActive });
 
 // ============================================================================
 // SECTION 8 — RATE LIMITING & COMMAND WRAPPER
@@ -739,6 +741,7 @@ async function handleDirectVideo(msg, media) {
   const chatId = msg.chat.id;
   if (!isAdmin(chatId)) return;
   if (isAddSessionActive(chatId)) return; // owned by the /add upload pipeline instead
+  if (isBrowseAwaitingMedia(chatId)) return; // owned by the /anime /movie /webseries Replace Video flow instead
 
   const result = await bufferVideoItem(chatId, media, msg, 'direct');
 
@@ -783,7 +786,7 @@ async function handleChannelVideo(msg, source) {
   // a video that's already part of their batch.
   let primaryResult = null;
   for (const adminId of ADMIN_IDS) {
-    if (isAddSessionActive(adminId)) continue;
+    if (isAddSessionActive(adminId) || isBrowseAwaitingMedia(adminId)) continue;
     const result = await bufferVideoItem(adminId, media, msg, source);
     if (!primaryResult) primaryResult = result;
   }
@@ -846,8 +849,8 @@ registerCommand('help', async (msg) => {
     '/deleteallmovies',
     '/deleteallwebseries',
     '',
-    '<b>Browsing</b>',
-    '/listanime · /listmovies · /listwebseries',
+    '<b>Browsing &amp; managing</b>',
+    '/anime · /movie · /webseries — browse by title, then season/episode; replace video, edit details, or delete via buttons',
     '/find title|episode|season|language|category &lt;value&gt;',
     '',
     '<b>Monitoring</b>',
@@ -1451,9 +1454,10 @@ function registerListCommand(command, category) {
     await renderListPage(msg.chat.id, CATEGORY_CODE[category], 0, null);
   });
 }
-registerListCommand('listanime', CATEGORIES.ANIME);
-registerListCommand('listmovies', CATEGORIES.MOVIES);
-registerListCommand('listwebseries', CATEGORIES.WEBSERIES);
+// NOTE: /listanime, /listmovies, /listwebseries were replaced by the
+// hierarchical /anime, /movie, /webseries browser (handlers/browseAdmin.js).
+// registerListCommand() and its supporting renderListPage()/fetchCategoryDocsCached()
+// above are left in place but are no longer wired to any command.
 
 // ============================================================================
 // SECTION 17 — STATS / STORAGE / HEALTH / LOGS / PING (Requirement 8 & 10)
@@ -1698,7 +1702,7 @@ bot.onText(/^\/(\w+)/, async (msg, match) => {
     'start', 'help', 'saveanime', 'savemovie', 'savewebseries', 'autosave',
     'deleteanime', 'deletemovie', 'deleteseries',
     'deletelanguage', 'deleteallanime', 'deleteallmovies', 'deleteallwebseries',
-    'listanime', 'listmovies', 'listwebseries', 'stats', 'storage', 'health', 'logs', 'ping',
+    'anime', 'movie', 'webseries', 'stats', 'storage', 'health', 'logs', 'ping',
     'maxbuffer', 'showbuffer', 'clearbuffer', 'find', 'add', 'canceladd', 'done',
   ]);
   const cmd = match[1].toLowerCase();
