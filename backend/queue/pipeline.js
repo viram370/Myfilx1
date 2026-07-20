@@ -959,6 +959,7 @@ async function writeFirestoreDoc(session, item, episode, uploadResult) {
     language: session.language,
     quality: session.quality || null,
     year: session.year || null,
+    thumbnailFileId: session.thumbnailFileId || null,
     duration: item.probe?.duration || item.durationHint || 0,
     fileSizeBytes: uploadResult.size,
     published: true,
