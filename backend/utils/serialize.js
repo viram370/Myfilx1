@@ -1,3 +1,4 @@
+
 /**
  * Video Serializer
  * Converts Firestore `videos` documents into the exact object shape
@@ -82,7 +83,7 @@ async function serializeVideo(doc, { withImage = true } = {}) {
   let thumbnail = doc.thumbnail || null;
 
   if (withImage && !thumbnail) {
-    const imageFileId = doc.bannerFileId || doc.thumbFileId || doc.telegram_file_id; // fallback
+    const imageFileId = doc.thumbnailFileId || doc.bannerFileId || doc.thumbFileId || doc.telegram_file_id; // fallback
     if (imageFileId) {
       thumbnail = await resolveFileUrl(imageFileId);
     }
@@ -175,3 +176,4 @@ module.exports = {
   serializeVideos, 
   groupIntoSeasons 
 };
+
