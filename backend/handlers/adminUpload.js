@@ -127,10 +127,14 @@ function validateField(step, raw) {
 // receive `session`, not these helpers) can reach them without a race.
 let sharedSafeSendMessage = null;
 let sharedSafeEditMessageText = null;
+let sharedBot = null;
+let isAdminRef = null;
 
 function registerAdminUpload(bot, { isAdmin, safeSendMessage, safeEditMessageText }) {
   sharedSafeSendMessage = safeSendMessage;
   sharedSafeEditMessageText = safeEditMessageText;
+  sharedBot = bot;
+  isAdminRef = isAdmin;
   pipeline.setBotInstance(bot);
 
   const kindPattern = Object.keys(KIND_ALIASES).sort((a, b) => b.length - a.length).join('|');
@@ -187,6 +191,12 @@ function registerAdminUpload(bot, { isAdmin, safeSendMessage, safeEditMessageTex
     const wizard = wizards.get(chatId);
     if (!wizard) return;
 
+    // NEW — thumbnail step guard (inserted; does not alter any step logic below).
+    if (wizard.awaitingThumbnail) {
+      await safeSendMessage(chatId, '❌ Please send a valid image.');
+      return;
+    }
+
     if (wizard.stepIndex < wizard.steps.length) {
       if (isDoneTrigger) return; // ignore Done while still collecting title/season/etc.
       await handleWizardTextStep(chatId, wizard, msg.text, safeSendMessage);
@@ -214,6 +224,98 @@ function registerAdminUpload(bot, { isAdmin, safeSendMessage, safeEditMessageTex
   // origin instead of expecting forward_origin.
   bot.on('channel_post', (msg) => captureChannelEpisode(msg, 'channel_post').catch((err) => log.error('channel_post handler', 'capture failed', err, { stack: err.stack })));
   bot.on('edited_channel_post', (msg) => captureChannelEpisode(msg, 'edited_channel_post').catch((err) => log.error('edited_channel_post handler', 'capture failed', err, { stack: err.stack })));
+
+  // ---- NEW: thumbnail step (Photo / image Document only) ---------------
+  // These are separate, additive listeners — they only ever act when a
+  // wizard is sitting in the new awaitingThumbnail state, and are complete
+  // no-ops otherwise, so they never interfere with the existing video
+  // capture listeners above.
+  bot.on('photo', (msg) => handleThumbnailPhoto(msg).catch((err) => log.error('photo handler', 'thumbnail capture failed', err, { stack: err.stack })));
+  bot.on('document', (msg) => handleThumbnailDocument(msg).catch((err) => log.error('document handler', 'thumbnail capture failed', err, { stack: err.stack })));
+  bot.on('video', (msg) => handleThumbnailRejectVideo(msg).catch((err) => log.error('video handler', 'thumbnail rejection failed', err, { stack: err.stack })));
+
+  bot.on('callback_query', (query) => handleThumbnailCallback(query).catch((err) => log.error('callback_query', 'thumbnail callback failed', err, { stack: err.stack })));
+}
+
+function isImageDocument(doc) {
+  if (!doc) return false;
+  const mt = (doc.mime_type || '').toLowerCase();
+  if (mt.startsWith('image/')) return true;
+  return /\.(jpe?g|png|webp)$/i.test(doc.file_name || '');
+}
+
+async function sendThumbnailConfirmation(chatId) {
+  await sharedSafeSendMessage(chatId, '✅ Thumbnail received successfully.', {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '💾 Save Anime', callback_data: 'thumb:save' }, { text: '🔁 Replace Thumbnail', callback_data: 'thumb:replace' }],
+        [{ text: '❌ Cancel', callback_data: 'thumb:cancel' }],
+      ],
+    },
+  });
+}
+
+async function handleThumbnailPhoto(msg) {
+  const chatId = msg.chat.id;
+  if (!isAdminRef(chatId)) return;
+  const wizard = wizards.get(chatId);
+  if (!wizard || !wizard.awaitingThumbnail) return;
+  const sizes = msg.photo || [];
+  const best = sizes[sizes.length - 1];
+  if (!best) { await sharedSafeSendMessage(chatId, '❌ Please send a valid image.'); return; }
+  wizard.thumbnailFileId = best.file_id;
+  await sendThumbnailConfirmation(chatId);
+}
+
+async function handleThumbnailDocument(msg) {
+  const chatId = msg.chat.id;
+  if (!isAdminRef(chatId)) return;
+  const wizard = wizards.get(chatId);
+  if (!wizard || !wizard.awaitingThumbnail) return;
+  if (!isImageDocument(msg.document)) { await sharedSafeSendMessage(chatId, '❌ Please send a valid image.'); return; }
+  wizard.thumbnailFileId = msg.document.file_id;
+  await sendThumbnailConfirmation(chatId);
+}
+
+async function handleThumbnailRejectVideo(msg) {
+  const chatId = msg.chat.id;
+  if (!isAdminRef(chatId)) return;
+  const wizard = wizards.get(chatId);
+  if (!wizard || !wizard.awaitingThumbnail) return;
+  await sharedSafeSendMessage(chatId, '❌ Please send a valid image.');
+}
+
+async function handleThumbnailCallback(query) {
+  const chatId = query.message?.chat?.id;
+  const data = query.data || '';
+  if (!chatId || !data.startsWith('thumb:') || !isAdminRef(chatId)) return;
+
+  const wizard = wizards.get(chatId);
+  if (!wizard || !wizard.awaitingThumbnail) {
+    try { await sharedBot.answerCallbackQuery(query.id, { text: '⌛ This step has expired.', show_alert: true }); } catch (_) {}
+    return;
+  }
+
+  const action = data.slice('thumb:'.length);
+  try { await sharedBot.answerCallbackQuery(query.id); } catch (_) {}
+
+  if (action === 'replace') {
+    wizard.thumbnailFileId = null;
+    await sharedSafeSendMessage(chatId, '🖼 Please send the new anime thumbnail.');
+    return;
+  }
+  if (action === 'cancel') {
+    wizards.delete(chatId);
+    const session = pipeline.getSession(chatId);
+    if (session && !session.closed) pipeline.endSession(chatId);
+    await sharedSafeSendMessage(chatId, '❎ /add session cancelled.');
+    return;
+  }
+  if (action === 'save') {
+    if (!wizard.thumbnailFileId) { await sharedSafeSendMessage(chatId, '⚠️ Send a thumbnail image first.'); return; }
+    wizard.awaitingThumbnail = false;
+    await enterBatchMode(chatId, wizard, sharedSafeSendMessage);
+  }
 }
 
 /**
@@ -278,7 +380,22 @@ async function handleWizardTextStep(id, wizard, text, safeSendMessage) {
     return;
   }
 
-  // All fields collected — enter batch (buffering) mode.
+  // All fields collected — NEW: ask for the thumbnail before entering batch
+  // mode (per requirements). enterBatchMode() below is the exact same code
+  // that used to run directly here; it now also runs after the thumbnail
+  // is confirmed via the "Save Anime" button (see bot.on('callback_query')).
+  wizard.awaitingThumbnail = true;
+  await safeSendMessage(id, '🖼 Please send the anime thumbnail.');
+}
+
+/**
+ * NEW — factored out unchanged from the former tail of handleWizardTextStep()
+ * so both the original completion point and the post-thumbnail "Save Anime"
+ * callback can reach it identically. Behavior for the video-collection /
+ * batch-mode flow itself is byte-for-byte what it was before the thumbnail
+ * step was inserted.
+ */
+async function enterBatchMode(id, wizard, safeSendMessage) {
   const kind = wizard.kind;
   const session = pipeline.createSession(id, {
     kind,
@@ -289,6 +406,7 @@ async function handleWizardTextStep(id, wizard, text, safeSendMessage) {
     language: wizard.fields.language,
     quality: wizard.fields.quality || null,
     year: wizard.fields.year || null,
+    thumbnailFileId: wizard.thumbnailFileId || null,
     storageChannelId: process.env.STORAGE_CHANNEL_ID,
   }, {
     onProgress: makeProgressRenderer(id),
