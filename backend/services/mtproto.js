@@ -21,6 +21,14 @@ const ENTITY_CACHE_TTL_MS = 10 * 60_000;
 const MAX_CONCURRENT_STREAMS = parseInt(process.env.MAX_CONCURRENT_STREAMS || '12', 10);
 const RECONNECT_CHECK_INTERVAL_MS = 30_000;
 const DEFAULT_CHUNK_SIZE = 512 * 1024; // 512KB — Telegram-friendly, aligned chunk size
+// How many 512KB chunks downloadToFile keeps in flight simultaneously.
+// The original loop awaited one chunk at a time, so total throughput was
+// capped at chunkSize/RTT no matter how much bandwidth was available.
+// Overlapping several requests hides that per-chunk round-trip latency
+// behind the others' — real speedup, same bytes, same order on disk (see
+// downloadToFile). Kept modest by default to stay well clear of Telegram's
+// FLOOD_WAIT thresholds; override with MTPROTO_DOWNLOAD_CONCURRENCY.
+const DOWNLOAD_CONCURRENCY = Math.max(1, parseInt(process.env.MTPROTO_DOWNLOAD_CONCURRENCY || '4', 10));
 
 // ---- DC migration / retry tuning -----------------------------------
 const CHUNK_MAX_RETRIES = parseInt(process.env.MTPROTO_CHUNK_MAX_RETRIES || '5', 10);
@@ -666,44 +674,88 @@ async function downloadToFile(channelId, messageId, destPath, { onProgress } = {
   const bigInt = require('big-integer');
 
   const { doc, size } = await resolveVideoSource(channelId, messageId);
-  let fileLocation = buildFileLocation(doc); // refreshed in-place below on FILE_REFERENCE_EXPIRED
-  const out = fs.createWriteStream(destPath);
+  let fileLocation = buildFileLocation(doc); // refreshed below (shared best-effort hint) on FILE_REFERENCE_EXPIRED
+  // Larger highWaterMark = fewer, bigger write() syscalls for the same
+  // total bytes — meaningful at video file sizes, free otherwise.
+  const out = fs.createWriteStream(destPath, { highWaterMark: 1024 * 1024 });
 
-  let offset = bigInt(0);
-  let written = 0;
-  let chunkIndex = 0;
-  
   let activeDcId = doc.dcId || currentDcId || c.session.dcId;
+  // Exact total chunk count is knowable upfront because `size` (the real
+  // file size) already came back from resolveVideoSource — no need to
+  // discover EOF by trial and error the way a single sequential loop
+  // would have to.
+  const totalChunks = Math.max(1, Math.ceil(size / DEFAULT_CHUNK_SIZE));
 
-  try {
-    while (written < size) {
-      chunkIndex += 1;
-      
-      const chunkRes = await requestChunkWithRetry(c, fileLocation, offset, DEFAULT_CHUNK_SIZE, {
-        channelId, messageId, chunkIndex,
-      }, activeDcId);
-      
-      activeDcId = chunkRes.finalDcId;
-      fileLocation = chunkRes.finalFileLocation;
-      const result = chunkRes.result;
+  // Parallel/pipelined download: up to DOWNLOAD_CONCURRENCY chunk
+  // requests are kept in flight at once (see DOWNLOAD_CONCURRENCY above),
+  // but bytes are still written to `out` in strict ascending order —
+  // any chunk that resolves out of turn is buffered in `pending` until
+  // every earlier chunk has already been flushed. This can only ever
+  // change *when* a chunk's request goes out, never the order bytes land
+  // on disk, so file integrity is identical to the old sequential loop.
+  const pending = new Map(); // chunkIndex -> bytes, for arrivals that finish out of turn
+  let nextToWrite = 0;
+  let nextToFetch = 0;
+  let written = 0;
+  let firstErr = null;
 
-      if (result.className === 'upload.FileCdnRedirect') {
-        throw new Error('TELEGRAM_CDN_REDIRECT_UNSUPPORTED');
-      }
-
-      const bytes = result.bytes;
-      if (!bytes || bytes.length === 0) break;
-
-      await new Promise((resolve, reject) => {
-        out.write(bytes, (err) => (err ? reject(err) : resolve()));
-      });
-
+  const writeReadyChunks = async () => {
+    while (pending.has(nextToWrite)) {
+      const bytes = pending.get(nextToWrite);
+      pending.delete(nextToWrite);
+      await new Promise((resolve, reject) => out.write(bytes, (err) => (err ? reject(err) : resolve())));
       written += bytes.length;
-      offset = offset.add(bytes.length);
       if (onProgress) onProgress(written, size);
-      if (bytes.length < DEFAULT_CHUNK_SIZE) break;
+      nextToWrite += 1;
+    }
+  };
+
+  const fetchChunk = async (chunkIndex) => {
+    const offset = bigInt(chunkIndex * DEFAULT_CHUNK_SIZE);
+    // Always request a full DEFAULT_CHUNK_SIZE `limit`, even for the last
+    // chunk — Telegram's upload.GetFile requires size-aligned limits, and
+    // simply returns fewer bytes than requested at genuine EOF. Requesting
+    // an exact computed remainder instead would risk an unaligned/rejected
+    // request; this matches the original sequential loop's behavior.
+    const chunkRes = await requestChunkWithRetry(c, fileLocation, offset, DEFAULT_CHUNK_SIZE, {
+      channelId, messageId, chunkIndex: chunkIndex + 1,
+    }, activeDcId);
+
+    // Best-effort shared hints for the next chunk that hasn't started yet
+    // — each call is independently self-healing on migration/expired
+    // references regardless of whether these are current, so a stale
+    // read here (another worker updates it a moment later) is harmless.
+    activeDcId = chunkRes.finalDcId;
+    fileLocation = chunkRes.finalFileLocation;
+    const result = chunkRes.result;
+
+    if (result.className === 'upload.FileCdnRedirect') {
+      throw new Error('TELEGRAM_CDN_REDIRECT_UNSUPPORTED');
     }
 
+    const bytes = result.bytes || Buffer.alloc(0);
+    pending.set(chunkIndex, bytes);
+    await writeReadyChunks();
+  };
+
+  try {
+    const worker = async () => {
+      while (nextToFetch < totalChunks && !firstErr) {
+        const idx = nextToFetch;
+        nextToFetch += 1;
+        try {
+          await fetchChunk(idx);
+        } catch (err) {
+          if (!firstErr) firstErr = err;
+          return;
+        }
+      }
+    };
+
+    const workerCount = Math.min(DOWNLOAD_CONCURRENCY, totalChunks);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+    if (firstErr) throw firstErr;
     if (written !== size) {
       throw new Error(`downloadToFile: wrote ${written} of ${size} expected bytes for ${channelId}:${messageId}`);
     }
@@ -713,7 +765,7 @@ async function downloadToFile(channelId, messageId, destPath, { onProgress } = {
 
   const elapsedMs = Date.now() - startedAt;
   log.success('downloadToFile', 'Download completed', {
-    channelId, messageId, destPath, bytes: written, elapsedMs, finishedAt: new Date().toISOString(),
+    channelId, messageId, destPath, bytes: written, elapsedMs, concurrency: Math.min(DOWNLOAD_CONCURRENCY, totalChunks), finishedAt: new Date().toISOString(),
   });
 
   const fileNameAttr = (doc.attributes || []).find((a) => a.className === 'DocumentAttributeFilename');
