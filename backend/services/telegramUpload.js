@@ -251,7 +251,7 @@ async function downloadFromChannel(channelId, messageId, destPath, opts = {}) {
  * @param {number|string} fromChatId the real source channel
  * @param {number} fromMessageId the message id in that channel
  * @param {number|string} toChatId the storage channel
- * @returns {{messageId:number}}
+ * @returns {{channelId:*, messageId:number, documentId:string, accessHash:?string, size:number, mimeType:string}}
  */
 async function copyMessageToStorage(bot, fromChatId, fromMessageId, toChatId) {
   if (!bot) throw new Error('copyMessageToStorage: no bot instance available.');
@@ -272,7 +272,22 @@ async function copyMessageToStorage(bot, fromChatId, fromMessageId, toChatId) {
   }
 
   log.success('copyMessageToStorage', 'Copy completed', { fromChatId, fromMessageId, toChatId, newMessageId: messageId });
-  return { messageId };
+
+  // Resolve the copied message's own document metadata (documentId/
+  // accessHash/size/mimeType) so callers get back exactly the same shape
+  // uploadEpisode() returns — a server-side copy needs no download, no
+  // re-upload, and no local disk/RAM at all, so callers that don't need
+  // to touch the file (no re-encode requested) can skip the transfer
+  // entirely and go straight from this result to writeFirestoreDoc().
+  const { doc, size } = await mtproto.resolveVideoSource(toChatId, messageId);
+  return {
+    channelId: toChatId,
+    messageId,
+    documentId: doc.id.toString(),
+    accessHash: doc.accessHash ? doc.accessHash.toString() : null,
+    size,
+    mimeType: doc.mimeType || 'video/mp4',
+  };
 }
 
 /**
