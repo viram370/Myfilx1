@@ -19,8 +19,10 @@
  *       3. Assigns episode numbers to whatever's left (anime/webseries
  *          only), sequentially, skipping over failed/skipped items so
  *          numbering has no gaps.
- *       4. Starts the download/compress/upload queues for every item
- *          that survived validation.
+ *       4. Starts the download/upload transfer queues for every item
+ *          that survived validation. There is no compression/re-encode
+ *          stage — every item is uploaded exactly as Telegram delivered
+ *          it (see the "NO COMPRESSION" note further down).
  *   - A failure at any stage only fails THAT episode — every other
  *     episode in the batch keeps processing (tickSessionUpload's "find
  *     the next unsettled item" already skips over 'failed'/'skipped'
@@ -65,7 +67,6 @@ const os = require('os');
 const path = require('path');
 const { makeLogger } = require('../utils/logger');
 const log = makeLogger('queue/pipeline.js');
-const compress = require('../services/compress');
 const transfer = require('../services/telegramUpload');
 const { getDB, getAdmin } = require('../services/firebase');
 
@@ -73,14 +74,20 @@ const { getDB, getAdmin } = require('../services/firebase');
 // hosts (Render, containers, etc.) where the app directory's writability
 // or persistence guarantees can vary, but /tmp is always writable.
 const TEMP_DIR = path.join(os.tmpdir(), 'myflix-add-pipeline');
-const UPLOADS_DIR = path.join(TEMP_DIR, 'uploads');
-const CONVERTED_DIR = path.join(TEMP_DIR, 'converted');
+const UPLOADS_DIR = path.join(TEMP_DIR, 'uploads'); // downloaded originals — also what gets uploaded, now that there's no compression stage
+const CONVERTED_DIR = path.join(TEMP_DIR, 'converted'); // unused now (no compression output), kept/created harmlessly in case anything external still expects the folder to exist
 for (const dir of [UPLOADS_DIR, CONVERTED_DIR]) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
 const VIDEOS_COLLECTION = 'videos';
-const COMPRESS_CONCURRENCY = Math.max(1, parseInt(process.env.COMPRESS_CONCURRENCY || '1', 10));
+// No compression stage anymore — this now governs how many videos are
+// transferred (download + upload) at once. Defaults to 1 so only a single
+// video's worth of buffers/temp file ever exists at a time, which is what
+// keeps this safe to run on a low-RAM host (e.g. Render's free 512MB tier).
+// TRANSFER_CONCURRENCY is the current name; COMPRESS_CONCURRENCY is still
+// read as a fallback so an existing deployment's env vars keep working.
+const TRANSFER_CONCURRENCY = Math.max(1, parseInt(process.env.TRANSFER_CONCURRENCY || process.env.COMPRESS_CONCURRENCY || '1', 10));
 const MAX_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 1500;
 const SAFETY_TICK_MS = 2000;
@@ -112,6 +119,41 @@ function reportBucketedProgress(session, item, field, rawPercent) {
   if (b === null || item[field] === b) return;
   item[field] = b;
   Promise.resolve(session.onProgress(session)).catch(() => {});
+}
+
+/**
+ * Tracks a rolling bytes/sec figure for one transfer direction on an item.
+ * Called on every raw progress tick (not just on 10%-bucket changes) so the
+ * speed reading stays current; it's cheap in-memory arithmetic, not a
+ * Telegram call, so calling it often costs nothing. `field` is either
+ * 'downloadSpeedState' or 'uploadSpeedState'.
+ */
+function updateTransferSpeed(item, field, bytesNow) {
+  const now = Date.now();
+  let state = item[field];
+  if (!state) {
+    state = { bytes: bytesNow, ts: now, bps: 0 };
+    item[field] = state;
+    return;
+  }
+  const dtSeconds = (now - state.ts) / 1000;
+  if (dtSeconds < 0.2) return; // avoid noisy readings from back-to-back ticks
+  const deltaBytes = bytesNow - state.bytes;
+  if (deltaBytes >= 0) state.bps = deltaBytes / dtSeconds;
+  state.bytes = bytesNow;
+  state.ts = now;
+}
+
+function formatSpeed(state) {
+  if (!state || !Number.isFinite(state.bps) || state.bps <= 0) return null;
+  return `${(state.bps / (1024 * 1024)).toFixed(1)} MB/s`;
+}
+
+/** Renders a 10-block text bar like `██████░░░░` for a 0-100 percent value. */
+function renderProgressBar(percent, size = 10) {
+  const pct = Math.max(0, Math.min(100, percent || 0));
+  const filled = Math.round((pct / 100) * size);
+  return '█'.repeat(filled) + '░'.repeat(size - filled);
 }
 
 function slugify(str) {
@@ -279,9 +321,8 @@ function addItem(session, media, msg, opts = {}) {
     fileUniqueId: media.file_unique_id,
     fileSizeBytes: media.file_size || null,
     // Only present for genuine Documents (Telegram videos never carry a
-    // filename of their own) — used purely as a fallback file extension
-    // hint if compression fails outright and the original file has to be
-    // uploaded as-is instead (see runCompressJob/runForwardedFallbackJob).
+    // filename of their own) — used purely as a filename hint when
+    // building the re-uploaded file's name.
     originalFileName: media.file_name || null,
     originalMimeType: media.mime_type || null,
     // The message the direct upload itself lives in (the admin's private
@@ -290,8 +331,9 @@ function addItem(session, media, msg, opts = {}) {
     chatMessageId: msg.message_id || null,
     downloadMethod: null, // 'bot-api' | 'mtproto', set once a download starts
     downloadProgress: null, // 0-100 (10% steps), only meaningful while status === 'downloading'
-    compressProgress: null, // 0-100 (10% steps), only meaningful while status === 'compressing'
+    downloadSpeedState: null, // { bytes, ts, bps } rolling speed tracker for the live progress message
     uploadProgress: null, // 0-100 (10% steps), only meaningful while status === 'uploading'
+    uploadSpeedState: null, // { bytes, ts, bps } rolling speed tracker for the live progress message
     startedAt: null, // Date.now() when this item's processing (download) began
     finishedAt: null, // Date.now() when this item reached a terminal state
     durationHint: media.duration || 0,
@@ -300,16 +342,16 @@ function addItem(session, media, msg, opts = {}) {
     sourceType: channelOrigin ? 'forwarded' : 'direct',
     forwardChatId: channelOrigin ? channelOrigin.chatId : null,
     forwardMessageId: channelOrigin ? channelOrigin.messageId : null,
-    status: 'buffered', // buffered -> [validation: failed|skipped|waiting] -> downloading -> compressing -> ready -> uploading -> done | failed
-    attempts: { copy: 0, compress: 0, upload: 0 },
+    // No compression stage anymore: buffered -> [validation: failed|skipped|waiting] -> downloading -> ready -> uploading -> done | failed
+    status: 'buffered',
+    attempts: { copy: 0, compress: 0, upload: 0 }, // field names kept for compatibility with existing logging/metrics
     episode: null,
     tempIn: null,
-    tempOut: null,
-    probe: null,
+    tempOut: null, // now always the same path as tempIn — kept as a separate field only so uploadPreparedFile()'s "file ready to upload" reference doesn't need renaming throughout
+    probe: null, // no longer populated (no ffprobe pass) — duration/width/height always come from durationHint/widthHint/heightHint (Telegram's own metadata) instead
     error: null,
     uploading: false,
-    usedOriginalFallback: false, // always false now — compress.processFile() either produces a verified H.264/AAC MP4 or the item fails outright (see runCompressJob/runForwardedFallbackJob); kept only so resolveExtension()/logging below don't need changes
-    tempThumb: null,
+    tempThumb: null, // no longer populated (no ffmpeg thumbnail extraction) — always uploads without a custom thumb
   };
   session.items.push(item);
 
@@ -319,14 +361,14 @@ function addItem(session, media, msg, opts = {}) {
     fileUniqueId: item.fileUniqueId, fileSizeBytes: item.fileSizeBytes,
   });
 
-  // Deliberately does nothing else — no compressQueue push, no
+  // Deliberately does nothing else — no transferQueue push, no
   // pumpUploadQueue call. Processing only begins in startBatch().
   return item;
 }
 
 // ============================================================================
 // BATCH LOCK — step 2 of the batch-commit workflow. Validates, dedupes,
-// numbers, and only THEN starts the download/compress/upload queues.
+// numbers, and only THEN starts the download/upload transfer queues.
 // ============================================================================
 
 /**
@@ -372,26 +414,19 @@ async function startBatch(chatId) {
   for (const item of session.items) {
     if (item.status !== 'validated') continue;
     item.status = 'waiting';
-    // FIX ("bot always uploads the exact same file the user uploaded"):
-    // this used to send 'forwarded' items (i.e. the common case — a video
-    // forwarded to the bot from a channel) straight to 'ready' so the
-    // publish step could try a zero-download Telegram server-side
-    // copyMessage() first. That copy is literally byte-identical to the
-    // source message — it never runs FFmpeg, never re-encodes, never
-    // regenerates a thumbnail, and never goes through the
-    // verifyOutputFile()/DocumentAttributeVideo checks the rest of this
-    // pipeline relies on. Since most admin uploads ARE forwards, that
-    // fast path was silently skipping compression for the majority of
-    // episodes — exactly the bug reported. Every item, forwarded or
-    // direct, now always goes through download -> compress (FFmpeg,
-    // verified) -> upload. See runForwardedFallbackJob/runCompressJob.
+    // No compression stage anymore — every upload is the exact original
+    // file, whether it gets there via a straight download+reupload or via
+    // a zero-download Telegram server-side copy (forwarded items try that
+    // first; see runForwardedTransferJob). Either way the result is
+    // byte-identical to the source, so there's no compatibility mismatch
+    // between the two paths to worry about.
     if (item.sourceType === 'forwarded') {
       forwardedFallbackQueue.push({ chatId: session.chatId, seq: item.seq });
     } else {
-      compressQueue.push({ chatId: session.chatId, seq: item.seq });
+      transferQueue.push({ chatId: session.chatId, seq: item.seq });
     }
   }
-  pumpCompressQueue();
+  pumpTransferQueue();
   pumpForwardedFallbackQueue();
   pumpUploadQueue();
   await maybeCompleteSession(session); // covers the edge case where every item failed/was skipped in validation
@@ -478,18 +513,18 @@ async function assignEpisodeNumbers(session) {
 // copy-first path in the publish queue below.
 // ============================================================================
 
-const compressQueue = [];
-let compressActive = 0;
+const transferQueue = [];
+let transferActive = 0;
 
-function pumpCompressQueue() {
-  while (compressActive < COMPRESS_CONCURRENCY && compressQueue.length > 0) {
-    const job = compressQueue.shift();
-    compressActive++;
-    runCompressJob(job)
-      .catch((err) => log.error('pumpCompressQueue', 'Unhandled compress job error', err, { ...job, stack: err.stack }))
+function pumpTransferQueue() {
+  while (transferActive < TRANSFER_CONCURRENCY && transferQueue.length > 0) {
+    const job = transferQueue.shift();
+    transferActive++;
+    runDirectTransferJob(job)
+      .catch((err) => log.error('pumpTransferQueue', 'Unhandled transfer job error', err, { ...job, stack: err.stack }))
       .finally(() => {
-        compressActive--;
-        pumpCompressQueue();
+        transferActive--;
+        pumpTransferQueue();
       });
   }
 }
@@ -509,19 +544,7 @@ function cleanupFile(p) {
  * just means the upload proceeds without a custom thumbnail (Telegram
  * still gets a chance to generate its own).
  */
-async function tryGenerateThumbnail(chatId, seq, stamp, item, callerLabel) {
-  const thumbPath = path.join(CONVERTED_DIR, `${stamp}.jpg`);
-  try {
-    await compress.generateThumbnail(item.tempOut, thumbPath, (item.probe && item.probe.duration) || item.durationHint || 0);
-    return thumbPath;
-  } catch (err) {
-    log.warn(callerLabel, 'Thumbnail generation failed — uploading without a custom thumbnail', { chatId, seq, reason: err.message });
-    cleanupFile(thumbPath);
-    return null;
-  }
-}
-
-async function runCompressJob({ chatId, seq }) {
+async function runDirectTransferJob({ chatId, seq }) {
   const session = sessions.get(chatId);
   if (!session || session.closed) return;
   const item = session.items[seq];
@@ -529,17 +552,16 @@ async function runCompressJob({ chatId, seq }) {
 
   const stamp = `${chatId}_${seq}_${Date.now()}`;
   const inPath = path.join(UPLOADS_DIR, `${stamp}.src`);
-  const outPath = path.join(CONVERTED_DIR, `${stamp}.mp4`);
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    item.attempts.compress = attempt;
+    item.attempts.compress = attempt; // field name kept for compatibility with anything reading it; this is now the one-and-only transfer attempt counter
     try {
       item.status = 'downloading';
       item.downloadProgress = 0;
-      item.compressProgress = null;
+      item.downloadSpeedState = null;
       item.downloadMethod = 'bot-api'; // 'direct' items ALWAYS use the Bot API — never MTProto
       if (!item.startedAt) item.startedAt = Date.now();
-      log.info('runCompressJob', `Download started (attempt ${attempt}/${MAX_ATTEMPTS})`, {
+      log.info('runDirectTransferJob', `Download started (attempt ${attempt}/${MAX_ATTEMPTS})`, {
         chatId, seq, sourceType: item.sourceType, pipeline: 'bot-api', fileId: item.fileId, fileSizeBytes: item.fileSizeBytes,
       });
       await session.onProgress(session, { force: true });
@@ -547,66 +569,30 @@ async function runCompressJob({ chatId, seq }) {
       await transfer.downloadViaBotApi(botInstance, item.fileId, inPath, {
         onProgress: (written, total) => {
           if (!total) return;
+          updateTransferSpeed(item, 'downloadSpeedState', written);
           reportBucketedProgress(session, item, 'downloadProgress', (written / total) * 100);
         },
       });
+      // No compression stage — the file downloaded here is exactly what
+      // gets uploaded. item.tempOut is kept (rather than renaming every
+      // downstream reference) as "the file ready to upload"; it's simply
+      // now always the same path as item.tempIn.
       item.tempIn = inPath;
+      item.tempOut = inPath;
       item.downloadProgress = 100;
-      log.success('runCompressJob', 'Download completed', { chatId, seq, path: inPath, method: 'bot-api' });
-
-      item.status = 'compressing';
-      item.downloadProgress = null;
-      item.compressProgress = 0;
-      log.info('runCompressJob', 'Compression started', { chatId, seq });
-      await session.onProgress(session, { force: true });
-
-      let info;
-      try {
-        info = await compress.processFile(inPath, outPath, ({ percent }) => {
-          reportBucketedProgress(session, item, 'compressProgress', percent);
-        });
-        item.tempOut = outPath;
-      } catch (compressErr) {
-        // FIX: this used to fall back to uploading the raw, unconverted
-        // original file whenever every FFmpeg strategy failed — which
-        // meant an MKV/HEVC/whatever-codec source that couldn't be fixed
-        // still got uploaded and saved to Firestore as if it were a
-        // normal successful episode, silently reproducing the exact
-        // "black screen, audio only" (or fully unplayable) bug this
-        // pipeline exists to prevent. compress.processFile() has already
-        // exhausted every remux/transcode/drop-subtitles/drop-audio tier
-        // and verified each attempt with ffprobe — there is no compatible
-        // file to fall back to. Treat this as a real stage failure: the
-        // outer attempt loop below retries the whole download+compress
-        // from scratch (a corrupt partial download is a plausible cause),
-        // and if every attempt fails the item is marked 'failed' — never
-        // 'done' — while every other episode in the batch keeps going.
-        cleanupFile(outPath);
-        throw compressErr;
-      }
-      item.probe = info;
-      item.compressProgress = 100;
-      log.success('runCompressJob', 'Compression stage finished', {
-        chatId, seq, mode: info.mode, duration: info.duration,
-        originalFile: inPath, compressedFile: outPath,
-      });
-
-      item.tempThumb = await tryGenerateThumbnail(chatId, seq, stamp, item, 'runCompressJob');
+      log.success('runDirectTransferJob', 'Download completed — uploading original file unmodified (no re-encoding)', { chatId, seq, path: inPath, method: 'bot-api' });
 
       item.status = 'ready';
-      item.compressProgress = null;
       await session.onProgress(session, { force: true });
       pumpUploadQueue();
       return;
     } catch (err) {
       const tooBig = /too big/i.test(err.message || '');
-      log.error('runCompressJob', `Attempt ${attempt}/${MAX_ATTEMPTS} failed`, err, { chatId, seq, stack: err.stack });
+      log.error('runDirectTransferJob', `Attempt ${attempt}/${MAX_ATTEMPTS} failed`, err, { chatId, seq, stack: err.stack });
       cleanupFile(inPath);
-      cleanupFile(outPath);
       item.tempIn = null;
       item.tempOut = null;
       item.downloadProgress = null;
-      item.compressProgress = null;
 
       // A "too big" rejection from the Bot API can never succeed on retry
       // (there is no MTProto fallback for a direct upload) — fail fast.
@@ -614,9 +600,9 @@ async function runCompressJob({ chatId, seq }) {
         // Only THIS episode fails — the batch and every other episode
         // keep going (tickSessionUpload skips terminal-status items).
         item.status = 'failed';
-        item.error = tooBig ? err.message : `Download/compression failed after ${MAX_ATTEMPTS} attempts: ${err.message}`;
+        item.error = tooBig ? err.message : `Download failed after ${MAX_ATTEMPTS} attempts: ${err.message}`;
         item.finishedAt = Date.now();
-        log.error('runCompressJob', 'Failed', new Error(item.error), { chatId, seq });
+        log.error('runDirectTransferJob', 'Failed', new Error(item.error), { chatId, seq });
         await session.onProgress(session, { force: true });
         await maybeCompleteSession(session);
         pumpUploadQueue();
@@ -670,19 +656,19 @@ async function tickSessionUpload(session) {
   pumpUploadQueue(); // immediately check whether the next item is also ready
 }
 
-// ---- download+compress for 'forwarded' items (videos forwarded to the ----
-// bot from a channel) — always via MTProto, using the REAL source channel
-// (item.forwardChatId/forwardMessageId), never Bot API, never a private
-// chat id. This is the ONLY path forwarded items take now — there is no
-// more zero-compression server-side copy shortcut (see startBatch).
+// ---- transfer for 'forwarded' items (videos forwarded to the bot from ----
+// a channel) — tries a zero-download server-side copy first, falling back
+// to a real MTProto download+re-upload. Always uses the REAL source
+// channel (item.forwardChatId/forwardMessageId), never Bot API, never a
+// private chat id. See runForwardedTransferJob for both paths.
 const forwardedFallbackQueue = [];
 let forwardedFallbackActive = 0;
 
 function pumpForwardedFallbackQueue() {
-  while (forwardedFallbackActive < COMPRESS_CONCURRENCY && forwardedFallbackQueue.length > 0) {
+  while (forwardedFallbackActive < TRANSFER_CONCURRENCY && forwardedFallbackQueue.length > 0) {
     const job = forwardedFallbackQueue.shift();
     forwardedFallbackActive++;
-    runForwardedFallbackJob(job)
+    runForwardedTransferJob(job)
       .catch((err) => log.error('pumpForwardedFallbackQueue', 'Unhandled fallback job error', err, { ...job, stack: err.stack }))
       .finally(() => {
         forwardedFallbackActive--;
@@ -691,82 +677,87 @@ function pumpForwardedFallbackQueue() {
   }
 }
 
-async function runForwardedFallbackJob({ chatId, seq }) {
+async function runForwardedTransferJob({ chatId, seq }) {
   const session = sessions.get(chatId);
   if (!session || session.closed) return;
   const item = session.items[seq];
   if (!item) return;
 
+  if (!item.startedAt) item.startedAt = Date.now();
+
+  // ---- Fast path: server-side copy, zero download/upload ----------------
+  // With no compression stage, a straight Telegram-side copy of the source
+  // message into the storage channel produces exactly the same result as
+  // download-then-reupload — but spends no bandwidth, no disk, and no RAM
+  // on this item at all. Tried once; anything short of success (bot isn't
+  // an admin of the source channel, message is gone, transient error...)
+  // falls straight through to the normal MTProto download+upload path
+  // below, which has its own full retry handling.
+  item.status = 'downloading'; // no separate "copying" UI state — same visible step either way
+  item.downloadMethod = 'server-copy';
+  await session.onProgress(session, { force: true });
+
+  try {
+    const copyResult = await transfer.copyMessageToStorage(botInstance, item.forwardChatId, item.forwardMessageId, session.storageChannelId);
+    log.success('runForwardedTransferJob', 'Server-side copy succeeded — no download/upload needed for this item', {
+      chatId, seq, channelId: item.forwardChatId, messageId: item.forwardMessageId, newMessageId: copyResult.messageId,
+    });
+
+    await writeFirestoreDoc(session, item, item.episode, copyResult);
+    item.status = 'done';
+    item.finishedAt = Date.now();
+    log.success('runForwardedTransferJob', 'Completed via server-side copy', { chatId, seq, episode: item.episode });
+    await session.onProgress(session, { force: true });
+    await maybeCompleteSession(session);
+    pumpUploadQueue(); // lets the strict-FIFO upload cursor skip past this now-terminal item
+    return;
+  } catch (copyErr) {
+    log.warn('runForwardedTransferJob', 'Server-side copy not possible — falling back to download+upload', {
+      chatId, seq, reason: copyErr.message,
+    });
+  }
+
+  // ---- Fallback: real MTProto download, then re-upload -------------------
   const stamp = `${chatId}_${seq}_${Date.now()}`;
   const inPath = path.join(UPLOADS_DIR, `${stamp}.src`);
-  const outPath = path.join(CONVERTED_DIR, `${stamp}.mp4`);
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    item.attempts.compress = attempt;
+    item.attempts.compress = attempt; // field name kept for compatibility with anything reading it; this is now the one-and-only transfer attempt counter
     try {
       item.status = 'downloading';
       item.downloadProgress = 0;
-      item.compressProgress = null;
+      item.downloadSpeedState = null;
       item.downloadMethod = 'mtproto'; // 'forwarded' items ALWAYS use MTProto with the real channel
-      if (!item.startedAt) item.startedAt = Date.now();
-      log.info('runForwardedFallbackJob', `Download started (attempt ${attempt}/${MAX_ATTEMPTS})`, {
+      log.info('runForwardedTransferJob', `Download started (attempt ${attempt}/${MAX_ATTEMPTS})`, {
         chatId, seq, sourceType: item.sourceType, pipeline: 'mtproto',
         channelId: item.forwardChatId, messageId: item.forwardMessageId,
       });
       await session.onProgress(session, { force: true });
 
-      const onProgress = (written, total) => {
-        if (!total) return;
-        reportBucketedProgress(session, item, 'downloadProgress', (written / total) * 100);
-      };
-      await transfer.downloadFromChannel(item.forwardChatId, item.forwardMessageId, inPath, { onProgress });
-      item.tempIn = inPath;
-      item.downloadProgress = 100;
-      log.success('runForwardedFallbackJob', 'Download completed', { chatId, seq, path: inPath, method: 'mtproto' });
-
-      item.status = 'compressing';
-      item.downloadProgress = null;
-      item.compressProgress = 0;
-      log.info('runForwardedFallbackJob', 'Compression started', { chatId, seq });
-      await session.onProgress(session, { force: true });
-
-      let info;
-      try {
-        info = await compress.processFile(inPath, outPath, ({ percent }) => {
-          reportBucketedProgress(session, item, 'compressProgress', percent);
-        });
-        item.tempOut = outPath;
-      } catch (compressErr) {
-        // See the matching comment in runCompressJob: never fall back to
-        // uploading the raw, unverified original file — that silently
-        // reproduces the "black screen / unplayable" bug this pipeline
-        // exists to prevent. Fail the stage instead; the outer attempt
-        // loop retries the whole download+compress from scratch.
-        cleanupFile(outPath);
-        throw compressErr;
-      }
-      item.probe = info;
-      item.compressProgress = 100;
-      log.success('runForwardedFallbackJob', 'Compression stage finished', {
-        chatId, seq, mode: info.mode, duration: info.duration,
-        originalFile: inPath, compressedFile: outPath,
+      await transfer.downloadFromChannel(item.forwardChatId, item.forwardMessageId, inPath, {
+        onProgress: (written, total) => {
+          if (!total) return;
+          updateTransferSpeed(item, 'downloadSpeedState', written);
+          reportBucketedProgress(session, item, 'downloadProgress', (written / total) * 100);
+        },
       });
-
-      item.tempThumb = await tryGenerateThumbnail(chatId, seq, stamp, item, 'runForwardedFallbackJob');
+      // No compression stage — the file downloaded here is exactly what
+      // gets uploaded (same pattern as runDirectTransferJob).
+      item.tempIn = inPath;
+      item.tempOut = inPath;
+      item.downloadProgress = 100;
+      log.success('runForwardedTransferJob', 'Download completed — uploading original file unmodified (no re-encoding)', { chatId, seq, path: inPath, method: 'mtproto' });
 
       item.status = 'ready';
-      item.compressProgress = null;
       await session.onProgress(session, { force: true });
       pumpUploadQueue();
       return;
     } catch (err) {
-      log.error('runForwardedFallbackJob', `Attempt ${attempt}/${MAX_ATTEMPTS} failed`, err, { chatId, seq, stack: err.stack });
+      log.error('runForwardedTransferJob', `Attempt ${attempt}/${MAX_ATTEMPTS} failed`, err, { chatId, seq, stack: err.stack });
       cleanupFile(inPath);
-      cleanupFile(outPath);
       item.tempIn = null;
       item.tempOut = null;
       item.downloadProgress = null;
-      item.compressProgress = null;
 
       // A verified-source failure (deleted message / wrong channel / no
       // media) can never succeed on retry — fail fast with the SPECIFIC
@@ -776,9 +767,9 @@ async function runForwardedFallbackJob({ chatId, seq }) {
 
       if (attempt >= MAX_ATTEMPTS || isSourceError) {
         item.status = 'failed';
-        item.error = isSourceError ? err.message : `Download/compression failed after ${MAX_ATTEMPTS} attempts: ${err.message}`;
+        item.error = isSourceError ? err.message : `Download failed after ${MAX_ATTEMPTS} attempts: ${err.message}`;
         item.finishedAt = Date.now();
-        log.error('runForwardedFallbackJob', 'Failed', new Error(item.error), { chatId, seq });
+        log.error('runForwardedTransferJob', 'Failed', new Error(item.error), { chatId, seq });
         await session.onProgress(session, { force: true });
         await maybeCompleteSession(session);
         pumpUploadQueue();
@@ -790,57 +781,35 @@ async function runForwardedFallbackJob({ chatId, seq }) {
 }
 
 async function uploadPreparedFile(session, item) {
-  // DEFENSIVE GUARD: uploadEpisode() must never receive the original
-  // downloaded file. item.tempOut is only ever assigned the FFmpeg output
-  // path (see runCompressJob/runForwardedFallbackJob) — this is a hard
-  // stop, not a soft warning, in case some future change reintroduces a
-  // path that sets tempOut back to tempIn (which is exactly the bug that
-  // was reported: a code path setting tempOut = inPath after compression
-  // "failed" and silently uploading the untouched source).
-  if (item.tempOut && item.tempIn && path.resolve(item.tempOut) === path.resolve(item.tempIn)) {
-    item.status = 'failed';
-    item.error = 'Internal error: the compressed output path was identical to the original download path — refusing to upload the original file.';
-    item.finishedAt = Date.now();
-    log.error('uploadPreparedFile', 'BUG GUARD TRIPPED — tempOut === tempIn, refusing to upload the original file', new Error(item.error), {
-      chatId: session.chatId, seq: item.seq, tempIn: item.tempIn, tempOut: item.tempOut,
-    });
-    await session.onProgress(session, { force: true });
-    return;
-  }
-
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     item.attempts.upload = attempt;
     try {
       item.status = 'uploading';
       item.uploadProgress = 0;
+      item.uploadSpeedState = null;
       const uploadStartedAt = Date.now();
       let localFileSizeBytes = null;
       try { localFileSizeBytes = fs.statSync(item.tempOut).size; } catch (_) { /* logged as null, uploadEpisode will hard-fail if the file is truly gone */ }
 
-      // Exactly what was requested for debugging this class of bug: the
-      // original downloaded path, the FFmpeg-compressed path, and —
-      // explicitly labeled — which one is actually about to be uploaded.
-      // If "Uploading" here ever shows the original path, that's the bug.
-      log.info('uploadPreparedFile', 'Path check before upload', {
-        chatId: session.chatId, seq: item.seq,
-        originalFile: item.tempIn,
-        compressedFile: item.tempOut,
-        uploading: item.tempOut,
-      });
       log.info('uploadPreparedFile', `Upload started (attempt ${attempt}/${MAX_ATTEMPTS})`, {
         chatId: session.chatId, seq: item.seq, sourceType: item.sourceType, pipeline: 'mtproto-upload',
-        localFileSizeBytes,
+        uploading: item.tempOut, localFileSizeBytes,
       });
       await session.onProgress(session, { force: true });
 
       const fileName = buildFileName(session, item, item.episode);
       const result = await transfer.uploadEpisode(session.storageChannelId, item.tempOut, {
         fileName,
-        duration: item.probe?.duration || item.durationHint || 0,
-        width: item.probe?.width || item.widthHint || 0,
-        height: item.probe?.height || item.heightHint || 0,
-        thumbPath: item.tempThumb || undefined,
-        onProgress: (percent) => reportBucketedProgress(session, item, 'uploadProgress', percent),
+        // No ffprobe pass anymore — duration/width/height always come
+        // straight from Telegram's own metadata on the source message.
+        duration: item.durationHint || 0,
+        width: item.widthHint || 0,
+        height: item.heightHint || 0,
+        thumbPath: undefined, // no ffmpeg-generated thumbnail anymore
+        onProgress: (percent) => {
+          if (Number.isFinite(localFileSizeBytes)) updateTransferSpeed(item, 'uploadSpeedState', Math.round((percent / 100) * localFileSizeBytes));
+          reportBucketedProgress(session, item, 'uploadProgress', percent);
+        },
       });
       item.uploadProgress = 100;
       log.success('uploadPreparedFile', 'Upload completed', {
@@ -855,8 +824,6 @@ async function uploadPreparedFile(session, item) {
       item.uploadProgress = null;
       item.finishedAt = Date.now();
       cleanupFile(item.tempIn);
-      cleanupFile(item.tempOut);
-      cleanupFile(item.tempThumb);
       const totalElapsedMs = item.startedAt ? item.finishedAt - item.startedAt : null;
       const mem = process.memoryUsage();
       log.success('uploadPreparedFile', 'Completed', {
@@ -878,8 +845,6 @@ async function uploadPreparedFile(session, item) {
         item.finishedAt = Date.now();
         log.error('uploadPreparedFile', 'Failed', new Error(item.error), { chatId: session.chatId, seq: item.seq });
         cleanupFile(item.tempIn);
-        cleanupFile(item.tempOut);
-        cleanupFile(item.tempThumb);
         await session.onProgress(session, { force: true });
         return;
       }
@@ -888,24 +853,30 @@ async function uploadPreparedFile(session, item) {
   }
 }
 
-/** Maps a probed container format name to a reasonable file extension for the original-file fallback path. */
-function extensionForContainer(containerFormat) {
-  const f = (containerFormat || '').toLowerCase();
-  if (f.includes('matroska') || f.includes('webm')) return f.includes('webm') ? '.webm' : '.mkv';
-  if (f.includes('quicktime') || f.includes('mov')) return '.mov';
-  if (f.includes('avi')) return '.avi';
-  if (f.includes('mpegts')) return '.ts';
-  if (f.includes('mp4') || f.includes('m4a') || f.includes('3gp')) return '.mp4';
+/** Maps a Telegram mimeType to a reasonable file extension. */
+function extensionForMimeType(mimeType) {
+  const m = (mimeType || '').toLowerCase();
+  if (m.includes('matroska')) return '.mkv';
+  if (m.includes('webm')) return '.webm';
+  if (m.includes('quicktime')) return '.mov';
+  if (m === 'video/x-msvideo') return '.avi';
+  if (m.includes('mp2t')) return '.ts';
+  if (m.includes('mp4')) return '.mp4';
   return null;
 }
 
+/**
+ * No compression/remux stage anymore — every upload is the original file
+ * exactly as Telegram delivered it, so the extension has to come from
+ * what Telegram told us about the source (filename, then mimeType),
+ * never assumed to always be MP4.
+ */
 function resolveExtension(item) {
-  if (!item.usedOriginalFallback) return '.mp4'; // normal path — compress.js always produces a real MP4
   if (item.originalFileName) {
     const ext = path.extname(item.originalFileName);
     if (ext) return ext;
   }
-  return extensionForContainer(item.probe && item.probe.container) || '.mp4';
+  return extensionForMimeType(item.originalMimeType) || '.mp4';
 }
 
 function buildFileName(session, item, episode) {
@@ -960,7 +931,7 @@ async function writeFirestoreDoc(session, item, episode, uploadResult) {
     quality: session.quality || null,
     year: session.year || null,
     thumbnailFileId: session.thumbnailFileId || null,
-    duration: item.probe?.duration || item.durationHint || 0,
+    duration: item.durationHint || 0,
     fileSizeBytes: uploadResult.size,
     published: true,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -980,10 +951,9 @@ const STATUS_ICON = {
   validated: '📦',
   waiting: '⏳',
   copying: '🔗',
-  downloading: '📥',
-  compressing: '⚙',
+  downloading: '⬇️',
   ready: '📦',
-  uploading: '📤',
+  uploading: '⬆️',
   done: '✅',
   failed: '❌',
   skipped: '⏭',
@@ -994,7 +964,6 @@ const STATUS_LABEL = {
   waiting: 'Waiting...',
   copying: 'Copying from channel...',
   downloading: 'Downloading...',
-  compressing: 'Compressing...',
   ready: 'Queued...',
   uploading: 'Uploading...',
   done: 'Completed',
@@ -1010,12 +979,13 @@ function episodeLabel(session, item) {
 /**
  * Renders one item's block in the single, repeatedly-edited progress
  * message, in the requested format:
- *   📦 Episode 1
- *   Downloading...
- *   30%
- * — only the phase name and the current 10%-stepped percent are shown
- * (not a history of every percent it passed through), because this whole
- * block gets replaced in place on every edit.
+ *   ⬇️ Downloading...
+ *   ██████░░░░ 63%
+ *   Speed: 24.8 MB/s
+ * — only the current 10%-stepped percent and the latest speed reading are
+ * shown (not a history of every value passed through), because this whole
+ * block gets replaced in place on every edit. No "Compressing" phase
+ * exists anymore — every item goes straight from Downloading to Uploading.
  */
 function renderItemBlock(session, item) {
   const icon = STATUS_ICON[item.status] || '❓';
@@ -1023,7 +993,8 @@ function renderItemBlock(session, item) {
   const lines = [`${icon} <b>${escapeHtml(label)}</b>`];
 
   if (item.status === 'done') {
-    lines[0] = `✅ <b>${escapeHtml(label)} Completed</b>`;
+    lines[0] = `✅ <b>${escapeHtml(label)}</b>`;
+    lines.push('✅ Upload completed.');
     return lines.join('\n');
   }
 
@@ -1039,19 +1010,28 @@ function renderItemBlock(session, item) {
     return lines.join('\n');
   }
 
-  const statusText = STATUS_LABEL[item.status] || item.status;
-  lines.push(statusText);
-
   if (item.status === 'downloading' && typeof item.downloadProgress === 'number') {
-    lines.push(`${item.downloadProgress}%${item.downloadMethod === 'mtproto' ? ' (via channel)' : ''}`);
-  } else if (item.status === 'compressing' && typeof item.compressProgress === 'number') {
-    lines.push(`${item.compressProgress}%`);
-  } else if (item.status === 'uploading' && typeof item.uploadProgress === 'number') {
-    lines.push(`${item.uploadProgress}%`);
-  } else if (item.status === 'copying') {
-    lines.push('Please wait...');
+    lines.push('⬇️ Downloading...');
+    lines.push(`${renderProgressBar(item.downloadProgress)} ${item.downloadProgress}%`);
+    const speed = formatSpeed(item.downloadSpeedState);
+    if (speed) lines.push(`Speed: ${speed}`);
+    return lines.join('\n');
   }
 
+  if (item.status === 'uploading' && typeof item.uploadProgress === 'number') {
+    lines.push('⬆️ Uploading...');
+    lines.push(`${renderProgressBar(item.uploadProgress)} ${item.uploadProgress}%`);
+    const speed = formatSpeed(item.uploadSpeedState);
+    if (speed) lines.push(`Speed: ${speed}`);
+    return lines.join('\n');
+  }
+
+  if (item.status === 'copying') {
+    lines.push('Please wait...');
+    return lines.join('\n');
+  }
+
+  lines.push(STATUS_LABEL[item.status] || item.status);
   return lines.join('\n');
 }
 
