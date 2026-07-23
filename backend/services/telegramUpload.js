@@ -27,15 +27,19 @@
  *   client (services/mtproto.js), which is logged in as this bot via
  *   botAuthToken and is not subject to the Bot API's download cap.
  *
- *   copyMessageToStorage(bot, fromChatId, fromMessageId, toChatId) — for
- *   the same real-channel case above: asks Telegram to copy the message
- *   server-side directly into the storage channel, no download at all.
- *   Tried first; downloadFromChannel is the fallback if it isn't possible.
- *
- *   uploadEpisode(targetChannelId, filePath, opts) — pushes a locally
- *   compressed file into the storage channel (a real channel) over the
+ *   uploadEpisode(targetChannelId, filePath, opts) — pushes the locally
+ *   downloaded file into the storage channel (a real channel) over the
  *   MTProto client, which chunks large uploads automatically and isn't
  *   subject to the Bot API's ~50MB send limit.
+ *
+ * HARD RULE — no copyMessage/forwardMessage for videos, ever: this module
+ * used to also expose copyMessageToStorage(), a server-side
+ * bot.copyMessage() shortcut that skipped downloading entirely. It has
+ * been removed. Every video, no exceptions, goes through the real
+ * download -> verify -> upload -> delete-temp-file pipeline below and in
+ * queue/pipeline.js — copyMessage/forwardMessage produced incorrect/
+ * unusable results for this workflow and must never be reintroduced as
+ * a "fast path".
  * ----------------------------------------------------------------------
  */
 'use strict';
@@ -237,57 +241,6 @@ async function downloadFromChannel(channelId, messageId, destPath, opts = {}) {
     channelId, messageId, destPath, bytes: result.size, elapsedMs, finishedAt: new Date().toISOString(),
   });
   return { path: destPath, size: result.size };
-}
-
-/**
- * Attempts a server-side copy of a channel video straight into the
- * storage channel, with no download at all. `fromChatId` must be a real
- * channel id (see downloadFromChannel's contract above). Throws if the
- * bot can't see the source chat/message (e.g. it isn't a member of that
- * channel) — callers should catch this and fall back to
- * downloadFromChannel.
- *
- * @param {import('node-telegram-bot-api')} bot
- * @param {number|string} fromChatId the real source channel
- * @param {number} fromMessageId the message id in that channel
- * @param {number|string} toChatId the storage channel
- * @returns {{channelId:*, messageId:number, documentId:string, accessHash:?string, size:number, mimeType:string}}
- */
-async function copyMessageToStorage(bot, fromChatId, fromMessageId, toChatId) {
-  if (!bot) throw new Error('copyMessageToStorage: no bot instance available.');
-
-  log.info('copyMessageToStorage', 'Attempting server-side copy', { fromChatId, fromMessageId, toChatId });
-
-  let result;
-  try {
-    result = await bot.copyMessage(toChatId, fromChatId, fromMessageId);
-  } catch (err) {
-    log.error('copyMessageToStorage', 'copyMessage failed', err, { fromChatId, fromMessageId, toChatId, stack: err.stack });
-    throw new Error(`Telegram copyMessage failed: ${err.message}`);
-  }
-
-  const messageId = typeof result === 'object' && result !== null ? result.message_id : result;
-  if (!messageId) {
-    throw new Error('copyMessage returned no message_id.');
-  }
-
-  log.success('copyMessageToStorage', 'Copy completed', { fromChatId, fromMessageId, toChatId, newMessageId: messageId });
-
-  // Resolve the copied message's own document metadata (documentId/
-  // accessHash/size/mimeType) so callers get back exactly the same shape
-  // uploadEpisode() returns — a server-side copy needs no download, no
-  // re-upload, and no local disk/RAM at all, so callers that don't need
-  // to touch the file (no re-encode requested) can skip the transfer
-  // entirely and go straight from this result to writeFirestoreDoc().
-  const { doc, size } = await mtproto.resolveVideoSource(toChatId, messageId);
-  return {
-    channelId: toChatId,
-    messageId,
-    documentId: doc.id.toString(),
-    accessHash: doc.accessHash ? doc.accessHash.toString() : null,
-    size,
-    mimeType: doc.mimeType || 'video/mp4',
-  };
 }
 
 /**
@@ -536,7 +489,6 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
 module.exports = {
   downloadViaBotApi,
   downloadFromChannel,
-  copyMessageToStorage,
   uploadEpisode,
   BOT_API_DOWNLOAD_LIMIT_BYTES,
 };
