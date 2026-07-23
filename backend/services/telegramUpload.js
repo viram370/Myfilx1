@@ -246,12 +246,18 @@ async function downloadFromChannel(channelId, messageId, destPath, opts = {}) {
 /**
  * @param {string|number} targetChannelId storage channel to upload into
  * @param {string} filePath local path of the converted MP4
- * @param {{fileName?:string, caption?:string, duration?:number, width?:number, height?:number, mimeType?:string, onProgress?:(fraction:number)=>void}} opts
+ * @param {{fileName?:string, caption?:string, duration?:number, width?:number, height?:number, mimeType?:string, videoCodec?:string, audioCodec?:string, container?:string, onProgress?:(fraction:number)=>void}} opts
  *   duration/width/height MUST be real, ffprobe-verified values (see
  *   queue/pipeline.js#verifyDownloadedFile) — never an unverified hint
  *   from Telegram's own message metadata. Sending 0/absent values here
  *   is the single most common reason Telegram stores an upload as a
  *   plain document instead of playable video media.
+ *   videoCodec/audioCodec/container are informational only (debug
+ *   logging) — they are NEVER used to accept or reject the upload. The
+ *   file is always uploaded exactly as downloaded, with no transcoding
+ *   and no local codec-based rejection (HEVC/H.265 and any other codec
+ *   are uploaded unmodified); only Telegram's own post-upload response
+ *   (DocumentAttributeVideo present or not) decides acceptance.
  * @returns {{channelId:*, messageId:number, documentId:string, accessHash:string, size:number, mimeType:string}}
  */
 async function uploadEpisode(targetChannelId, filePath, opts = {}) {
@@ -279,9 +285,10 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
     );
   }
 
-  log.info('uploadEpisode', 'Upload started — debug metadata about to be sent', {
+  log.info('uploadEpisode', 'Upload started — debug metadata about to be sent (uploaded exactly as downloaded: no transcode, no compression, no codec-based rejection)', {
     targetChannelId, filePath, localSizeBytes,
     mimeType, duration, width, height,
+    videoCodec: opts.videoCodec || 'unknown', audioCodec: opts.audioCodec || 'unknown', container: opts.container || 'unknown',
     videoAttributesSent: { duration, w: width, h: height, supportsStreaming: true, nosound: false, roundMessage: false },
     forceDocument: false, hasThumb: !!opts.thumbPath, uploadMethod: 'sendFile (high-level)',
   });
@@ -459,9 +466,11 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
       new Error(`attributes=[${(doc?.attributes || []).map((a) => a.className).join(', ') || 'none'}]`),
       {
         targetChannelId, filePath, messageId: sent?.id ?? null, mimeType: doc?.mimeType,
+        sourceVideoCodec: opts.videoCodec || 'unknown', sourceAudioCodec: opts.audioCodec || 'unknown', sourceContainer: opts.container || 'unknown',
+        telegramMediaType: doc ? 'MessageMediaDocument (generic document, no DocumentAttributeVideo)' : 'none',
         likelyReason: !doc
           ? 'Telegram returned no document at all on the sent message.'
-          : 'Server-side analysis did not qualify the bytes as valid streamable video — forceDocument is ruled out (explicitly false), invalid duration/width/height is ruled out (pre-upload ffprobe gate), so this points at the actual uploaded bytes Telegram received being corrupt/truncated/reordered despite matching size locally (e.g. from parallel-chunk assembly issues).',
+          : 'Server-side analysis did not qualify the bytes as valid streamable video — forceDocument is ruled out (explicitly false), invalid duration/width/height is ruled out (pre-upload ffprobe gate). This file was uploaded exactly as downloaded with no transcoding, so this may simply be a source format/codec combination Telegram\'s backend does not accept as playable video (rather than a corrupted upload) — the alternate-method retry below distinguishes the two.',
       }
     );
     if (sent?.id) {
@@ -488,9 +497,13 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
     if (!doc || !videoAttr) {
       log.error(
         'uploadEpisode',
-        'Telegram stored the alternate-method retry as a plain document too — giving up, not saving this as a successful upload',
+        'Telegram stored the alternate-method retry as a plain document too — the source format is not accepted by Telegram as playable video. Not saving this as a successful upload.',
         new Error(`attributes=[${(doc?.attributes || []).map((a) => a.className).join(', ') || 'none'}]`),
-        { targetChannelId, filePath, messageId: sent?.id ?? null, mimeType: doc?.mimeType }
+        {
+          targetChannelId, filePath, messageId: sent?.id ?? null, mimeType: doc?.mimeType,
+          sourceVideoCodec: opts.videoCodec || 'unknown', sourceAudioCodec: opts.audioCodec || 'unknown', sourceContainer: opts.container || 'unknown',
+          telegramMediaType: doc ? 'MessageMediaDocument (generic document, no DocumentAttributeVideo)' : 'none',
+        }
       );
       if (sent?.id) {
         try {
@@ -503,9 +516,11 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
         }
       }
       throw new Error(
-        'Telegram did not recognize the uploaded file as playable video media (no DocumentAttributeVideo on the ' +
-        'stored document) on either the primary or alternate upload method — it would show up as a plain file ' +
-        'attachment with no inline player. Not saving this as a successful upload.'
+        `The source format is not accepted by Telegram as playable video: it was stored as a plain document ` +
+        `(no DocumentAttributeVideo) on both the primary and alternate upload methods, not because of any local ` +
+        `codec check — this file (video codec "${opts.videoCodec || 'unknown'}", container "${opts.container || 'unknown'}") ` +
+        `was uploaded unmodified and Telegram itself declined to classify it as playable video. It would show up ` +
+        `as a plain file attachment with no inline player. Not saving this as a successful upload.`
       );
     }
     log.success('uploadEpisode', 'Alternate upload method succeeded — Telegram confirmed DocumentAttributeVideo', { targetChannelId, filePath, messageId: sent.id });

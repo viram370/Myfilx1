@@ -631,22 +631,19 @@ function buildFfmpegArgs(inputPath, outputPath, tier, info, hwEncoder = null) {
 }
 
 /**
- * Confirms a finished FFmpeg run actually produced a working, Telegram-
- * playable MP4 on disk — not just that the process exited 0. Checks (in
- * order): the file exists and isn't suspiciously tiny, ffprobe can
- * actually open it (a file with a truncated/missing moov atom fails
- * right here), it contains a real video stream, it reports a sane (>0)
- * duration, AND — the check that used to be missing — the video is
- * actually H.264 and the audio (if any) is actually AAC. A stream-copy
- * tier can only ever produce those codecs by construction (buildFfmpegArgs
- * only allows `-c:v copy` when analyze() already confirmed h264/aac), but
- * this re-verifies it directly against the file that's actually about to
- * be uploaded rather than trusting that chain of assumptions — codec
- * mismatches are exactly what make Telegram fall back to "Use external
- * video player" while still showing a normal-looking .mp4 file. Also
- * used by the upload pipeline as a final gate immediately before upload,
- * and to decide whether to fall back to uploading the original source
- * file instead of a broken/incompatible compressed one.
+ * Confirms a finished download/file is structurally sound before it's
+ * handed to the upload step — file exists and isn't suspiciously tiny,
+ * ffprobe can actually open it (a file with a truncated/missing moov
+ * atom fails right here), it contains a real video stream, and it
+ * reports a sane (>0) duration/resolution. It does NOT reject based on
+ * video/audio codec (H.264/AAC vs anything else, e.g. HEVC/H.265) —
+ * codec is logged for visibility only. The pipeline never transcodes or
+ * compresses; the original file is uploaded exactly as downloaded, and
+ * Telegram's own response after upload (DocumentAttributeVideo present
+ * or not) is the only thing that decides whether a given codec/container
+ * combination is accepted as playable video — see
+ * queue/pipeline.js#verifyDownloadedFile and
+ * services/telegramUpload.js#uploadEpisode.
  */
 async function verifyOutputFile(outputPath) {
   let stat;
@@ -670,6 +667,18 @@ async function verifyOutputFile(outputPath) {
   const videoStream = pickVideoStream(streams);
   const audioStreams = pickAudioStreams(streams);
   const duration = Number(meta.format?.duration) || 0;
+  const container = meta.format?.format_name || 'unknown';
+  const videoCodec = (videoStream?.codec_name || 'unknown').toLowerCase();
+  const audioCodec = (audioStreams[0]?.codec_name || 'none').toLowerCase();
+  const pixFmt = (videoStream?.pix_fmt || 'unknown').toLowerCase();
+
+  // Debug visibility for every file that reaches this point, regardless
+  // of codec/container — required so a non-H.264 (e.g. HEVC/H.265)
+  // upload can still be traced end-to-end.
+  log.info('verifyOutputFile', 'Probed source file — codec/container are informational only, never a rejection reason', {
+    outputPath, container, videoCodec, audioCodec, pixFmt,
+    width: videoStream?.width || 0, height: videoStream?.height || 0, duration: Math.round(duration),
+  });
 
   if (!videoStream) {
     return { valid: false, reason: 'output has no video stream' };
@@ -677,20 +686,24 @@ async function verifyOutputFile(outputPath) {
   if (!(duration > 0)) {
     return { valid: false, reason: 'output reports zero/invalid duration (likely a truncated or missing moov atom)' };
   }
-  const outVideoCodec = (videoStream.codec_name || '').toLowerCase();
-  if (outVideoCodec !== 'h264') {
-    return { valid: false, reason: `output video codec is "${outVideoCodec || 'unknown'}", not H.264 — Telegram's inline player will reject this` };
-  }
-  const outPixFmt = (videoStream.pix_fmt || '').toLowerCase();
-  if (outPixFmt && !/^yuvj?420p$/.test(outPixFmt)) {
-    return { valid: false, reason: `output pixel format is "${outPixFmt}", not yuv420p — many decoders (including Telegram's inline player) reject 4:2:2/4:4:4/10-bit output` };
+  // INTENTIONALLY NOT a rejection: video codec other than H.264 (e.g.
+  // HEVC/H.265), non-4:2:0 pixel format, or non-AAC audio no longer fail
+  // verification here. The file is never transcoded/compressed by this
+  // pipeline, so a hard local codec gate would only block uploads that
+  // Telegram itself might accept and play fine. These are logged as
+  // warnings for visibility; only Telegram's own post-upload response
+  // (checked in telegramUpload.js#uploadEpisode) decides acceptance.
+  if (videoCodec !== 'h264') {
+    log.warn('verifyOutputFile', `Video codec is "${videoCodec}", not H.264 — uploading unmodified anyway and letting Telegram decide playability`, { outputPath, videoCodec, container });
+  } else if (pixFmt !== 'unknown' && !/^yuvj?420p$/.test(pixFmt)) {
+    log.warn('verifyOutputFile', `Pixel format is "${pixFmt}", not yuv420p — uploading unmodified anyway and letting Telegram decide playability`, { outputPath, pixFmt });
   }
   if (!(videoStream.width > 0) || !(videoStream.height > 0)) {
     return { valid: false, reason: `output reports an invalid resolution (${videoStream.width || 0}x${videoStream.height || 0})` };
   }
   const badAudio = audioStreams.find((s) => (s.codec_name || '').toLowerCase() !== 'aac');
   if (badAudio) {
-    return { valid: false, reason: `output has a non-AAC audio track ("${badAudio.codec_name || 'unknown'}") — Telegram's inline player will reject this` };
+    log.warn('verifyOutputFile', `Audio codec is "${badAudio.codec_name || 'unknown'}", not AAC — uploading unmodified anyway and letting Telegram decide playability`, { outputPath, audioCodec: badAudio.codec_name || 'unknown' });
   }
   const frameRate = parseFrameRate(videoStream.avg_frame_rate) || parseFrameRate(videoStream.r_frame_rate);
   if (!(frameRate > 0)) {
@@ -708,9 +721,10 @@ async function verifyOutputFile(outputPath) {
   // "mov,mp4,m4a,3gp,3g2,mj2"). Falls back to the system `file` utility
   // (present on virtually every Linux host, including Render's) as a
   // second opinion when ffprobe's format tag is missing/ambiguous, and
-  // only defaults to 'video/mp4' if both are inconclusive AND the H.264/
-  // AAC/moov checks above already passed — i.e. never used as a way to
-  // paper over a container that actually failed validation.
+  // only defaults to 'video/mp4' if both are inconclusive AND the
+  // structural checks above (real video stream, valid duration/
+  // resolution/frame rate, faststart) already passed — i.e. never used
+  // as a way to paper over a container that actually failed validation.
   const formatNames = String(meta.format?.format_name || '').toLowerCase().split(',');
   let mimeType = null;
   if (formatNames.includes('mp4') || formatNames.includes('mov')) {
@@ -719,13 +733,12 @@ async function verifyOutputFile(outputPath) {
     mimeType = await detectMimeTypeViaFileCommand(outputPath);
   }
   if (!mimeType || !/^video\//i.test(mimeType)) {
-    // Every check above (H.264 video stream, valid resolution/duration,
-    // AAC-or-no audio, faststart) already passed, so the bytes ARE a
-    // playable MP4 even if neither detector above could name it — but
-    // this is exactly the kind of ambiguity that must never be silently
-    // assumed away, so it's logged loudly rather than upgraded to
-    // "video/mp4" without comment.
-    log.warn('verifyOutputFile', 'Could not confirm a video/* MIME type from ffprobe or `file` — defaulting to video/mp4 since the stream-level checks above already confirmed H.264/AAC/MP4', {
+    // The structural checks above already passed, so the bytes ARE a
+    // playable-container video even if neither detector above could
+    // name it — but this is exactly the kind of ambiguity that must
+    // never be silently assumed away, so it's logged loudly rather than
+    // upgraded to "video/mp4" without comment.
+    log.warn('verifyOutputFile', 'Could not confirm a video/* MIME type from ffprobe or `file` — defaulting to video/mp4 since the structural checks above already passed', {
       outputPath, ffprobeFormatName: meta.format?.format_name || null, fileCommandResult: mimeType,
     });
     mimeType = 'video/mp4';
@@ -739,6 +752,9 @@ async function verifyOutputFile(outputPath) {
     height: videoStream.height || 0,
     frameRate,
     mimeType,
+    videoCodec,
+    audioCodec,
+    container,
   };
 }
 
