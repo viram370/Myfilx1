@@ -44,10 +44,12 @@
  *     storage channel the bot administers) carries a REAL channel id +
  *     message id from Telegram itself (`forward_origin`/`forward_from_chat`,
  *     or the channel_post's own chat/message id). These always go through
- *     MTProto — first a fast server-side `bot.copyMessage()` straight into
- *     the storage channel (no download at all), falling back to
- *     `downloadFromChannel()` (also MTProto, same real channel id) if the
- *     copy isn't possible.
+ *     MTProto's `downloadFromChannel()` — a genuine download to local disk,
+ *     verified, then re-uploaded as a brand-new message via `uploadEpisode()`.
+ *     HARD RULE: bot.copyMessage()/forwardMessage() are NEVER used for
+ *     videos, even as a "fast path" — that was tried once and removed
+ *     because it sometimes copied the original message instead of actually
+ *     processing the video, producing incorrect/unusable output.
  *   - A "Copy"'d message (Telegram's own Copy feature, as opposed to
  *     Forward) carries no forward metadata at all — Telegram makes it
  *     indistinguishable from a direct upload — so it naturally goes
@@ -161,7 +163,7 @@ function slugify(str) {
 }
 
 // Set once via setBotInstance() at startup (handlers/adminUpload.js) —
-// needed here for Bot-API downloads and copyMessage.
+// needed here for Bot-API downloads.
 let botInstance = null;
 function setBotInstance(bot) { botInstance = bot; }
 
@@ -415,11 +417,8 @@ async function startBatch(chatId) {
     if (item.status !== 'validated') continue;
     item.status = 'waiting';
     // No compression stage anymore — every upload is the exact original
-    // file, whether it gets there via a straight download+reupload or via
-    // a zero-download Telegram server-side copy (forwarded items try that
-    // first; see runForwardedTransferJob). Either way the result is
-    // byte-identical to the source, so there's no compatibility mismatch
-    // between the two paths to worry about.
+    // file, always via a real download + brand-new upload (never a
+    // copyMessage/forwardMessage shortcut — see runForwardedTransferJob).
     if (item.sourceType === 'forwarded') {
       forwardedFallbackQueue.push({ chatId: session.chatId, seq: item.seq });
     } else {
@@ -657,10 +656,10 @@ async function tickSessionUpload(session) {
 }
 
 // ---- transfer for 'forwarded' items (videos forwarded to the bot from ----
-// a channel) — tries a zero-download server-side copy first, falling back
-// to a real MTProto download+re-upload. Always uses the REAL source
+// a channel) — always a real MTProto download + brand-new re-upload,
+// never bot.copyMessage()/forwardMessage(). Always uses the REAL source
 // channel (item.forwardChatId/forwardMessageId), never Bot API, never a
-// private chat id. See runForwardedTransferJob for both paths.
+// private chat id. See runForwardedTransferJob.
 const forwardedFallbackQueue = [];
 let forwardedFallbackActive = 0;
 
@@ -685,39 +684,13 @@ async function runForwardedTransferJob({ chatId, seq }) {
 
   if (!item.startedAt) item.startedAt = Date.now();
 
-  // ---- Fast path: server-side copy, zero download/upload ----------------
-  // With no compression stage, a straight Telegram-side copy of the source
-  // message into the storage channel produces exactly the same result as
-  // download-then-reupload — but spends no bandwidth, no disk, and no RAM
-  // on this item at all. Tried once; anything short of success (bot isn't
-  // an admin of the source channel, message is gone, transient error...)
-  // falls straight through to the normal MTProto download+upload path
-  // below, which has its own full retry handling.
-  item.status = 'downloading'; // no separate "copying" UI state — same visible step either way
-  item.downloadMethod = 'server-copy';
-  await session.onProgress(session, { force: true });
-
-  try {
-    const copyResult = await transfer.copyMessageToStorage(botInstance, item.forwardChatId, item.forwardMessageId, session.storageChannelId);
-    log.success('runForwardedTransferJob', 'Server-side copy succeeded — no download/upload needed for this item', {
-      chatId, seq, channelId: item.forwardChatId, messageId: item.forwardMessageId, newMessageId: copyResult.messageId,
-    });
-
-    await writeFirestoreDoc(session, item, item.episode, copyResult);
-    item.status = 'done';
-    item.finishedAt = Date.now();
-    log.success('runForwardedTransferJob', 'Completed via server-side copy', { chatId, seq, episode: item.episode });
-    await session.onProgress(session, { force: true });
-    await maybeCompleteSession(session);
-    pumpUploadQueue(); // lets the strict-FIFO upload cursor skip past this now-terminal item
-    return;
-  } catch (copyErr) {
-    log.warn('runForwardedTransferJob', 'Server-side copy not possible — falling back to download+upload', {
-      chatId, seq, reason: copyErr.message,
-    });
-  }
-
-  // ---- Fallback: real MTProto download, then re-upload -------------------
+  // NEVER use bot.copyMessage()/forwardMessage() for videos — this was
+  // tried as a zero-download "fast path" and removed again: it sometimes
+  // copied the original Telegram message instead of actually processing
+  // the video, producing incorrect/unusable output. Every forwarded item,
+  // no exceptions, goes through the real MTProto download below, then
+  // uploadPreparedFile() sends it back out as a genuinely new upload —
+  // never a copy or forward of anything.
   const stamp = `${chatId}_${seq}_${Date.now()}`;
   const inPath = path.join(UPLOADS_DIR, `${stamp}.src`);
 
@@ -742,11 +715,11 @@ async function runForwardedTransferJob({ chatId, seq }) {
         },
       });
       // No compression stage — the file downloaded here is exactly what
-      // gets uploaded (same pattern as runDirectTransferJob).
+      // gets uploaded as a brand-new message (same pattern as runDirectTransferJob).
       item.tempIn = inPath;
       item.tempOut = inPath;
       item.downloadProgress = 100;
-      log.success('runForwardedTransferJob', 'Download completed — uploading original file unmodified (no re-encoding)', { chatId, seq, path: inPath, method: 'mtproto' });
+      log.success('runForwardedTransferJob', 'Download completed — uploading as a new file unmodified (no re-encoding, no copy/forward)', { chatId, seq, path: inPath, method: 'mtproto' });
 
       item.status = 'ready';
       await session.onProgress(session, { force: true });
