@@ -351,7 +351,18 @@ function addItem(session, media, msg, opts = {}) {
     episode: null,
     tempIn: null,
     tempOut: null, // now always the same path as tempIn — kept as a separate field only so uploadPreparedFile()'s "file ready to upload" reference doesn't need renaming throughout
-    probe: null, // no longer populated (no ffprobe pass) — duration/width/height always come from durationHint/widthHint/heightHint (Telegram's own metadata) instead
+    // Populated by verifyDownloadedFile() right after download, from a
+    // REAL ffprobe pass over the actual bytes on disk — this is what
+    // gets sent to Telegram (see uploadPreparedFile), never the
+    // durationHint/widthHint/heightHint above. Telegram's own message
+    // metadata is only a fallback hint used for logging/thumbnail
+    // seeking; it is frequently 0/absent (documents carry none at all,
+    // and even genuine video messages from some clients omit it), and
+    // sending DocumentAttributeVideo with duration:0/width:0/height:0 is
+    // exactly what makes Telegram's server store the upload as a plain
+    // document instead of playable video media.
+    // Shape once set: { valid, sizeBytes, duration, width, height, frameRate, mimeType }
+    probe: null,
     error: null,
     uploading: false,
     // Local path of the ffmpeg-generated per-EPISODE display thumbnail
@@ -558,6 +569,99 @@ function cleanupFile(p) {
  * serializer treats a missing episode thumbnail as "use a placeholder",
  * never a crash.
  */
+/**
+ * Runs an ACTUAL ffprobe pass over the just-downloaded file — never
+ * trusts Telegram's own duration/width/height message metadata, which is
+ * frequently 0/missing (documents carry none of it at all; some client
+ * apps omit it even on genuine video messages) and, when sent through
+ * unchanged into DocumentAttributeVideo, is exactly what causes Telegram
+ * to fall back to storing the upload as a plain document with no inline
+ * player — the bug this function fixes. Also confirms the container is
+ * genuinely a valid, playable MP4 (real video stream, non-zero duration,
+ * H.264/AAC, faststart) BEFORE any upload attempt is made, and derives
+ * the real MIME type from the file's own bytes rather than an assumed
+ * extension.
+ *
+ * On success, overwrites item.durationHint/widthHint/heightHint with the
+ * probed ground-truth values (kept as the same field names so the
+ * thumbnail-seek call below and any other reader doesn't need to change)
+ * and stores the full probe result on item.probe for the upload step and
+ * for debug logging.
+ *
+ * On failure, marks the item 'failed' directly — an invalid/corrupt
+ * container can never become uploadable by retrying the upload step, so
+ * this fails fast with a clear, specific reason instead of only being
+ * discovered after Telegram rejects the upload as a generic document.
+ *
+ * @returns {boolean} true if the item is verified-good and processing should continue
+ */
+async function verifyDownloadedFile(session, item) {
+  log.info('verifyDownloadedFile', 'Running ffprobe verification on downloaded file before upload', {
+    chatId: session.chatId, seq: item.seq, path: item.tempOut,
+    telegramReportedDuration: item.durationHint, telegramReportedWidth: item.widthHint, telegramReportedHeight: item.heightHint,
+  });
+
+  let result;
+  try {
+    result = await compress.verifyOutputFile(item.tempOut);
+  } catch (err) {
+    log.error('verifyDownloadedFile', 'ffprobe verification crashed', err, { chatId: session.chatId, seq: item.seq, path: item.tempOut, stack: err.stack });
+    result = { valid: false, reason: `ffprobe verification crashed: ${err.message}` };
+  }
+
+  if (!result.valid) {
+    log.error('verifyDownloadedFile', 'Downloaded file failed pre-upload verification — refusing to upload it as video', new Error(result.reason), {
+      chatId: session.chatId, seq: item.seq, path: item.tempOut,
+    });
+    cleanupFile(item.tempOut);
+    item.tempIn = null;
+    item.tempOut = null;
+    item.probe = null;
+    item.status = 'failed';
+    item.error = `Downloaded file is not a valid playable MP4: ${result.reason}`;
+    item.finishedAt = Date.now();
+    await session.onProgress(session, { force: true });
+    await maybeCompleteSession(session);
+    return false;
+  }
+
+  item.probe = result;
+  // Ground truth from the actual bytes replaces whatever hint Telegram's
+  // message metadata carried (which may have been 0/absent/stale).
+  item.durationHint = result.duration || 0;
+  item.widthHint = result.width || 0;
+  item.heightHint = result.height || 0;
+
+  log.success('verifyDownloadedFile', 'ffprobe verification passed', {
+    chatId: session.chatId, seq: item.seq, path: item.tempOut,
+    mimeType: result.mimeType, duration: result.duration, width: result.width, height: result.height,
+    frameRate: result.frameRate, sizeBytes: result.sizeBytes,
+  });
+
+  if (!(result.duration > 0) || !(result.width > 0) || !(result.height > 0)) {
+    // verifyOutputFile() should already have rejected any of these as
+    // invalid, but this is the exact condition that produces Telegram's
+    // "no DocumentAttributeVideo" symptom, so it gets its own explicit,
+    // impossible-to-miss guard right at the point of use rather than
+    // relying solely on that earlier check never regressing.
+    log.error('verifyDownloadedFile', 'Probed metadata still has a zero/missing duration, width, or height — refusing to upload with attributes that would make Telegram reject video classification', new Error(`duration=${result.duration} width=${result.width} height=${result.height}`), {
+      chatId: session.chatId, seq: item.seq, path: item.tempOut,
+    });
+    cleanupFile(item.tempOut);
+    item.tempIn = null;
+    item.tempOut = null;
+    item.probe = null;
+    item.status = 'failed';
+    item.error = `Video metadata is incomplete (duration=${result.duration}, width=${result.width}, height=${result.height}) — cannot upload as playable video.`;
+    item.finishedAt = Date.now();
+    await session.onProgress(session, { force: true });
+    await maybeCompleteSession(session);
+    return false;
+  }
+
+  return true;
+}
+
 async function generateEpisodeThumbnailForItem(session, item) {
   if (!item.tempIn) return;
   const thumbPath = path.join(UPLOADS_DIR, `${session.chatId}_${item.seq}_${Date.now()}.thumb.jpg`);
@@ -620,7 +724,10 @@ async function runDirectTransferJob({ chatId, seq }) {
       item.tempIn = inPath;
       item.tempOut = inPath;
       item.downloadProgress = 100;
-      log.success('runDirectTransferJob', 'Download completed — uploading original file unmodified (no re-encoding)', { chatId, seq, path: inPath, method: 'bot-api' });
+      log.success('runDirectTransferJob', 'Download completed — verifying before upload (no re-encoding)', { chatId, seq, path: inPath, method: 'bot-api' });
+
+      const verified = await verifyDownloadedFile(session, item);
+      if (!verified) { pumpUploadQueue(); return; }
 
       await generateEpisodeThumbnailForItem(session, item);
 
@@ -762,7 +869,10 @@ async function runForwardedTransferJob({ chatId, seq }) {
       item.tempIn = inPath;
       item.tempOut = inPath;
       item.downloadProgress = 100;
-      log.success('runForwardedTransferJob', 'Download completed — uploading as a new file unmodified (no re-encoding, no copy/forward)', { chatId, seq, path: inPath, method: 'mtproto' });
+      log.success('runForwardedTransferJob', 'Download completed — verifying before upload as a new file (no re-encoding, no copy/forward)', { chatId, seq, path: inPath, method: 'mtproto' });
+
+      const verified = await verifyDownloadedFile(session, item);
+      if (!verified) { pumpUploadQueue(); return; }
 
       await generateEpisodeThumbnailForItem(session, item);
 
@@ -815,14 +925,27 @@ async function uploadPreparedFile(session, item) {
       });
       await session.onProgress(session, { force: true });
 
+      // item.probe is guaranteed non-null here: uploadPreparedFile only
+      // ever runs on items that reached 'ready', and the only path to
+      // 'ready' (both runDirectTransferJob and runForwardedTransferJob)
+      // requires verifyDownloadedFile() to have succeeded first. If that
+      // invariant is ever violated, fail loudly here rather than
+      // silently falling back to the unverified Telegram hint fields —
+      // the exact bug this whole pipeline exists to fix.
+      if (!item.probe || !item.probe.valid) {
+        throw new Error('uploadPreparedFile: item reached the upload step with no verified ffprobe result — refusing to upload with unverified video metadata.');
+      }
       const fileName = buildFileName(session, item, item.episode);
       const result = await transfer.uploadEpisode(session.storageChannelId, item.tempOut, {
         fileName,
-        // No ffprobe pass anymore — duration/width/height always come
-        // straight from Telegram's own metadata on the source message.
-        duration: item.durationHint || 0,
-        width: item.widthHint || 0,
-        height: item.heightHint || 0,
+        // Real, ffprobe-verified values from the actual bytes about to
+        // be uploaded (see verifyDownloadedFile) — never Telegram's own
+        // message metadata, which is frequently 0/absent and is exactly
+        // what causes Telegram to store the upload as a plain document.
+        duration: item.probe.duration,
+        width: item.probe.width,
+        height: item.probe.height,
+        mimeType: item.probe.mimeType || 'video/mp4',
         thumbPath: item.tempThumb || undefined, // reuse the auto-generated episode thumbnail (if any) as Telegram's own message preview too
         onProgress: (percent) => {
           if (Number.isFinite(localFileSizeBytes)) updateTransferSpeed(item, 'uploadSpeedState', Math.round((percent / 100) * localFileSizeBytes));
