@@ -640,10 +640,15 @@ function buildFfmpegArgs(inputPath, outputPath, tier, info, hwEncoder = null) {
  * codec is logged for visibility only. The pipeline never transcodes or
  * compresses; the original file is uploaded exactly as downloaded, and
  * Telegram's own response after upload (DocumentAttributeVideo present
- * or not) is the only thing that decides whether a given codec/container
- * combination is accepted as playable video — see
- * queue/pipeline.js#verifyDownloadedFile and
- * services/telegramUpload.js#uploadEpisode.
+ * or not) is the only thing that decides whether a given codec/
+ * container/moov-position combination is accepted as playable video —
+ * see queue/pipeline.js#verifyDownloadedFile and
+ * services/telegramUpload.js#uploadEpisode. Rejections here are limited
+ * to genuine container corruption/invalidity (missing file, unreadable
+ * by ffprobe, no video stream, zero/invalid duration or resolution or
+ * frame rate) — never codec choice, pixel format, audio codec, or moov
+ * atom position ("faststart"), all of which Telegram accepts fine and
+ * are stricter than what Telegram itself requires.
  */
 async function verifyOutputFile(outputPath) {
   let stat;
@@ -709,9 +714,18 @@ async function verifyOutputFile(outputPath) {
   if (!(frameRate > 0)) {
     return { valid: false, reason: `output reports an invalid/zero frame rate ("${videoStream.avg_frame_rate || videoStream.r_frame_rate || 'unknown'}")` };
   }
+  // INTENTIONALLY NOT a rejection: moov-atom position ("faststart") is
+  // no longer enforced. A non-faststart MP4 is still a perfectly valid,
+  // playable container — Telegram's own backend remuxes/streams it fine
+  // regardless of moov position, so a local faststart requirement was
+  // stricter than Telegram's own validation and rejected files that
+  // would have uploaded and played correctly. Logged for visibility
+  // only; never blocks the upload. Only Telegram's own post-upload
+  // response (DocumentAttributeVideo present or not, checked in
+  // telegramUpload.js#uploadEpisode) decides acceptance.
   const faststart = checkFaststart(outputPath);
   if (!faststart.ok) {
-    return { valid: false, reason: `output is not faststart (moov atom is not before mdat: ${faststart.reason}) — many players won't start playback until the whole file downloads` };
+    log.warn('verifyOutputFile', `Output is not faststart (${faststart.reason}) — uploading unmodified anyway and letting Telegram decide playability`, { outputPath });
   }
 
   // MIME type: never trust the filename/extension (a document forwarded
@@ -723,8 +737,8 @@ async function verifyOutputFile(outputPath) {
   // second opinion when ffprobe's format tag is missing/ambiguous, and
   // only defaults to 'video/mp4' if both are inconclusive AND the
   // structural checks above (real video stream, valid duration/
-  // resolution/frame rate, faststart) already passed — i.e. never used
-  // as a way to paper over a container that actually failed validation.
+  // resolution/frame rate) already passed — i.e. never used as a way to
+  // paper over a container that actually failed validation.
   const formatNames = String(meta.format?.format_name || '').toLowerCase().split(',');
   let mimeType = null;
   if (formatNames.includes('mp4') || formatNames.includes('mov')) {
@@ -754,6 +768,7 @@ async function verifyOutputFile(outputPath) {
     mimeType,
     videoCodec,
     audioCodec,
+    isFaststart: faststart.ok,
     container,
   };
 }
