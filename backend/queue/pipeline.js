@@ -636,6 +636,7 @@ async function verifyDownloadedFile(session, item) {
     chatId: session.chatId, seq: item.seq, path: item.tempOut,
     mimeType: result.mimeType, duration: result.duration, width: result.width, height: result.height,
     frameRate: result.frameRate, sizeBytes: result.sizeBytes,
+    videoCodec: result.videoCodec, audioCodec: result.audioCodec, container: result.container,
   });
 
   if (!(result.duration > 0) || !(result.width > 0) || !(result.height > 0)) {
@@ -946,6 +947,14 @@ async function uploadPreparedFile(session, item) {
         width: item.probe.width,
         height: item.probe.height,
         mimeType: item.probe.mimeType || 'video/mp4',
+        // Informational only (debug logging) — never used to gate the
+        // upload. The file is uploaded exactly as downloaded regardless
+        // of codec/container (e.g. HEVC/H.265 sources are uploaded
+        // unmodified; only Telegram's own post-upload response decides
+        // acceptance — see telegramUpload.js#uploadEpisode).
+        videoCodec: item.probe.videoCodec,
+        audioCodec: item.probe.audioCodec,
+        container: item.probe.container,
         thumbPath: item.tempThumb || undefined, // reuse the auto-generated episode thumbnail (if any) as Telegram's own message preview too
         onProgress: (percent) => {
           if (Number.isFinite(localFileSizeBytes)) updateTransferSpeed(item, 'uploadSpeedState', Math.round((percent / 100) * localFileSizeBytes));
