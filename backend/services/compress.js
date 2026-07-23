@@ -701,6 +701,36 @@ async function verifyOutputFile(outputPath) {
     return { valid: false, reason: `output is not faststart (moov atom is not before mdat: ${faststart.reason}) — many players won't start playback until the whole file downloads` };
   }
 
+  // MIME type: never trust the filename/extension (a document forwarded
+  // to the bot can carry any extension, or none) — derive it from
+  // ffprobe's own container detection (`format_name` is a comma-
+  // separated list of muxer aliases; mp4's is always exactly
+  // "mov,mp4,m4a,3gp,3g2,mj2"). Falls back to the system `file` utility
+  // (present on virtually every Linux host, including Render's) as a
+  // second opinion when ffprobe's format tag is missing/ambiguous, and
+  // only defaults to 'video/mp4' if both are inconclusive AND the H.264/
+  // AAC/moov checks above already passed — i.e. never used as a way to
+  // paper over a container that actually failed validation.
+  const formatNames = String(meta.format?.format_name || '').toLowerCase().split(',');
+  let mimeType = null;
+  if (formatNames.includes('mp4') || formatNames.includes('mov')) {
+    mimeType = 'video/mp4';
+  } else {
+    mimeType = await detectMimeTypeViaFileCommand(outputPath);
+  }
+  if (!mimeType || !/^video\//i.test(mimeType)) {
+    // Every check above (H.264 video stream, valid resolution/duration,
+    // AAC-or-no audio, faststart) already passed, so the bytes ARE a
+    // playable MP4 even if neither detector above could name it — but
+    // this is exactly the kind of ambiguity that must never be silently
+    // assumed away, so it's logged loudly rather than upgraded to
+    // "video/mp4" without comment.
+    log.warn('verifyOutputFile', 'Could not confirm a video/* MIME type from ffprobe or `file` — defaulting to video/mp4 since the stream-level checks above already confirmed H.264/AAC/MP4', {
+      outputPath, ffprobeFormatName: meta.format?.format_name || null, fileCommandResult: mimeType,
+    });
+    mimeType = 'video/mp4';
+  }
+
   return {
     valid: true,
     sizeBytes: stat.size,
@@ -708,7 +738,36 @@ async function verifyOutputFile(outputPath) {
     width: videoStream.width || 0,
     height: videoStream.height || 0,
     frameRate,
+    mimeType,
   };
+}
+
+/**
+ * Second-opinion MIME detection using the system `file` utility (magic-
+ * byte based, ignores filename/extension entirely) — used only as a
+ * fallback when ffprobe's own format_name doesn't clearly say mp4/mov.
+ * Best-effort: `file` not being installed (rare on Linux hosts, but not
+ * guaranteed) must never fail the whole verification, so any error here
+ * just resolves to null and the caller's own default applies.
+ */
+function detectMimeTypeViaFileCommand(filePath) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn('file', ['--brief', '--mime-type', filePath]);
+    } catch (_) {
+      resolve(null);
+      return;
+    }
+    let stdout = '';
+    child.stdout?.on('data', (d) => { stdout += d; });
+    child.on('error', () => resolve(null));
+    child.on('close', (code) => {
+      if (code !== 0) { resolve(null); return; }
+      const mime = stdout.trim();
+      resolve(mime || null);
+    });
+  });
 }
 
 function parseFrameRate(raw) {

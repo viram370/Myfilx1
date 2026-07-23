@@ -246,7 +246,12 @@ async function downloadFromChannel(channelId, messageId, destPath, opts = {}) {
 /**
  * @param {string|number} targetChannelId storage channel to upload into
  * @param {string} filePath local path of the converted MP4
- * @param {{fileName?:string, caption?:string, duration?:number, width?:number, height?:number, onProgress?:(fraction:number)=>void}} opts
+ * @param {{fileName?:string, caption?:string, duration?:number, width?:number, height?:number, mimeType?:string, onProgress?:(fraction:number)=>void}} opts
+ *   duration/width/height MUST be real, ffprobe-verified values (see
+ *   queue/pipeline.js#verifyDownloadedFile) — never an unverified hint
+ *   from Telegram's own message metadata. Sending 0/absent values here
+ *   is the single most common reason Telegram stores an upload as a
+ *   plain document instead of playable video media.
  * @returns {{channelId:*, messageId:number, documentId:string, accessHash:string, size:number, mimeType:string}}
  */
 async function uploadEpisode(targetChannelId, filePath, opts = {}) {
@@ -257,10 +262,28 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
   } catch (err) {
     throw new Error(`uploadEpisode: cannot stat local file before upload (${err.message}) — refusing to upload a file that may not exist/be fully written.`);
   }
-  log.info('uploadEpisode', 'Upload started', {
+
+  // GATE: refuse to even attempt the upload with metadata that's known
+  // to make Telegram reject video classification. This mirrors the
+  // check in verifyDownloadedFile() so uploadEpisode() is also safe to
+  // call directly (defense in depth, not just relying on every caller
+  // upstream doing the right thing).
+  const duration = Number(opts.duration) || 0;
+  const width = Number(opts.width) || 0;
+  const height = Number(opts.height) || 0;
+  const mimeType = opts.mimeType || 'video/mp4';
+  if (!(duration > 0) || !(width > 0) || !(height > 0)) {
+    throw new Error(
+      `uploadEpisode: refusing to upload with incomplete video metadata (duration=${duration}, width=${width}, height=${height}) — ` +
+      `Telegram will store this as a plain document, not playable video. Pass real ffprobe-verified values.`
+    );
+  }
+
+  log.info('uploadEpisode', 'Upload started — debug metadata about to be sent', {
     targetChannelId, filePath, localSizeBytes,
-    videoAttributesSent: { duration: opts.duration || 0, w: opts.width || 0, h: opts.height || 0, supportsStreaming: true, nosound: false, roundMessage: false },
-    mimeType: 'video/mp4', forceDocument: false, hasThumb: !!opts.thumbPath,
+    mimeType, duration, width, height,
+    videoAttributesSent: { duration, w: width, h: height, supportsStreaming: true, nosound: false, roundMessage: false },
+    forceDocument: false, hasThumb: !!opts.thumbPath, uploadMethod: 'sendFile (high-level)',
   });
 
   const client = await mtproto.connect();
@@ -272,9 +295,9 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
   const fileName = opts.fileName || path.basename(filePath);
   const attributes = [
     new Api.DocumentAttributeVideo({
-      duration: opts.duration || 0,
-      w: opts.width || 0,
-      h: opts.height || 0,
+      duration,
+      w: width,
+      h: height,
       supportsStreaming: true,
       // THE LIKELY ROOT CAUSE of "tapping the video doesn't play it
       // correctly, sometimes only plays in a small PiP-style window
@@ -343,11 +366,9 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
     //
     // Explicit mimeType instead of relying purely on GramJS deriving it
     // from the `fileName` extension via its internal mime-type lookup.
-    // Every file this pipeline ever hands to sendFile is guaranteed
-    // (verifyOutputFile) to be H.264/AAC in an MP4 container, so this is
-    // always exactly correct — and removes any dependency on filename
-    // extension parsing succeeding for every possible generated name.
-    mimeType: 'video/mp4',
+    // Comes from the caller's own ffprobe-verified detection
+    // (verifyOutputFile), never assumed from the filename extension.
+    mimeType,
     // A real thumbnail (see services/compress.js#generateThumbnail)
     // removes any dependency on Telegram's own server-side auto-
     // thumbnail generation, which isn't fully reliable and can silently
@@ -365,7 +386,62 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
       : undefined,
   });
 
+  // ALTERNATE UPLOAD METHOD (used only as a retry — see below): pre-
+  // uploads the raw bytes via client.uploadFile() (GramJS's low-level
+  // primitive) with a SERIAL (workers:1) transfer, then hands the
+  // resulting already-uploaded file handle to sendFile() instead of
+  // letting sendFile() manage its own internal chunked/parallel read of
+  // the path directly. Exercises a genuinely different code path from
+  // the first attempt (which streams+chunks the path itself with
+  // UPLOAD_WORKERS parallel workers) — worth trying if the first
+  // attempt's upload produced bytes Telegram's backend didn't accept as
+  // valid video (parallel out-of-order chunk assembly is one plausible
+  // culprit for a subtly malformed remote copy).
+  const sendViaAlternateMethod = async (thumbPath) => {
+    const { CustomFile } = require('telegram/client/uploads');
+    const toUpload = new CustomFile(fileName, localSizeBytes, filePath);
+    const uploadedHandle = await client.uploadFile({
+      file: toUpload,
+      workers: 1,
+      onProgress: opts.onProgress
+        ? (fraction) => {
+            try {
+              const percent = Math.max(0, Math.min(100, Math.round(fraction * 100)));
+              opts.onProgress(percent);
+            } catch (_) { /* never let a UI callback break the upload */ }
+          }
+        : undefined,
+    });
+    return client.sendFile(entity, {
+      file: uploadedHandle,
+      fileName,
+      caption: opts.caption || '',
+      forceDocument: false,
+      mimeType,
+      thumb: thumbPath || undefined,
+      attributes,
+    });
+  };
+
+  function checkForVideoAttribute(sentMsg, methodLabel) {
+    const document = sentMsg?.media?.document;
+    const returnedAttributes = document?.attributes || [];
+    const attr = returnedAttributes.find((a) => a.className === 'DocumentAttributeVideo');
+    log.info('uploadEpisode', 'Telegram response received — logging full document attributes', {
+      targetChannelId, filePath, uploadMethod: methodLabel,
+      messageId: sentMsg?.id ?? null,
+      telegramResponseDocumentId: document?.id ? document.id.toString() : null,
+      telegramResponseMimeType: document?.mimeType ?? null,
+      telegramResponseSizeBytes: document?.size ? Number(document.size) : null,
+      documentAttributesReturned: returnedAttributes.map((a) => a.className),
+      hasDocumentAttributeVideo: !!attr,
+      videoAttributeReturned: attr ? { duration: attr.duration, w: attr.w, h: attr.h, supportsStreaming: !!attr.supportsStreaming, nosound: !!attr.nosound } : null,
+    });
+    return { document, attr };
+  }
+
   let sent;
+  let methodUsed = 'sendFile (high-level, parallel workers)';
   try {
     sent = await sendOnce(opts.thumbPath);
   } catch (err) {
@@ -374,52 +450,72 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
     sent = await sendOnce(null);
   }
 
-  const doc = sent?.media?.document;
-  if (!doc) {
-    throw new Error('Telegram accepted the upload but returned no document — cannot record it.');
-  }
+  let { document: doc, attr: videoAttr } = checkForVideoAttribute(sent, methodUsed);
 
-  // FINAL GATE: a successful RPC only means Telegram accepted the bytes —
-  // it does NOT mean Telegram stored them as a *playable video*. Both a
-  // real inline-streamable video and a plain "97.2 MB file.mp4" generic
-  // attachment come back as the exact same `MessageMediaDocument` shape;
-  // the only reliable signal that Telegram's backend actually recognized
-  // and processed this as video media is the returned document's own
-  // `attributes` array containing a `DocumentAttributeVideo` entry (this
-  // is Telegram's own confirmation, not just an echo of what we sent —
-  // if the file didn't qualify as valid video media server-side, this
-  // attribute comes back missing even though `forceDocument` was false
-  // and the RPC "succeeded"). Treating that case as success is exactly
-  // how a broken/unplayable upload used to silently reach Firestore.
-  const sentAttributes = doc.attributes || [];
-  const videoAttr = sentAttributes.find((a) => a.className === 'DocumentAttributeVideo');
-  if (!videoAttr) {
+  if (!doc || !videoAttr) {
     log.error(
       'uploadEpisode',
-      'Telegram stored this upload as a plain document, not a video — refusing to treat it as a successful streamable upload',
-      new Error(`attributes=[${sentAttributes.map((a) => a.className).join(', ') || 'none'}]`),
-      { targetChannelId, filePath, messageId: sent.id, mimeType: doc.mimeType }
+      'Telegram stored this upload as a plain document, not a video, on the first attempt — explaining why and retrying with an alternate upload method',
+      new Error(`attributes=[${(doc?.attributes || []).map((a) => a.className).join(', ') || 'none'}]`),
+      {
+        targetChannelId, filePath, messageId: sent?.id ?? null, mimeType: doc?.mimeType,
+        likelyReason: !doc
+          ? 'Telegram returned no document at all on the sent message.'
+          : 'Server-side analysis did not qualify the bytes as valid streamable video — forceDocument is ruled out (explicitly false), invalid duration/width/height is ruled out (pre-upload ffprobe gate), so this points at the actual uploaded bytes Telegram received being corrupt/truncated/reordered despite matching size locally (e.g. from parallel-chunk assembly issues).',
+      }
     );
-    // Never leave a failed/misrecognized upload sitting in the storage
-    // channel as orphaned junk while the caller retries — delete it
-    // immediately. Best-effort: if the delete itself fails, the retry
-    // still proceeds (the caller's next attempt sends a brand-new
-    // message either way), but we log it loudly since it means a stray
-    // document is now sitting in the channel that a human may need to
-    // clean up manually.
-    try {
-      await client.deleteMessages(entity, [sent.id], { revoke: true });
-      log.warn('uploadEpisode', 'Deleted the failed upload from the storage channel', { targetChannelId, messageId: sent.id });
-    } catch (delErr) {
-      log.error('uploadEpisode', 'Failed to delete the bad upload — a stray non-video document may remain in the storage channel', delErr, {
-        targetChannelId, messageId: sent.id, stack: delErr.stack,
-      });
+    if (sent?.id) {
+      try {
+        await client.deleteMessages(entity, [sent.id], { revoke: true });
+        log.warn('uploadEpisode', 'Deleted the failed first-attempt upload from the storage channel', { targetChannelId, messageId: sent.id });
+      } catch (delErr) {
+        log.error('uploadEpisode', 'Failed to delete the bad upload — a stray non-video document may remain in the storage channel', delErr, {
+          targetChannelId, messageId: sent.id, stack: delErr.stack,
+        });
+      }
     }
-    throw new Error(
-      'Telegram did not recognize the uploaded file as playable video media (no DocumentAttributeVideo on the ' +
-      'stored document) — it would show up as a plain file attachment with no inline player. Not saving this as a successful upload.'
-    );
+
+    methodUsed = 'uploadFile+sendFile (alternate, serial worker)';
+    log.info('uploadEpisode', 'Retrying upload once using the alternate method', { targetChannelId, filePath, uploadMethod: methodUsed });
+    try {
+      sent = await sendViaAlternateMethod(opts.thumbPath);
+    } catch (err) {
+      log.error('uploadEpisode', 'Alternate upload method also failed to send', err, { targetChannelId, filePath, stack: err.stack });
+      throw new Error(`Alternate upload method failed after the first attempt was stored as a non-video document: ${err.message}`);
+    }
+    ({ document: doc, attr: videoAttr } = checkForVideoAttribute(sent, methodUsed));
+
+    if (!doc || !videoAttr) {
+      log.error(
+        'uploadEpisode',
+        'Telegram stored the alternate-method retry as a plain document too — giving up, not saving this as a successful upload',
+        new Error(`attributes=[${(doc?.attributes || []).map((a) => a.className).join(', ') || 'none'}]`),
+        { targetChannelId, filePath, messageId: sent?.id ?? null, mimeType: doc?.mimeType }
+      );
+      if (sent?.id) {
+        try {
+          await client.deleteMessages(entity, [sent.id], { revoke: true });
+          log.warn('uploadEpisode', 'Deleted the failed alternate-method upload from the storage channel', { targetChannelId, messageId: sent.id });
+        } catch (delErr) {
+          log.error('uploadEpisode', 'Failed to delete the bad alternate-method upload — a stray non-video document may remain in the storage channel', delErr, {
+            targetChannelId, messageId: sent.id, stack: delErr.stack,
+          });
+        }
+      }
+      throw new Error(
+        'Telegram did not recognize the uploaded file as playable video media (no DocumentAttributeVideo on the ' +
+        'stored document) on either the primary or alternate upload method — it would show up as a plain file ' +
+        'attachment with no inline player. Not saving this as a successful upload.'
+      );
+    }
+    log.success('uploadEpisode', 'Alternate upload method succeeded — Telegram confirmed DocumentAttributeVideo', { targetChannelId, filePath, messageId: sent.id });
   }
+
+  // At this point `doc`/`videoAttr` are guaranteed to be a real,
+  // Telegram-confirmed DocumentAttributeVideo (checkForVideoAttribute
+  // above already gated on this, retrying with the alternate method and
+  // throwing if both attempts failed) — the remaining checks verify the
+  // streaming/audio/mimeType details of that confirmed video.
   if (!videoAttr.supportsStreaming) {
     log.warn('uploadEpisode', 'Uploaded video is missing supportsStreaming on the stored document — playback may require a full download before it starts', {
       targetChannelId, filePath, messageId: sent.id,
@@ -455,12 +551,31 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
     });
   }
 
+  // "Inline player works" verification: the concrete, checkable signals
+  // Telegram exposes for that are exactly (a) a confirmed
+  // DocumentAttributeVideo (already gated on above), (b) a non-zero
+  // duration/width/height on THAT attribute (Telegram's own analysis,
+  // not just what we sent), and (c) supportsStreaming true. There is no
+  // further RPC that renders the player itself, so these three together
+  // are treated as the inline-player-works confirmation.
+  const inlinePlayerVerified = !!videoAttr && videoAttr.duration > 0 && videoAttr.w > 0 && videoAttr.h > 0 && !!videoAttr.supportsStreaming;
+  if (!inlinePlayerVerified) {
+    log.warn('uploadEpisode', 'DocumentAttributeVideo is present but one or more playability signals look off — inline player may not behave as expected', {
+      targetChannelId, filePath, messageId: sent.id,
+      duration: videoAttr.duration, w: videoAttr.w, h: videoAttr.h, supportsStreaming: !!videoAttr.supportsStreaming,
+    });
+  }
+
   const remoteSizeBytes = Number(doc.size);
   const elapsedMs = Date.now() - startedAt;
   log.success('uploadEpisode', 'Upload completed and verified as playable video', {
     targetChannelId, messageId: sent.id, localSizeBytes, remoteSizeBytes, elapsedMs, finishedAt: new Date().toISOString(),
+    uploadMethod: methodUsed,
+    mimeTypeSent: mimeType, mimeTypeReturned: doc.mimeType,
+    durationSent: duration, widthSent: width, heightSent: height,
     verifiedDuration: videoAttr.duration, verifiedWidth: videoAttr.w, verifiedHeight: videoAttr.h,
     supportsStreaming: !!videoAttr.supportsStreaming, nosound: !!videoAttr.nosound,
+    inlinePlayerVerified,
   });
 
   if (Number.isFinite(remoteSizeBytes) && remoteSizeBytes !== localSizeBytes) {
@@ -483,6 +598,12 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
     accessHash: doc.accessHash ? doc.accessHash.toString() : null,
     size: remoteSizeBytes,
     mimeType: doc.mimeType || 'video/mp4',
+    duration: videoAttr.duration,
+    width: videoAttr.w,
+    height: videoAttr.h,
+    supportsStreaming: !!videoAttr.supportsStreaming,
+    uploadMethod: methodUsed,
+    inlinePlayerVerified,
   };
 }
 
