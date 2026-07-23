@@ -486,9 +486,56 @@ async function uploadEpisode(targetChannelId, filePath, opts = {}) {
   };
 }
 
+/**
+ * Uploads the ffmpeg-generated episode thumbnail (see
+ * services/compress.js#generateEpisodeThumbnail) as a plain Bot API
+ * photo message into the storage channel, purely to obtain a normal
+ * Bot-API `file_id` — the exact same kind of id the admin's manually
+ * uploaded anime poster already produces (handlers/adminUpload.js's
+ * handleThumbnailPhoto), and the same kind utils/serialize.js's
+ * resolveFileUrl() already knows how to turn into a displayable URL.
+ * This is a plain bot.sendPhoto() call — never copyMessage/
+ * forwardMessage, and never touches the video pipeline at all.
+ *
+ * Best-effort by design: a failure here must never fail the episode
+ * upload itself — callers should catch and fall back to no episode
+ * thumbnail (the frontend/serializer falls back to a placeholder).
+ *
+ * @param {import('node-telegram-bot-api')} bot
+ * @param {number|string} targetChannelId storage channel to post the photo into
+ * @param {string} jpgPath local path of the generated JPEG frame
+ * @returns {string} the Bot API file_id of the uploaded photo
+ */
+async function uploadEpisodeThumbnailPhoto(bot, targetChannelId, jpgPath) {
+  if (!bot) throw new Error('uploadEpisodeThumbnailPhoto: no bot instance available.');
+  if (!jpgPath) throw new Error('uploadEpisodeThumbnailPhoto: no thumbnail file path given.');
+
+  log.info('uploadEpisodeThumbnailPhoto', 'Uploading episode thumbnail photo', { targetChannelId, jpgPath });
+  const sent = await bot.sendPhoto(targetChannelId, fs.createReadStream(jpgPath), {
+    disable_notification: true,
+  });
+
+  const sizes = sent && sent.photo;
+  if (!Array.isArray(sizes) || !sizes.length) {
+    throw new Error('Telegram accepted the photo upload but returned no photo sizes — cannot record a file_id.');
+  }
+  // Telegram returns photo sizes smallest-first — the last entry is the
+  // largest, which is what we want to resolve/display.
+  const best = sizes[sizes.length - 1];
+  if (!best || !best.file_id) {
+    throw new Error('Telegram photo upload response is missing a file_id.');
+  }
+
+  log.success('uploadEpisodeThumbnailPhoto', 'Episode thumbnail uploaded', {
+    targetChannelId, messageId: sent.message_id, fileId: best.file_id,
+  });
+  return best.file_id;
+}
+
 module.exports = {
   downloadViaBotApi,
   downloadFromChannel,
   uploadEpisode,
+  uploadEpisodeThumbnailPhoto,
   BOT_API_DOWNLOAD_LIMIT_BYTES,
 };

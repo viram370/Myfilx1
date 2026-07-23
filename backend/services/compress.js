@@ -801,6 +801,58 @@ async function generateThumbnail(videoPath, outputJpgPath, durationSeconds) {
   return outputJpgPath;
 }
 
+/**
+ * Picks the seek point (in seconds) for the auto-generated EPISODE
+ * thumbnail shown throughout the app (episode list, continue watching,
+ * recently watched, recommendations, player "next episode" card, etc.)
+ * — a distinct thumbnail from the anime/series poster the admin uploads
+ * by hand in /addanime, and from generateThumbnail() above (which is
+ * only ever used for Telegram's own in-chat message preview).
+ *
+ * Spec: prefer a frame 15–30s in; for shorter episodes, fall back to
+ * ~10% of the duration so the seek point never lands past the end of a
+ * short clip.
+ */
+function computeEpisodeThumbnailSeek(durationSeconds) {
+  const d = Number(durationSeconds) || 0;
+  if (d >= 30) return 20; // comfortably inside the 15-30s window
+  if (d > 3) {
+    // 10% of duration, but never so close to the end that ffmpeg has no
+    // frame left to grab, and never before 1s.
+    return Math.max(1, Math.min(d - 1, Math.floor(d * 0.1)));
+  }
+  return 0; // sub-3s clip — nothing safer to seek to than the first frame
+}
+
+/**
+ * Extracts a single JPEG frame to use as the EPISODE's own display
+ * thumbnail (as opposed to the anime/series poster, which is always the
+ * image the admin uploads manually during /addanime and is never
+ * touched by this function). Failure here must NEVER crash or fail the
+ * upload — callers treat a thrown/rejected result as "no episode
+ * thumbnail this time, fall back to a placeholder", exactly like
+ * generateThumbnail() above.
+ */
+async function generateEpisodeThumbnail(videoPath, outputJpgPath, durationSeconds) {
+  const seekSeconds = computeEpisodeThumbnailSeek(durationSeconds);
+  const args = [
+    '-y',
+    '-ss', String(seekSeconds),
+    '-i', videoPath,
+    '-frames:v', '1',
+    '-vf', 'scale=480:-2',
+    '-q:v', '3',
+    outputJpgPath,
+  ];
+  await runFfmpeg(args, null, 0);
+
+  const stat = fs.statSync(outputJpgPath);
+  if (!stat.size) {
+    throw new Error('Episode thumbnail generation produced an empty file');
+  }
+  return outputJpgPath;
+}
+
 function cleanupTierOutput(outputPath) {
   try { fs.unlinkSync(outputPath); } catch (err) { if (err.code !== 'ENOENT') log.warn('cleanupTierOutput', 'Failed to remove invalid output file', { outputPath, reason: err.message }); }
 }
@@ -946,4 +998,4 @@ async function processFile(inputPath, outputPath, onProgress) {
   throw new Error(`FFmpeg compression failed after ${tiers.length} attempt(s): ${lastErr ? lastErr.message : 'unknown error'}`);
 }
 
-module.exports = { probe, analyze, processFile, verifyOutputFile, generateThumbnail, ensureAvailable, detectHardwareEncoder };
+module.exports = { probe, analyze, processFile, verifyOutputFile, generateThumbnail, generateEpisodeThumbnail, ensureAvailable, detectHardwareEncoder };
