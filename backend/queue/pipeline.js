@@ -577,10 +577,14 @@ function cleanupFile(p) {
  * unchanged into DocumentAttributeVideo, is exactly what causes Telegram
  * to fall back to storing the upload as a plain document with no inline
  * player — the bug this function fixes. Also confirms the container is
- * genuinely a valid, playable MP4 (real video stream, non-zero duration,
- * H.264/AAC, faststart) BEFORE any upload attempt is made, and derives
+ * genuinely a valid, playable MP4 (real video stream, non-zero duration/
+ * resolution/frame rate) BEFORE any upload attempt is made, and derives
  * the real MIME type from the file's own bytes rather than an assumed
- * extension.
+ * extension. It does NOT require H.264/AAC or a "faststart" moov-atom
+ * position — those are logged for visibility but never block the
+ * upload; only Telegram's own post-upload response decides whether a
+ * given codec/container/moov-position combination is accepted as
+ * playable video.
  *
  * On success, overwrites item.durationHint/widthHint/heightHint with the
  * probed ground-truth values (kept as the same field names so the
