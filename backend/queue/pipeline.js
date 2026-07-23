@@ -70,6 +70,7 @@ const path = require('path');
 const { makeLogger } = require('../utils/logger');
 const log = makeLogger('queue/pipeline.js');
 const transfer = require('../services/telegramUpload');
+const compress = require('../services/compress');
 const { getDB, getAdmin } = require('../services/firebase');
 
 // Uses the OS temp dir rather than a path inside the repo — safer across
@@ -353,7 +354,14 @@ function addItem(session, media, msg, opts = {}) {
     probe: null, // no longer populated (no ffprobe pass) — duration/width/height always come from durationHint/widthHint/heightHint (Telegram's own metadata) instead
     error: null,
     uploading: false,
-    tempThumb: null, // no longer populated (no ffmpeg thumbnail extraction) — always uploads without a custom thumb
+    // Local path of the ffmpeg-generated per-EPISODE display thumbnail
+    // (see generateEpisodeThumbnailForItem below) — distinct from the
+    // anime/series poster (session.thumbnailFileId), which always stays
+    // whatever the admin uploaded manually in /addanime. Best-effort:
+    // stays null if generation ever fails, and the episode simply gets
+    // no episodeThumbnailFileId (frontend falls back to a placeholder).
+    tempThumb: null,
+    episodeThumbnailFileId: null,
   };
   session.items.push(item);
 
@@ -536,6 +544,39 @@ function cleanupFile(p) {
 }
 
 /**
+ * Auto-generates the per-EPISODE display thumbnail from the just-
+ * downloaded video file (see compress.js#generateEpisodeThumbnail —
+ * seeks 15-30s in, or ~10% for shorter clips). This is the thumbnail
+ * shown for the episode itself (episode list, continue watching,
+ * recently watched, recommendations, player) — it is completely
+ * separate from the anime/series poster the admin uploads by hand in
+ * /addanime, which is never touched here or anywhere in this file.
+ *
+ * NEVER fatal: any failure (ffmpeg missing, decode error, etc.) is
+ * logged and swallowed — item.tempThumb simply stays null, and the
+ * episode is saved with no episodeThumbnailFileId. The frontend/
+ * serializer treats a missing episode thumbnail as "use a placeholder",
+ * never a crash.
+ */
+async function generateEpisodeThumbnailForItem(session, item) {
+  if (!item.tempIn) return;
+  const thumbPath = path.join(UPLOADS_DIR, `${session.chatId}_${item.seq}_${Date.now()}.thumb.jpg`);
+  try {
+    await compress.generateEpisodeThumbnail(item.tempIn, thumbPath, item.durationHint || 0);
+    item.tempThumb = thumbPath;
+    log.success('generateEpisodeThumbnailForItem', 'Episode thumbnail generated', {
+      chatId: session.chatId, seq: item.seq, thumbPath,
+    });
+  } catch (err) {
+    log.warn('generateEpisodeThumbnailForItem', 'Episode thumbnail generation failed — continuing without one', {
+      chatId: session.chatId, seq: item.seq, reason: err.message,
+    });
+    cleanupFile(thumbPath);
+    item.tempThumb = null;
+  }
+}
+
+/**
  * Best-effort thumbnail extraction — NEVER fatal to the item. Telegram's
  * own server-side auto-thumbnail generation for MTProto uploads isn't
  * fully reliable, and a video that ends up with no preview looks
@@ -580,6 +621,8 @@ async function runDirectTransferJob({ chatId, seq }) {
       item.tempOut = inPath;
       item.downloadProgress = 100;
       log.success('runDirectTransferJob', 'Download completed — uploading original file unmodified (no re-encoding)', { chatId, seq, path: inPath, method: 'bot-api' });
+
+      await generateEpisodeThumbnailForItem(session, item);
 
       item.status = 'ready';
       await session.onProgress(session, { force: true });
@@ -721,6 +764,8 @@ async function runForwardedTransferJob({ chatId, seq }) {
       item.downloadProgress = 100;
       log.success('runForwardedTransferJob', 'Download completed — uploading as a new file unmodified (no re-encoding, no copy/forward)', { chatId, seq, path: inPath, method: 'mtproto' });
 
+      await generateEpisodeThumbnailForItem(session, item);
+
       item.status = 'ready';
       await session.onProgress(session, { force: true });
       pumpUploadQueue();
@@ -778,7 +823,7 @@ async function uploadPreparedFile(session, item) {
         duration: item.durationHint || 0,
         width: item.widthHint || 0,
         height: item.heightHint || 0,
-        thumbPath: undefined, // no ffmpeg-generated thumbnail anymore
+        thumbPath: item.tempThumb || undefined, // reuse the auto-generated episode thumbnail (if any) as Telegram's own message preview too
         onProgress: (percent) => {
           if (Number.isFinite(localFileSizeBytes)) updateTransferSpeed(item, 'uploadSpeedState', Math.round((percent / 100) * localFileSizeBytes));
           reportBucketedProgress(session, item, 'uploadProgress', percent);
@@ -789,6 +834,25 @@ async function uploadPreparedFile(session, item) {
         chatId: session.chatId, seq: item.seq, newMessageId: result.messageId,
         localFileSizeBytes, telegramDocumentSizeBytes: result.size, elapsedMs: Date.now() - uploadStartedAt,
       });
+
+      // Best-effort: push the ffmpeg-generated episode thumbnail (if one
+      // was produced) up to Telegram as its own photo message so we get a
+      // resolvable file_id — see telegramUpload.js#uploadEpisodeThumbnailPhoto.
+      // A failure here is NEVER fatal to the episode: it just gets saved
+      // with no episodeThumbnailFileId, and the frontend falls back to a
+      // placeholder image instead of crashing.
+      if (item.tempThumb) {
+        try {
+          item.episodeThumbnailFileId = await transfer.uploadEpisodeThumbnailPhoto(botInstance, session.storageChannelId, item.tempThumb);
+        } catch (thumbErr) {
+          log.warn('uploadPreparedFile', 'Episode thumbnail photo upload failed — saving episode with no episode thumbnail', {
+            chatId: session.chatId, seq: item.seq, reason: thumbErr.message,
+          });
+          item.episodeThumbnailFileId = null;
+        }
+        cleanupFile(item.tempThumb);
+        item.tempThumb = null;
+      }
 
       await writeFirestoreDoc(session, item, item.episode, result);
       log.success('uploadPreparedFile', 'Firestore updated', { chatId: session.chatId, seq: item.seq, episode: item.episode });
@@ -818,6 +882,8 @@ async function uploadPreparedFile(session, item) {
         item.finishedAt = Date.now();
         log.error('uploadPreparedFile', 'Failed', new Error(item.error), { chatId: session.chatId, seq: item.seq });
         cleanupFile(item.tempIn);
+        cleanupFile(item.tempThumb);
+        item.tempThumb = null;
         await session.onProgress(session, { force: true });
         return;
       }
@@ -903,7 +969,15 @@ async function writeFirestoreDoc(session, item, episode, uploadResult) {
     language: session.language,
     quality: session.quality || null,
     year: session.year || null,
+    // The anime/series poster — ALWAYS the image the admin uploaded by
+    // hand during /addanime. Never overwritten with an episode thumbnail.
     thumbnailFileId: session.thumbnailFileId || null,
+    // The auto-generated per-EPISODE display thumbnail (see
+    // generateEpisodeThumbnailForItem above) — separate field, separate
+    // image, used only when displaying this individual episode. Null if
+    // generation/upload failed for this episode; the frontend falls back
+    // to a placeholder rather than ever substituting the anime poster.
+    episodeThumbnailFileId: item.episodeThumbnailFileId || null,
     duration: item.durationHint || 0,
     fileSizeBytes: uploadResult.size,
     published: true,
