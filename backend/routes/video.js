@@ -26,7 +26,7 @@ router.get('/:id', softAuth, async (req, res) => {
       if (!episodes.length) {
         episodes = await queryDocs('videos', [['published', '==', true], ['title', '==', seriesTitle]]);
       }
-      serialized.seasons = groupIntoSeasons(episodes.length ? episodes : [doc]);
+      serialized.seasons = await groupIntoSeasons(episodes.length ? episodes : [doc], serialized.thumbnail);
     }
 
     res.json({ video: serialized });

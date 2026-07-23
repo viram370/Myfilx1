@@ -46,7 +46,7 @@ const { getDoc, updateDoc, addDoc } = require('../services/firebase');
 const mtproto = require('../services/mtproto');
 const playbackCompat = require('../services/playbackCompat');
 const { requireAuth, softAuth } = require('../middleware/auth');
-const { requireDocId, ApiValidationError, clampInt } = require('../utils/validators');
+const { requireDocId, ApiValidationError, clampInt, slugify } = require('../utils/validators');
 const { makeLogger } = require('../utils/logger');
 const log = makeLogger('routes/stream.js');
 
@@ -362,14 +362,52 @@ router.post('/:videoId/progress', requireAuth, async (req, res) => {
     }
 
     const progressPercent = duration ? Math.round((position / duration) * 100) : 0;
+    const completed = progressPercent >= 90;
+    const watchedAt = new Date().toISOString();
     const docId = `${userId}_${videoId}`;
 
     const { setDoc } = require('../services/firebase');
+    // Per-EPISODE resume position — keyed by the exact video, used only by
+    // GET /:videoId/progress below to restore playback of THIS episode.
     await setDoc('continueWatching', docId, {
       userId, videoId, position, duration, progressPercent,
-      completed: progressPercent >= 90,
-      watchedAt: new Date().toISOString(),
+      completed,
+      watchedAt,
     });
+
+    // ---- Continue Watching (home row) summary ----------------------------
+    // FIX for "shows Episode 12 even though only Episode 1 was watched":
+    // the old design keyed this summary per-episode too, so watching
+    // episode 1 and later episode 3 of the same anime created TWO separate
+    // rows instead of updating one — whichever had the more recent
+    // watchedAt could win the sort, showing a stale/unexpected episode.
+    // Keying this by SERIES (userId + a stable slug of seriesTitle/title)
+    // means any episode of the same anime always overwrites the single
+    // existing entry with the real season/episode/position/duration/
+    // timestamp just watched — never a duplicate, never a wrong episode.
+    try {
+      const video = await getDoc('videos', videoId);
+      if (video) {
+        const seriesKey = slugify(video.seriesTitle || video.title || videoId);
+        const seriesDocId = `${userId}_${seriesKey}`;
+        await setDoc('continueWatchingSeries', seriesDocId, {
+          userId,
+          seriesKey,
+          videoId,
+          title: video.title || '',
+          seriesTitle: video.seriesTitle || video.title || '',
+          season: video.season != null ? Number(video.season) : null,
+          episode: video.episode != null ? Number(video.episode) : null,
+          position, duration, progressPercent,
+          completed,
+          watchedAt,
+        });
+      }
+    } catch (seriesErr) {
+      // Never let the summary-row update fail the actual progress save —
+      // the per-episode resume position above already succeeded.
+      log.warn('saveProgress', 'Failed to update Continue Watching series summary', { videoId, reason: seriesErr.message });
+    }
 
     res.json({ saved: true, progressPercent });
   } catch (err) {

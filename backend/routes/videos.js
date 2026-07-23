@@ -53,7 +53,7 @@ router.get('/', softAuth, async (req, res) => {
         const rep = episodes[0];
         const serialized = await serializeVideo(rep, { withImage: true });
         serialized.title = seriesTitle;
-        serialized.seasons = groupIntoSeasons(episodes);
+        serialized.seasons = await groupIntoSeasons(episodes, serialized.thumbnail);
         return serialized;
       })),
     ]);
