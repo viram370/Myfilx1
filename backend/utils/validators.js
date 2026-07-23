@@ -46,6 +46,12 @@ function paginationParams(query, { defaultLimit = 30, maxLimit = 100 } = {}) {
   return { limit, cursor };
 }
 
+/** Stable, URL/doc-id-safe key for grouping — e.g. one Continue Watching
+ * entry per anime/series regardless of which episode was last watched. */
+function slugify(str) {
+  return String(str || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-+|-+$)/g, '').slice(0, 80) || 'untitled';
+}
+
 module.exports = {
   ApiValidationError,
   isValidDocId,
@@ -54,5 +60,6 @@ module.exports = {
   clampInt,
   isValidCategory,
   paginationParams,
+  slugify,
   DOC_ID_RE,
 };

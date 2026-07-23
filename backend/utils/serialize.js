@@ -89,6 +89,19 @@ async function serializeVideo(doc, { withImage = true } = {}) {
     }
   }
 
+  // The per-EPISODE display thumbnail — auto-generated from the episode's
+  // own video (see backend/services/compress.js#generateEpisodeThumbnail),
+  // completely separate from `thumbnail` above (which is always the
+  // anime/series poster the admin uploaded by hand in /addanime and must
+  // never be replaced by an episode frame). Falls back to the anime
+  // poster — never null-vs-crash — if this specific episode has no
+  // generated thumbnail yet (e.g. generation failed for it).
+  let episodeThumbnail = thumbnail;
+  if (withImage && doc.episodeThumbnailFileId) {
+    const resolved = await resolveFileUrl(doc.episodeThumbnailFileId);
+    if (resolved) episodeThumbnail = resolved;
+  }
+
   return {
     id: doc.id || doc._id || null,
 
@@ -111,6 +124,13 @@ async function serializeVideo(doc, { withImage = true } = {}) {
     thumbnail,
     poster: thumbnail,
     banner: thumbnail,
+    // Individual-episode thumbnail — use ONLY when displaying this one
+    // episode (episode list rows, continue watching, recently watched,
+    // recommendations of individual episodes, the player's next-episode
+    // card). Anime cards, search results, home page, categories and the
+    // detail page header must keep using `thumbnail`/`poster`/`banner`
+    // above instead.
+    episodeThumbnail,
 
     season: doc.season != null ? Number(doc.season) : null,
     episode: doc.episode != null ? Number(doc.episode) : null,
@@ -138,9 +158,17 @@ async function serializeVideos(docs, opts = {}) {
 }
 
 /**
- * Group episodes into seasons for series cards
+ * Group episodes into seasons for series cards.
+ *
+ * `fallbackThumbnail` should be the series/anime poster (already-resolved
+ * URL) — used only when an individual episode has no auto-generated
+ * thumbnail of its own (e.g. generation failed for that one episode), so
+ * the UI never shows a broken image, and never silently reuses a STALE
+ * value from `ep.thumbnail` the way this used to (that field is never
+ * actually set on a raw Firestore doc, so every episode row used to come
+ * back with `thumbnail: null` regardless of what was uploaded).
  */
-function groupIntoSeasons(episodes) {
+async function groupIntoSeasons(episodes, fallbackThumbnail = null) {
   if (!Array.isArray(episodes) || episodes.length === 0) {
     return [];
   }
@@ -151,14 +179,20 @@ function groupIntoSeasons(episodes) {
     if (!ep) continue;
     const s = ep.season != null ? Number(ep.season) : 1;
     if (!bySeasonNum[s]) bySeasonNum[s] = [];
-    
+
+    let epThumbnail = fallbackThumbnail;
+    if (ep.episodeThumbnailFileId) {
+      const resolved = await resolveFileUrl(ep.episodeThumbnailFileId);
+      if (resolved) epThumbnail = resolved;
+    }
+
     bySeasonNum[s].push({
       ep: ep.episode != null ? Number(ep.episode) : 1,
       title: ep.title || `Episode ${ep.episode || 1}`,
       duration: Number(ep.duration) || 0,
       prog: Number(ep.progressPercent) || 0,
       videoId: ep.id || ep._id,
-      thumbnail: ep.thumbnail || null
+      thumbnail: epThumbnail || null
     });
   }
 
