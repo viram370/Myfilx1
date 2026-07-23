@@ -14,8 +14,8 @@
  *        addItem does no download/compression/upload/worker-assignment):
  *          - direct upload to the bot -> Bot API only (file_id)
  *          - forwarded from a channel -> real channel id + message id
- *            (from Telegram's forward metadata), used later for
- *            copyMessage()/MTProto
+ *            (from Telegram's forward metadata), used later for a real
+ *            MTProto download (never copyMessage — see queue/pipeline.js)
  *          - posted straight into a private storage channel the bot
  *            admins (channel_post/edited_channel_post) -> same real
  *            channel id + message id, joining whichever /add batch(es)
@@ -458,9 +458,9 @@ function isRecognizedChannel(channelId) {
  * they're routed into every /add batch currently waiting for episodes
  * (mirrors the legacy buffer's multi-admin broadcast in services/bot.js).
  * Each gets flagged channelNative so pipeline.js treats the post itself —
- * not a forward — as the source, buffers it, and it gets picked up (via
- * copyMessage/MTProto against that same real channel) once the batch is
- * locked.
+ * not a forward — as the source, buffers it, and it gets picked up (via a
+ * real MTProto download against that same real channel, never copyMessage)
+ * once the batch is locked.
  */
 async function captureChannelEpisode(msg, source) {
   if (!isRecognizedChannel(msg.chat.id)) return;
