@@ -14,6 +14,14 @@
   // Point this at your deployed backend (see README).
   window.MYFLIX_API = window.MYFLIX_API || 'https://myfilx1.onrender.com/api';
 </script>
+<script>
+  // Apply the saved theme before first paint, so switching to Light/AMOLED
+  // in Settings doesn't flash the default dark theme on next launch.
+  try{
+    const s=JSON.parse(localStorage.getItem('myflix_settings')||'{}');
+    document.documentElement.setAttribute('data-theme', s.theme||'dark');
+  }catch(_){document.documentElement.setAttribute('data-theme','dark');}
+</script>
 <style>
 :root{
   --bg:#090910;--bg-c:#111118;--bg-e:#191924;--bg-m:#0d0d15;
@@ -24,10 +32,26 @@
   --gold:#f5c518;
   --t1:#f0f0f8;--t2:#8a8a9a;--t3:#3a3a50;
   --bdr:rgba(255,255,255,.07);--bdr2:rgba(255,255,255,.14);
+  --fill:rgba(255,255,255,.07);--fill2:rgba(255,255,255,.14);--fill-active:rgba(255,255,255,.16);
+  --nav-bg:rgba(9,9,16,.98);
   --r8:8px;--r12:12px;--r16:16px;--r20:20px;
   --nav:62px;
   --sb:env(safe-area-inset-bottom,0px);--st:env(safe-area-inset-top,0px);
   --ease:cubic-bezier(.4,0,.2,1);--spring:cubic-bezier(.34,1.56,.64,1);
+}
+/* ══ THEMES — Settings > Appearance swaps these on <html data-theme> ══ */
+html[data-theme="light"]{
+  --bg:#f4f4f8;--bg-c:#ffffff;--bg-e:#eceef3;--bg-m:#eef0f4;
+  --t1:#14141c;--t2:#5c5c6e;--t3:#c7c7d4;
+  --bdr:rgba(0,0,0,.08);--bdr2:rgba(0,0,0,.14);
+  --fill:rgba(0,0,0,.045);--fill2:rgba(0,0,0,.08);--fill-active:rgba(0,0,0,.1);
+  --nav-bg:rgba(255,255,255,.96);
+}
+html[data-theme="amoled"]{
+  --bg:#000000;--bg-c:#0a0a0a;--bg-e:#141414;--bg-m:#000000;
+  --bdr:rgba(255,255,255,.06);--bdr2:rgba(255,255,255,.12);
+  --fill:rgba(255,255,255,.06);--fill2:rgba(255,255,255,.12);--fill-active:rgba(255,255,255,.15);
+  --nav-bg:rgba(0,0,0,.98);
 }
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html,body{height:100%;overflow:hidden}
@@ -66,7 +90,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
   position:relative;z-index:100;
   display:flex;align-items:center;gap:10px;
   padding:calc(var(--st)+10px) 14px 8px;
-  background:rgba(9,9,16,.97);
+  background:var(--nav-bg);
   pointer-events:none;
   flex-shrink:0;
 }
@@ -77,9 +101,9 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 .nav-r{font-size:17px;font-weight:800;color:var(--t1);letter-spacing:-.3px}
 .nav-search{flex:1;position:relative;display:flex;align-items:center}
 .nav-si{position:absolute;left:11px;top:50%;transform:translateY(-50%);color:var(--t2);pointer-events:none}
-.nav-input{width:100%;height:36px;background:rgba(255,255,255,.08);border:1.5px solid rgba(255,255,255,.1);border-radius:18px;color:var(--t1);font-size:13px;font-family:inherit;padding:0 34px 0 34px;outline:none;transition:border-color .2s,background .2s,box-shadow .2s}
+.nav-input{width:100%;height:36px;background:var(--fill);border:1.5px solid var(--bdr2);border-radius:18px;color:var(--t1);font-size:13px;font-family:inherit;padding:0 34px 0 34px;outline:none;transition:border-color .2s,background .2s,box-shadow .2s}
 .nav-input::placeholder{color:var(--t3)}
-.nav-input:focus{border-color:rgba(229,9,20,.45);background:rgba(255,255,255,.1);box-shadow:0 0 0 3px var(--red-d)}
+.nav-input:focus{border-color:rgba(229,9,20,.45);background:var(--fill2);box-shadow:0 0 0 3px var(--red-d)}
 .nav-clr{position:absolute;right:10px;top:50%;transform:translateY(-50%);width:18px;height:18px;border-radius:50%;background:var(--bg-e);color:var(--t2);font-size:11px;display:flex;align-items:center;justify-content:center}
 .nav-prof{flex-shrink:0;width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,var(--red),#a00);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:#fff;box-shadow:0 0 0 2px rgba(229,9,20,.3);transition:transform .15s}
 .nav-prof:active{transform:scale(.9)}
@@ -88,7 +112,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 .chip-wrap{
   flex-shrink:0;
   padding:7px 14px 8px;
-  background:rgba(9,9,16,.97);
+  background:var(--nav-bg);
   border-bottom:1px solid var(--bdr);
   position:relative;z-index:99;
 }
@@ -97,9 +121,9 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 .chip{
   flex-shrink:0;display:flex;align-items:center;gap:5px;
   padding:6px 14px;border-radius:18px;
-  border:1.5px solid rgba(255,255,255,.1);
+  border:1.5px solid var(--bdr2);
   font-size:12px;font-weight:600;color:var(--t2);
-  background:rgba(255,255,255,.05);
+  background:var(--fill);
   white-space:nowrap;
   transition:color .18s,background .18s,border-color .18s,box-shadow .18s,transform .1s;
 }
@@ -178,9 +202,20 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 .ba{background:var(--anime)}.bs{background:var(--series)}.bm{background:var(--movie)}.bd{background:var(--red)}
 .card-prog{position:absolute;bottom:0;left:0;right:0;height:2.5px;background:rgba(255,255,255,.15)}
 .card-prog-fill{height:100%;background:var(--red);border-radius:1px}
-.pip{position:absolute;top:5px;right:5px;font-size:12px;filter:drop-shadow(0 1px 3px rgba(0,0,0,.8))}
+.pip{position:absolute;top:5px;right:5px;color:var(--red);filter:drop-shadow(0 1px 3px rgba(0,0,0,.8))}
 .card-title{font-size:12px;font-weight:600;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .card-meta{font-size:11px;color:var(--t2);margin-top:2px}
+
+/* ══ IMAGE LOADING — shimmer skeleton while a thumbnail loads, fade-in ══ */
+/* on success, graceful icon fallback on failure. Containers that use this */
+/* already have fixed dimensions (aspect-ratio or explicit px), so nothing */
+/* here ever causes layout shift — the shimmer occupies the exact same box */
+/* the image will fill. */
+@keyframes imgShimmer{0%{background-position:-150% 0}100%{background-position:250% 0}}
+.img-loading{background-image:linear-gradient(100deg,transparent 30%,var(--fill2) 50%,transparent 70%);background-size:250% 100%;animation:imgShimmer 1.3s ease-in-out infinite}
+.thumb-img{width:100%;height:100%;object-fit:cover;display:block;opacity:0;transition:opacity .28s ease}
+.thumb-img.loaded{opacity:1}
+.thumb-fallback{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;opacity:.35;color:var(--t1)}
 
 /* ══ GRID ══ */
 .pgrid{display:grid;grid-template-columns:1fr 1fr;gap:11px;padding:0 14px}
@@ -191,7 +226,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 .gc-meta{font-size:11px;color:var(--t2);margin-top:2px}
 
 /* ══ BOTTOM NAV ══ */
-.bnav{position:relative;z-index:200;display:flex;align-items:center;height:calc(var(--nav) + var(--sb));padding-bottom:var(--sb);background:rgba(9,9,16,.98);border-top:1px solid rgba(255,255,255,.07);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);box-shadow:0 -1px 20px rgba(0,0,0,.4)}
+.bnav{position:relative;z-index:200;display:flex;align-items:center;height:calc(var(--nav) + var(--sb));padding-bottom:var(--sb);background:var(--nav-bg);border-top:1px solid var(--bdr);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);box-shadow:0 -1px 20px rgba(0,0,0,.16)}
 .nb{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;padding:8px 0;color:var(--t3);font-size:10px;font-weight:600;letter-spacing:.2px;position:relative;transition:color .18s ease,transform .13s}
 .nb:active{transform:scale(.88)}
 .nb.on{color:var(--red)}
@@ -211,12 +246,12 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 #page-series{background:radial-gradient(circle at 20% 0%,rgba(59,130,246,.04) 0%,transparent 55%),var(--bg)}
 #page-movies{background:radial-gradient(circle at 20% 0%,rgba(168,85,247,.04) 0%,transparent 55%),var(--bg)}
 
-.sp-head{flex-shrink:0;display:flex;align-items:center;gap:10px;padding:calc(var(--st)+12px) 14px 11px;background:rgba(9,9,16,.97);border-bottom:1px solid var(--bdr);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px)}
+.sp-head{flex-shrink:0;display:flex;align-items:center;gap:10px;padding:calc(var(--st)+12px) 14px 11px;background:var(--nav-bg);border-bottom:1px solid var(--bdr);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px)}
 #page-anime .sp-head{border-bottom:1px solid rgba(255,107,53,.3);box-shadow:0 1px 16px rgba(255,107,53,.1)}
 #page-series .sp-head{border-bottom:1px solid rgba(59,130,246,.3);box-shadow:0 1px 16px rgba(59,130,246,.1)}
 #page-movies .sp-head{border-bottom:1px solid rgba(168,85,247,.3);box-shadow:0 1px 16px rgba(168,85,247,.1)}
-.sp-back{width:34px;height:34px;border-radius:50%;background:rgba(255,255,255,.07);border:1.5px solid rgba(255,255,255,.1);display:flex;align-items:center;justify-content:center;color:var(--t1);flex-shrink:0;transition:background .15s}
-.sp-back:active{background:rgba(255,255,255,.15)}
+.sp-back{width:34px;height:34px;border-radius:50%;background:var(--fill);border:1.5px solid var(--bdr2);display:flex;align-items:center;justify-content:center;color:var(--t1);flex-shrink:0;transition:background .15s}
+.sp-back:active{background:var(--fill-active)}
 .sp-title{font-size:17px;font-weight:800;letter-spacing:-.3px}
 .sp-count{font-size:11px;color:var(--t2);margin-left:auto;font-weight:600}
 
@@ -224,9 +259,9 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 .sp-search{flex-shrink:0;padding:9px 14px;border-bottom:1px solid var(--bdr)}
 .sp-si{position:absolute;left:11px;top:50%;transform:translateY(-50%);color:var(--t2);pointer-events:none}
 .sp-sinput{position:relative;display:flex;align-items:center}
-.sp-inp{width:100%;height:36px;background:rgba(255,255,255,.07);border:1.5px solid rgba(255,255,255,.09);border-radius:18px;color:var(--t1);font-size:13px;font-family:inherit;padding:0 34px 0 34px;outline:none;transition:border-color .2s,background .2s,box-shadow .2s}
+.sp-inp{width:100%;height:36px;background:var(--fill);border:1.5px solid var(--bdr2);border-radius:18px;color:var(--t1);font-size:13px;font-family:inherit;padding:0 34px 0 34px;outline:none;transition:border-color .2s,background .2s,box-shadow .2s}
 .sp-inp::placeholder{color:var(--t3)}
-.sp-inp:focus{background:rgba(255,255,255,.1)}
+.sp-inp:focus{background:var(--fill2)}
 #page-anime .sp-inp:focus{border-color:rgba(255,107,53,.45);box-shadow:0 0 0 3px rgba(255,107,53,.09)}
 #page-series .sp-inp:focus{border-color:rgba(59,130,246,.45);box-shadow:0 0 0 3px rgba(59,130,246,.09)}
 #page-movies .sp-inp:focus{border-color:rgba(168,85,247,.45);box-shadow:0 0 0 3px rgba(168,85,247,.09)}
@@ -240,10 +275,10 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 .prof-page{position:fixed;inset:0;z-index:300;background:var(--bg);overflow-y:auto;scrollbar-width:none;transform:translateY(100%);transition:transform .35s var(--ease)}
 .prof-page.open{transform:translateY(0)}
 .prof-page::-webkit-scrollbar{display:none}
-.pp-head{position:sticky;top:0;z-index:10;display:flex;align-items:center;padding:calc(var(--st)+12px) 14px 12px;background:rgba(9,9,16,.97);border-bottom:1px solid var(--bdr);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px)}
+.pp-head{position:sticky;top:0;z-index:10;display:flex;align-items:center;padding:calc(var(--st)+12px) 14px 12px;background:var(--nav-bg);border-bottom:1px solid var(--bdr);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px)}
 .pp-title{font-size:17px;font-weight:800}
-.pp-close{margin-left:auto;width:34px;height:34px;border-radius:50%;background:rgba(255,255,255,.07);border:1.5px solid rgba(255,255,255,.1);display:flex;align-items:center;justify-content:center;color:var(--t1);transition:background .15s}
-.pp-close:active{background:rgba(255,255,255,.15)}
+.pp-close{margin-left:auto;width:34px;height:34px;border-radius:50%;background:var(--fill);border:1.5px solid var(--bdr2);display:flex;align-items:center;justify-content:center;color:var(--t1);transition:background .15s}
+.pp-close:active{background:var(--fill-active)}
 .pp-hero{padding:28px 20px 18px;display:flex;flex-direction:column;align-items:center;gap:10px;background:linear-gradient(180deg,rgba(229,9,20,.06) 0%,transparent 100%)}
 .pp-av{width:80px;height:80px;border-radius:50%;background:linear-gradient(135deg,var(--red),#900);display:flex;align-items:center;justify-content:center;font-size:29px;font-weight:800;color:#fff;box-shadow:0 0 0 3px rgba(229,9,20,.28),0 0 24px var(--red-g)}
 .pp-name{font-size:18px;font-weight:800;letter-spacing:-.3px}
@@ -263,12 +298,60 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 .pp-sub{font-size:12px;color:var(--t2);margin-top:1px}
 .pp-arr{color:var(--t3)}
 
-/* ══ DOWNLOADS ══ */
-.dl-page{position:fixed;inset:0;z-index:300;background:var(--bg);display:flex;flex-direction:column;transform:translateY(100%);transition:transform .35s var(--ease)}
-.dl-page.open{transform:translateY(0)}
-.dl-empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:50px 30px;text-align:center;gap:14px}
-.dl-et{font-size:17px;font-weight:700}
-.dl-es{font-size:13px;color:var(--t2);line-height:1.65}
+/* ══ SETTINGS PAGE ══ */
+.settings-page{position:fixed;inset:0;z-index:300;background:var(--bg);display:flex;flex-direction:column;transform:translateY(100%);transition:transform .35s var(--ease)}
+.settings-page.open{transform:translateY(0)}
+.stg-scroll{flex:1;overflow-y:auto;overflow-x:hidden;scrollbar-width:none;-webkit-overflow-scrolling:touch;padding:16px 14px 40px}
+.stg-scroll::-webkit-scrollbar{display:none}
+.stg-sec{margin-bottom:22px}
+.stg-sec-t{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.1px;color:var(--t2);margin-bottom:10px}
+.stg-row{display:flex;align-items:center;gap:12px;padding:14px 13px;background:var(--bg-c);border-radius:var(--r12);border:1px solid var(--bdr);margin-bottom:7px;cursor:pointer;transition:background .14s}
+.stg-row:active{background:var(--bg-e)}
+.stg-txt{flex:1;min-width:0}
+.stg-lbl{font-size:14px;font-weight:600}
+.stg-sub{font-size:12px;color:var(--t2);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stg-val{display:flex;align-items:center;gap:5px;font-size:12.5px;font-weight:700;color:var(--t2);flex-shrink:0}
+.stg-row.locked{cursor:default}
+.stg-row.locked:active{background:var(--bg-c)}
+.stg-locked{padding:5px 11px;border-radius:8px;background:rgba(128,128,140,.14);color:var(--t2);font-size:11.5px;font-weight:700;letter-spacing:.2px}
+
+/* ══ PREMIUM PLANS ══ */
+.plans-intro{display:flex;flex-direction:column;align-items:center;text-align:center;padding:22px 24px 6px;gap:6px}
+.plans-intro-icon{width:52px;height:52px;border-radius:16px;background:rgba(245,197,24,.12);display:flex;align-items:center;justify-content:center;margin-bottom:4px}
+.plans-intro-t{font-size:19px;font-weight:800}
+.plans-intro-s{font-size:12.5px;color:var(--t2);line-height:1.6;max-width:280px}
+.plans-list{padding:18px 14px 10px;display:flex;flex-direction:column;gap:14px}
+.plan-card{position:relative;background:var(--bg-c);border:1.5px solid var(--bdr);border-radius:var(--r16);padding:18px 16px;transition:border-color .2s}
+.plan-card.popular{border-color:var(--red);box-shadow:0 0 0 1px var(--red) inset,0 8px 24px var(--red-d)}
+.plan-badge{position:absolute;top:-10px;left:16px;background:var(--red);color:#fff;font-size:10px;font-weight:800;letter-spacing:.4px;text-transform:uppercase;padding:4px 10px;border-radius:6px;box-shadow:0 4px 10px var(--red-g)}
+.plan-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:2px}
+.plan-name{font-size:16px;font-weight:800}
+.plan-price{font-size:22px;font-weight:900;color:var(--t1)}
+.plan-price span{font-size:12px;font-weight:600;color:var(--t2)}
+.plan-feats{list-style:none;margin-top:14px;display:flex;flex-direction:column;gap:9px}
+.plan-feat{display:flex;align-items:center;gap:9px;font-size:13px;color:var(--t1)}
+.plan-feat svg{flex-shrink:0;color:#2ecc71}
+.plan-cta{width:100%;margin-top:16px;padding:12px;border-radius:11px;background:var(--fill);border:1.5px solid var(--bdr2);color:var(--t1);font-size:13.5px;font-weight:700;transition:background .15s,transform .15s}
+.plan-cta:active{transform:scale(.98)}
+.plan-card.popular .plan-cta{background:var(--red);border-color:var(--red);color:#fff}
+.plan-card.popular .plan-cta:active{background:#c40810}
+.stg-row.danger .stg-lbl{color:var(--red)}
+/* toggle switch */
+.stg-toggle{width:44px;height:26px;border-radius:14px;background:rgba(255,255,255,.14);position:relative;flex-shrink:0;transition:background .2s;border:1px solid var(--bdr2)}
+.stg-toggle::after{content:'';position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;background:#fff;transition:transform .2s var(--spring);box-shadow:0 1px 3px rgba(0,0,0,.4)}
+.stg-toggle.on{background:var(--red);border-color:transparent}
+.stg-toggle.on::after{transform:translateX(18px)}
+/* segmented control */
+.stg-seg{padding:13px;background:var(--bg-c);border-radius:var(--r12);border:1px solid var(--bdr);margin-bottom:7px}
+.stg-seg-lbl{font-size:14px;font-weight:600;margin-bottom:9px}
+.stg-seg-opts{display:flex;gap:6px;flex-wrap:wrap}
+.stg-seg-btn{padding:7px 13px;border-radius:9px;font-size:12.5px;font-weight:700;color:var(--t2);background:rgba(128,128,140,.12);border:1.5px solid rgba(128,128,140,.16);transition:all .15s}
+.stg-seg-btn:active{transform:scale(.94)}
+.stg-seg-btn.on{color:#fff;background:var(--red);border-color:transparent;box-shadow:0 0 10px var(--red-g)}
+/* language / picker sheet */
+.empty-state{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:50px 30px;text-align:center;gap:14px}
+.empty-state-t{font-size:17px;font-weight:700}
+.empty-state-s{font-size:13px;color:var(--t2);line-height:1.65}
 
 /* ══ MODAL ══ */
 .modal-ov{position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.72);backdrop-filter:blur(5px);-webkit-backdrop-filter:blur(5px);opacity:0;transition:opacity .28s ease}
@@ -293,10 +376,8 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 .mbtn-play{flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:12px;border-radius:10px;background:#fff;color:#09090f;font-size:14px;font-weight:800;box-shadow:0 3px 12px rgba(0,0,0,.5);transition:opacity .14s,transform .14s}
 .mbtn-play:active{opacity:.85;transform:scale(.97)}
 /* Save: glass */
-.mbtn-save{display:flex;align-items:center;justify-content:center;gap:5px;padding:12px 14px;border-radius:10px;background:rgba(255,255,255,.07);border:1.5px solid rgba(255,255,255,.14);color:var(--t1);font-size:13px;font-weight:600;transition:background .14s,transform .14s}
-.mbtn-save:active{background:rgba(255,255,255,.15);transform:scale(.97)}
 /* Fav: glass, red when active */
-.mbtn-fav{width:46px;display:flex;align-items:center;justify-content:center;border-radius:10px;background:rgba(255,255,255,.07);border:1.5px solid rgba(255,255,255,.14);color:var(--t2);transition:all .18s ease}
+.mbtn-fav{width:46px;display:flex;align-items:center;justify-content:center;border-radius:10px;background:var(--fill);border:1.5px solid var(--bdr2);color:var(--t2);transition:all .18s ease}
 .mbtn-fav.on{color:var(--red);border-color:rgba(229,9,20,.4);background:var(--red-d)}
 
 /* Playlist/Episode section */
@@ -469,7 +550,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 <body>
 
 <div class="ytb"><div class="ytbf"></div></div>
-<div class="offline" id="offline">📡 No internet connection</div>
+<div class="offline" id="offline"><span style="display:inline-flex;align-items:center;gap:6px;justify-content:center"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 1l22 22M16.72 11.06A10.94 10.94 0 0 1 19 12.55M5 12.55a10.94 10.94 0 0 1 5.17-2.39M10.71 5.05A16 16 0 0 1 22.58 9M1.42 9a15.91 15.91 0 0 1 4.7-2.88M8.53 16.11a6 6 0 0 1 6.95 0M12 20h.01"/></svg><span>No internet connection</span></span></div>
 
 <!-- SPLASH -->
 <div id="splash" class="splash">
@@ -491,7 +572,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
     <div class="nav-search">
       <svg class="nav-si" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
       <input id="nav-input" class="nav-input" type="text" placeholder="Search anime, movies, series…" autocomplete="off"/>
-      <button id="nav-clr" class="nav-clr hidden">✕</button>
+      <button id="nav-clr" class="nav-clr hidden"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     </div>
     <button id="nav-prof" class="nav-prof"><span id="nav-av">M</span></button>
   </nav>
@@ -535,7 +616,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
           <div class="hero-bg" id="hero-bg"></div>
           <div class="hero-grad"></div>
           <div class="hero-body">
-            <div class="hero-badge" id="hero-badge">🔥 Featured</div>
+            <div class="hero-badge" id="hero-badge"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2c1 3-3 4.5-3 8a3 3 0 0 0 6 0c0-1-.5-1.8-1-2.5 2 .5 4 2.8 4 5.9a6 6 0 0 1-12 0c0-4.5 3-6 3-8.5C9 4 10 2.8 12 2z"/></svg><span>Featured</span></div>
             <h1 class="hero-title" id="hero-title"></h1>
             <div class="hero-meta" id="hero-meta"></div>
             <div class="hero-acts">
@@ -570,7 +651,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 
       <!-- Fav Anime -->
       <section class="row" data-t="fav" id="fav-anime-row" style="display:none">
-        <div class="row-head"><h2 class="row-title">❤️ Favourite Anime</h2></div>
+        <div class="row-head"><h2 class="row-title"><svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg><span>Favourite Anime</span></h2></div>
         <div class="carousel" id="fav-anime-car"></div>
       </section>
 
@@ -587,7 +668,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 
       <!-- Fav Series -->
       <section class="row" data-t="fav" id="fav-series-row" style="display:none">
-        <div class="row-head"><h2 class="row-title">❤️ Favourite Series</h2></div>
+        <div class="row-head"><h2 class="row-title"><svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg><span>Favourite Series</span></h2></div>
         <div class="carousel" id="fav-series-car"></div>
       </section>
 
@@ -604,7 +685,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 
       <!-- Fav Movies -->
       <section class="row" data-t="fav" id="fav-movies-row" style="display:none">
-        <div class="row-head"><h2 class="row-title">❤️ Favourite Movies</h2></div>
+        <div class="row-head"><h2 class="row-title"><svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg><span>Favourite Movies</span></h2></div>
         <div class="carousel" id="fav-movies-car"></div>
       </section>
 
@@ -630,10 +711,6 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="2" y="2" width="20" height="20" rx="2.5" fill="currentColor" stroke="none" opacity=".14"/><rect x="2" y="2" width="20" height="20" rx="2.5"/><path d="M7 2v5M12 2v5M17 2v5M2 7h20"/><rect x="5.5" y="11" width="3.5" height="5" rx="1" fill="currentColor" stroke="none"/></svg>
       <span>Movies</span>
     </button>
-    <button class="nb" data-p="downloads">
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M8 17H5.5A3.5 3.5 0 0 1 2 13.5c0-1.7 1.2-3.1 2.8-3.4A5 5 0 0 1 14.5 8a5 5 0 0 1 4.7 3.3A3.5 3.5 0 0 1 22 14.5 3.5 3.5 0 0 1 18.5 18H16" stroke-linecap="round"/><path d="M12 12v8" stroke-linecap="round"/><polyline points="9 17 12 20 15 17" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      <span>Downloads</span>
-    </button>
   </nav>
 </div>
 
@@ -648,7 +725,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
     <div class="sp-sinput">
       <svg class="sp-si" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
       <input class="sp-inp" id="anime-search" type="text" placeholder="Search anime…" autocomplete="off"/>
-      <button class="sp-clr hidden" id="anime-search-clr">✕</button>
+      <button class="sp-clr hidden" id="anime-search-clr"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     </div>
   </div>
   <div class="sp-body">
@@ -658,7 +735,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
         <div class="hero-bg" id="anime-hero-bg"></div>
         <div class="hero-grad"></div>
         <div class="hero-body">
-          <div class="hero-badge" id="anime-hero-badge" style="background:var(--anime)">⛩️ Featured</div>
+          <div class="hero-badge" id="anime-hero-badge" style="background:var(--anime)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 6.5h20M4 6.5V4M20 4v2.5M6 6.5v14M18 6.5v14M2 10h20"/></svg><span>Featured</span></div>
           <h2 class="hero-title" id="anime-hero-title" style="font-size:17px"></h2>
           <div class="hero-acts">
             <button class="hbtn-play" id="anime-hero-play" style="font-size:13px;padding:9px 17px"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>Play</button>
@@ -668,7 +745,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
       </div>
     </section>
     <div class="fav-band" id="anime-fav-band" style="display:none">
-      <div class="fav-label">❤️ Favourite Anime</div>
+      <div class="fav-label"><svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg><span>Favourite Anime</span></div>
       <div class="carousel" id="sp-anime-fav-car"></div>
     </div>
     <div class="row" data-t="anime" style="margin-top:18px">
@@ -689,7 +766,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
     <div class="sp-sinput">
       <svg class="sp-si" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
       <input class="sp-inp" id="series-search" type="text" placeholder="Search web series…" autocomplete="off"/>
-      <button class="sp-clr hidden" id="series-search-clr">✕</button>
+      <button class="sp-clr hidden" id="series-search-clr"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     </div>
   </div>
   <div class="sp-body">
@@ -699,7 +776,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
         <div class="hero-bg" id="series-hero-bg"></div>
         <div class="hero-grad"></div>
         <div class="hero-body">
-          <div class="hero-badge" id="series-hero-badge" style="background:var(--series)">📺 Featured</div>
+          <div class="hero-badge" id="series-hero-badge" style="background:var(--series)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="13" rx="2"/><path d="M8 21h8M12 18v3"/></svg><span>Featured</span></div>
           <h2 class="hero-title" id="series-hero-title" style="font-size:17px"></h2>
           <div class="hero-acts">
             <button class="hbtn-play" id="series-hero-play" style="font-size:13px;padding:9px 17px"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>Play</button>
@@ -709,7 +786,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
       </div>
     </section>
     <div class="fav-band" id="series-fav-band" style="display:none">
-      <div class="fav-label">❤️ Favourite Series</div>
+      <div class="fav-label"><svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg><span>Favourite Series</span></div>
       <div class="carousel" id="sp-series-fav-car"></div>
     </div>
     <div class="row" data-t="series" style="margin-top:18px">
@@ -730,7 +807,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
     <div class="sp-sinput">
       <svg class="sp-si" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
       <input class="sp-inp" id="movies-search" type="text" placeholder="Search movies…" autocomplete="off"/>
-      <button class="sp-clr hidden" id="movies-search-clr">✕</button>
+      <button class="sp-clr hidden" id="movies-search-clr"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     </div>
   </div>
   <div class="sp-body">
@@ -740,7 +817,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
         <div class="hero-bg" id="movies-hero-bg"></div>
         <div class="hero-grad"></div>
         <div class="hero-body">
-          <div class="hero-badge" id="movies-hero-badge" style="background:var(--movie)">🎬 Featured</div>
+          <div class="hero-badge" id="movies-hero-badge" style="background:var(--movie)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8l1.6-3.8a1 1 0 0 1 1.3-.5l11 4.6a1 1 0 0 1 .5 1.3L17 13"/><rect x="3" y="8" width="18" height="12" rx="1.5"/><path d="M3 12h18"/></svg><span>Featured</span></div>
           <h2 class="hero-title" id="movies-hero-title" style="font-size:17px"></h2>
           <div class="hero-acts">
             <button class="hbtn-play" id="movies-hero-play" style="font-size:13px;padding:9px 17px"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg>Play</button>
@@ -750,7 +827,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
       </div>
     </section>
     <div class="fav-band" id="movies-fav-band" style="display:none">
-      <div class="fav-label">❤️ Favourite Movies</div>
+      <div class="fav-label"><svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg><span>Favourite Movies</span></div>
       <div class="carousel" id="sp-movies-fav-car"></div>
     </div>
     <div class="row" data-t="movies" style="margin-top:18px">
@@ -760,16 +837,46 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
   </div>
 </div>
 
-<!-- DOWNLOADS -->
-<div class="dl-page" id="page-downloads">
+<!-- WATCH HISTORY -->
+<div class="sec-page" id="page-history">
   <div class="sp-head">
-    <button class="sp-back" data-pg="downloads"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg></button>
-    <h1 class="sp-title">Downloads</h1>
+    <button class="sp-back" data-pg="history"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg></button>
+    <h1 class="sp-title">Watch History</h1>
   </div>
-  <div class="dl-empty">
-    <svg width="52" height="52" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,.2)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v13"/><path d="M7 11l5 5 5-5"/><path d="M3 18v1a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-1"/></svg>
-    <div class="dl-et">No downloads yet</div>
-    <div class="dl-es">Videos you save will appear here for offline watching.</div>
+  <div class="sp-body">
+    <div class="row" style="margin-top:16px">
+      <div class="pgrid" id="history-grid"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ALL FAVOURITES -->
+<div class="sec-page" id="page-favorites">
+  <div class="sp-head">
+    <button class="sp-back" data-pg="favorites"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg></button>
+    <h1 class="sp-title">All Favourites</h1>
+  </div>
+  <div class="sp-body">
+    <div class="row" style="margin-top:16px">
+      <div class="pgrid" id="favorites-grid"></div>
+    </div>
+  </div>
+</div>
+
+<!-- PREMIUM PLANS -->
+<div class="sec-page" id="page-plans">
+  <div class="sp-head">
+    <button class="sp-back" data-pg="plans"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg></button>
+    <h1 class="sp-title">Premium Plans</h1>
+  </div>
+  <div class="sp-body">
+    <div class="plans-intro">
+      <div class="plans-intro-icon"><svg width="26" height="26" viewBox="0 0 24 24" fill="var(--gold)"><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6z"/></svg></div>
+      <div class="plans-intro-t">Go Premium</div>
+      <div class="plans-intro-s">Pick a plan and message our team to activate it — all plans are billed monthly.</div>
+    </div>
+
+    <div class="plans-list" id="plans-list"></div>
   </div>
 </div>
 
@@ -792,19 +899,86 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
   </div>
   <div class="pp-sec">
     <div class="pp-sec-t">Account</div>
-    <div class="pp-item"><div class="pp-icon" style="background:rgba(229,9,20,.12)"><svg width="18" height="18" viewBox="0 0 24 24" fill="var(--red)"><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6z"/></svg></div><div class="pp-txt"><div class="pp-lbl">Upgrade to Premium</div><div class="pp-sub">HD, No Ads &amp; exclusive content</div></div><svg class="pp-arr" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></div>
-    <div class="pp-item"><div class="pp-icon" style="background:rgba(59,130,246,.12)"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--series)" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></div><div class="pp-txt"><div class="pp-lbl">Watch History</div><div class="pp-sub">Everything you've watched</div></div><svg class="pp-arr" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></div>
-    <div class="pp-item"><div class="pp-icon" style="background:rgba(245,197,24,.12)"><svg width="18" height="18" viewBox="0 0 24 24" fill="var(--gold)"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg></div><div class="pp-txt"><div class="pp-lbl">All Favourites</div><div class="pp-sub" id="pp-fav-sub">No favourites yet</div></div><svg class="pp-arr" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></div>
-    <div class="pp-item"><div class="pp-icon" style="background:rgba(168,85,247,.12)"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--movie)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg></div><div class="pp-txt"><div class="pp-lbl">Settings</div><div class="pp-sub">Preferences &amp; notifications</div></div><svg class="pp-arr" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></div>
+    <div class="pp-item" id="pp-premium-item"><div class="pp-icon" style="background:rgba(229,9,20,.12)"><svg width="18" height="18" viewBox="0 0 24 24" fill="var(--red)"><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6z"/></svg></div><div class="pp-txt"><div class="pp-lbl">Upgrade to Premium</div><div class="pp-sub">HD, No Ads &amp; exclusive content</div></div><svg class="pp-arr" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></div>
+    <div class="pp-item" id="pp-history-item"><div class="pp-icon" style="background:rgba(59,130,246,.12)"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--series)" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></div><div class="pp-txt"><div class="pp-lbl">Watch History</div><div class="pp-sub">Everything you've watched</div></div><svg class="pp-arr" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></div>
+    <div class="pp-item" id="pp-allfav-item"><div class="pp-icon" style="background:rgba(245,197,24,.12)"><svg width="18" height="18" viewBox="0 0 24 24" fill="var(--gold)"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg></div><div class="pp-txt"><div class="pp-lbl">All Favourites</div><div class="pp-sub" id="pp-fav-sub">No favourites yet</div></div><svg class="pp-arr" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></div>
+    <div class="pp-item" id="pp-settings-item"><div class="pp-icon" style="background:rgba(168,85,247,.12)"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--movie)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg></div><div class="pp-txt"><div class="pp-lbl">Settings</div><div class="pp-sub">Preferences &amp; notifications</div></div><svg class="pp-arr" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg></div>
   </div>
   <div style="height:40px"></div>
+</div>
+
+<!-- SETTINGS -->
+<div class="settings-page" id="page-settings">
+  <div class="sp-head">
+    <button class="sp-back" id="stg-back"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg></button>
+    <h1 class="sp-title">Settings</h1>
+  </div>
+  <div class="stg-scroll">
+    <div class="stg-sec">
+      <div class="stg-sec-t">Playback</div>
+      <div class="stg-row" id="stg-autoplay-row">
+        <div class="stg-txt"><div class="stg-lbl">Auto Play</div><div class="stg-sub">Automatically play the next episode</div></div>
+        <button class="stg-toggle" id="stg-autoplay"></button>
+      </div>
+      <div class="stg-row locked" id="stg-quality-row">
+        <div class="stg-txt"><div class="stg-lbl">Video Quality</div><div class="stg-sub">All videos stream in 720p HD</div></div>
+        <div class="stg-val stg-locked">720p HD</div>
+      </div>
+      <div class="stg-seg" data-seg="speed">
+        <div class="stg-seg-lbl">Playback Speed</div>
+        <div class="stg-seg-opts">
+          <button class="stg-seg-btn" data-val="0.5">0.5x</button>
+          <button class="stg-seg-btn" data-val="0.75">0.75x</button>
+          <button class="stg-seg-btn" data-val="1">1x</button>
+          <button class="stg-seg-btn" data-val="1.25">1.25x</button>
+          <button class="stg-seg-btn" data-val="1.5">1.5x</button>
+          <button class="stg-seg-btn" data-val="2">2x</button>
+        </div>
+      </div>
+      <div class="stg-row" id="stg-sub-row">
+        <div class="stg-txt"><div class="stg-lbl">Subtitle Language</div><div class="stg-sub">Not available yet</div></div>
+        <div class="stg-val stg-locked">Coming soon</div>
+      </div>
+      <div class="stg-row locked" id="stg-audio-row">
+        <div class="stg-txt"><div class="stg-lbl">Audio Language</div><div class="stg-sub">All content is in Hindi</div></div>
+        <div class="stg-val stg-locked">Hindi</div>
+      </div>
+    </div>
+
+    <div class="stg-sec">
+      <div class="stg-sec-t">Appearance</div>
+      <div class="stg-seg" data-seg="theme">
+        <div class="stg-seg-lbl">Theme</div>
+        <div class="stg-seg-opts">
+          <button class="stg-seg-btn" data-val="dark">Dark</button>
+          <button class="stg-seg-btn" data-val="light">Light</button>
+          <button class="stg-seg-btn" data-val="amoled">AMOLED</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="stg-sec">
+      <div class="stg-sec-t">Storage</div>
+      <div class="stg-row" id="stg-clear-cache">
+        <div class="stg-txt"><div class="stg-lbl">Clear Cache</div><div class="stg-sub" id="stg-cache-size">Tap to clear cached images &amp; data</div></div>
+        <div class="stg-val">Clear</div>
+      </div>
+    </div>
+
+    <div class="stg-sec">
+      <div class="stg-sec-t">Account</div>
+      <div class="stg-row danger" id="stg-logout">
+        <div class="stg-txt"><div class="stg-lbl">Log Out</div></div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- DETAIL MODAL -->
 <div class="modal-ov hidden" id="modal-ov">
   <div class="modal-sheet">
     <div class="modal-drag"></div>
-    <button class="modal-x" id="modal-x">✕</button>
+    <button class="modal-x" id="modal-x"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     <div class="modal-poster"><div class="modal-pbg" id="modal-pbg"></div><div class="modal-pgrad"></div></div>
     <div class="modal-body">
       <div class="modal-badge" id="modal-badge">Video</div>
@@ -813,7 +987,6 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
       <p class="modal-desc" id="modal-desc"></p>
       <div class="modal-acts">
         <button class="mbtn-play" id="mbtn-play"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg> Play Now</button>
-        <button class="mbtn-save" id="mbtn-save"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Save</button>
         <button class="mbtn-fav" id="mbtn-fav"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg></button>
       </div>
       <div class="eps-sec hidden" id="eps-sec">
@@ -872,7 +1045,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
 
       <!-- Next episode countdown -->
       <div class="ply-next-card" id="ply-next-card">
-        <button class="pnc-cancel" id="pnc-cancel">✕</button>
+        <button class="pnc-cancel" id="pnc-cancel"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
         <div class="pnc-thumb" id="pnc-thumb"></div>
         <div class="pnc-info">
           <div class="pnc-label">Next Episode</div>
@@ -934,13 +1107,7 @@ button{background:none;border:none;cursor:pointer;font-family:inherit;color:inhe
         <div class="seas-tabs" id="ply-seas-tabs"></div>
         <div id="ply-eps-list"></div>
       </div>
-      <div class="row hidden" id="ply-row-recommended"><div class="row-hd"><div class="row-t">Recommended</div></div><div class="carousel" id="ply-car-recommended"></div></div>
-      <div class="row hidden" id="ply-row-morelike"><div class="row-hd"><div class="row-t">More Like This</div></div><div class="carousel" id="ply-car-morelike"></div></div>
-      <div class="row hidden" id="ply-row-trending"><div class="row-hd"><div class="row-t">Trending Anime</div></div><div class="carousel" id="ply-car-trending"></div></div>
-      <div class="row hidden" id="ply-row-popular"><div class="row-hd"><div class="row-t">Popular Anime</div></div><div class="carousel" id="ply-car-popular"></div></div>
-      <div class="row hidden" id="ply-row-recent"><div class="row-hd"><div class="row-t">Recently Added</div></div><div class="carousel" id="ply-car-recent"></div></div>
-      <div class="row hidden" id="ply-row-becausewatched"><div class="row-hd"><div class="row-t" id="ply-because-title">Because You Watched This</div></div><div class="carousel" id="ply-car-becausewatched"></div></div>
-      <div class="row hidden" id="ply-row-similar"><div class="row-hd"><div class="row-t">Similar Titles</div></div><div class="carousel" id="ply-car-similar"></div></div>
+      <div class="row hidden" id="ply-row-similar"><div class="row-hd"><div class="row-t" id="ply-similar-title">Similar Anime</div></div><div class="carousel" id="ply-car-similar"></div></div>
     </div>
   </div>
 </div>
@@ -957,7 +1124,35 @@ const $=id=>document.getElementById(id);
 const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 function fmtD(s){if(!s)return'';const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h>0?`${h}h ${m}m`:`${m}m`;}
 const hap=t=>{try{window.Telegram?.WebApp?.HapticFeedback?.impactOccurred(t)}catch{}};
-function catIcon(c){return{Anime:'⛩️','Web Series':'📺',Series:'📺',Movies:'🎬',Movie:'🎬'}[c]||'🎬';}
+// ── Icon system ─────────────────────────────────────
+// Every icon in the app is a small inline-stroke SVG (matching the style
+// already used for nav/player/profile icons) instead of an emoji glyph —
+// emoji render inconsistently across devices/fonts and don't take a
+// theme color, so nothing here relies on them anymore.
+const ICON_PATHS={
+  heart:'<path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>',
+  flame:'<path d="M12 2c1 3-3 4.5-3 8a3 3 0 0 0 6 0c0-1-.5-1.8-1-2.5 2 .5 4 2.8 4 5.9a6 6 0 0 1-12 0c0-4.5 3-6 3-8.5C9 4 10 2.8 12 2z"/>',
+  tv:'<rect x="3" y="5" width="18" height="13" rx="2"/><path d="M8 21h8M12 18v3"/>',
+  clapper:'<path d="M4 8l1.6-3.8a1 1 0 0 1 1.3-.5l11 4.6a1 1 0 0 1 .5 1.3L17 13"/><rect x="3" y="8" width="18" height="12" rx="1.5"/><path d="M3 12h18"/>',
+  torii:'<path d="M2 6.5h20M4 6.5V4M20 4v2.5M6 6.5v14M18 6.5v14M2 10h20"/>',
+  star:'<path d="M12 2.5l2.9 6 6.6.7-4.9 4.5 1.3 6.5-5.9-3.3-5.9 3.3 1.3-6.5-4.9-4.5 6.6-.7z"/>',
+  x:'<path d="M18 6 6 18M6 6l12 12"/>',
+  wifiOff:'<path d="M1 1l22 22M16.72 11.06A10.94 10.94 0 0 1 19 12.55M5 12.55a10.94 10.94 0 0 1 5.17-2.39M10.71 5.05A16 16 0 0 1 22.58 9M1.42 9a15.91 15.91 0 0 1 4.7-2.88M8.53 16.11a6 6 0 0 1 6.95 0M12 20h.01"/>',
+  editPencil:'<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/>',
+  check:'<polyline points="20 6 9 17 4 12"/>',
+  crown:'<path d="M2 8l4 3 6-7 6 7 4-3-2 11H4z"/><path d="M4 21h16"/>',
+  headset:'<path d="M4 15v-3a8 8 0 0 1 16 0v3"/><rect x="2.5" y="14" width="4" height="6.5" rx="1.6"/><rect x="17.5" y="14" width="4" height="6.5" rx="1.6"/>',
+  bookmark:'<path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>',
+};
+function svgIcon(name,size=13,extra=''){
+  const body=ICON_PATHS[name]||ICON_PATHS.star;
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="${extra}">${body}</svg>`;
+}
+function catIconSvg(c,size=13){
+  const key=catKey(c);
+  const name={anime:'torii',series:'tv',movies:'clapper',cartoons:'tv'}[key]||'clapper';
+  return svgIcon(name,size);
+}
 function badgeClass(c){return{Anime:'ba','Web Series':'bs',Series:'bs',Movies:'bm',Movie:'bm'}[c]||'bd';}
 
 // ── Toast ─────────────────────────────────────────
@@ -966,6 +1161,84 @@ function toast(msg,ms=2600){
   const el=$('toast');el.textContent=msg;el.classList.remove('hidden');el.classList.add('show');
   clearTimeout(_tt);_tt=setTimeout(()=>{el.classList.remove('show');setTimeout(()=>el.classList.add('hidden'),250);},ms);
 }
+// Same as toast(), but with a leading icon. The message text is always
+// escaped — only the icon NAME is trusted/hardcoded by the caller — so
+// this is just as safe as the plain textContent-based toast() above.
+function toastIcon(iconName,msg,ms=2600){
+  const el=$('toast');
+  el.innerHTML=`<span style="display:inline-flex;align-items:center;gap:7px;justify-content:center">${svgIcon(iconName,14)}<span>${esc(msg)}</span></span>`;
+  el.classList.remove('hidden');el.classList.add('show');
+  clearTimeout(_tt);_tt=setTimeout(()=>{el.classList.remove('show');setTimeout(()=>el.classList.add('hidden'),250);},ms);
+}
+
+// ── Settings ──────────────────────────────────────
+const SETTINGS_KEY='myflix_settings';
+// quality/audio/subtitle are fixed app-wide (720p HD only, Hindi audio,
+// subtitles not launched yet) so they're no longer user-editable — kept
+// in the object only so anything reading APP_SETTINGS.* elsewhere still
+// gets a sane value, not because they're still pickable in the UI.
+const DEFAULT_SETTINGS={autoplay:true,quality:'720p',speed:1,subtitle:'unavailable',audio:'hi',theme:'dark'};
+
+function loadSettings(){
+  try{return {...DEFAULT_SETTINGS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY)||'{}'), quality:'720p',subtitle:'unavailable',audio:'hi'};}
+  catch(_){return {...DEFAULT_SETTINGS};}
+}
+function saveSettings(){localStorage.setItem(SETTINGS_KEY, JSON.stringify(APP_SETTINGS));}
+let APP_SETTINGS=loadSettings();
+function applyTheme(theme){document.documentElement.setAttribute('data-theme',theme);}
+
+function renderSettingsUI(){
+  const s=APP_SETTINGS;
+  $('stg-autoplay').classList.toggle('on',!!s.autoplay);
+  document.querySelectorAll('[data-seg="speed"] .stg-seg-btn').forEach(b=>b.classList.toggle('on',parseFloat(b.dataset.val)===parseFloat(s.speed)));
+  document.querySelectorAll('[data-seg="theme"] .stg-seg-btn').forEach(b=>b.classList.toggle('on',b.dataset.val===s.theme));
+}
+
+function setupSettingsPage(){
+  applyTheme(APP_SETTINGS.theme);
+  renderSettingsUI();
+
+  $('stg-autoplay').addEventListener('click',()=>{
+    hap('light');APP_SETTINGS.autoplay=!APP_SETTINGS.autoplay;saveSettings();renderSettingsUI();
+  });
+
+  document.querySelectorAll('[data-seg="speed"] .stg-seg-btn').forEach(b=>b.addEventListener('click',()=>{
+    hap('light');APP_SETTINGS.speed=parseFloat(b.dataset.val);saveSettings();renderSettingsUI();
+    // Apply live if a video is already open, so the choice takes effect immediately
+    const vid=$('vid-el');
+    if(vid && $('player-ov').classList.contains('vis')){
+      vid.playbackRate=APP_SETTINGS.speed;PLY.speed=APP_SETTINGS.speed;
+      $('ply-speed').textContent=`${APP_SETTINGS.speed}x`;
+      $('ply-speed-menu').querySelectorAll('button[data-speed]').forEach(bb=>bb.classList.toggle('on',parseFloat(bb.dataset.speed)===APP_SETTINGS.speed));
+    }
+  }));
+  document.querySelectorAll('[data-seg="theme"] .stg-seg-btn').forEach(b=>b.addEventListener('click',()=>{
+    hap('light');APP_SETTINGS.theme=b.dataset.val;saveSettings();applyTheme(APP_SETTINGS.theme);renderSettingsUI();
+  }));
+
+  $('stg-sub-row').addEventListener('click',()=>{hap('light');toastIcon('editPencil','Subtitles are coming soon!');});
+
+  $('stg-clear-cache').addEventListener('click',async()=>{
+    hap('medium');
+    if(!confirm("Clear cached images and data? This won't affect your account or watch history."))return;
+    try{if(window.caches){const keys=await caches.keys();await Promise.all(keys.map(k=>caches.delete(k)));}}catch(_){}
+    Object.keys(localStorage).forEach(k=>{if(k.startsWith('myflix_cache_'))localStorage.removeItem(k);});
+    $('stg-cache-size').textContent='Cache cleared';
+    toast('Cache cleared');
+  });
+
+  $('stg-logout').addEventListener('click',()=>{
+    hap('medium');
+    if(!confirm('Log out of MYFLIX?'))return;
+    try{localStorage.removeItem('myflix_token');}catch(_){}
+    toast('Logged out');
+    window.Telegram?.WebApp?.close?.();
+  });
+
+  $('pp-settings-item').addEventListener('click',()=>{hap('light');$('page-settings').classList.add('open');});
+  $('stg-back').addEventListener('click',()=>{$('page-settings').classList.remove('open');});
+}
+setupSettingsPage();
 
 // ── Backend API client ──────────────────────────────
 const API_BASE = window.MYFLIX_API;
@@ -1024,14 +1297,30 @@ function thumb(seed){
 
 // Normalize a backend video into the shape the existing UI functions expect.
 // (thumbnail -> gradient fallback if no image resolved yet)
+//
+// Some backend responses (Continue Watching, Watch History) describe a
+// SPECIFIC EPISODE the user was watching rather than a show. If that
+// episode carries its own thumbnail under a distinct field name, prefer
+// it over the generic `thumbnail` field — per spec, episode-level UI
+// must never fall back to showing the parent show's poster instead.
+function pickThumbnail(v){
+  return v.episodeThumbnail || v.thumbnail || null;
+}
 function normalize(v,i){
+  const image=pickThumbnail(v);
   return {
     id:v.id, category:v.category, title:v.title,
     year:v.year||'', rating:v.rating||null, genre:v.genre||v.category||'',
     description:v.description||'', duration:v.duration||0,
-    gradient: v.thumbnail ? null : thumb((i%12)+1),
-    image: v.thumbnail || null,
+    gradient: image ? null : thumb((i%12)+1),
+    image,
     seasons: v.seasons || null,
+    // Real season/episode number for the SPECIFIC episode this record
+    // describes (Continue Watching, Watch History) — null for a plain
+    // show/movie-level card. Never guessed/derived: whatever the backend
+    // says was actually watched.
+    season: v.season!=null ? Number(v.season) : null,
+    episode: v.episode!=null ? Number(v.episode) : null,
     watchProgress: v.watchProgress || 0,
   };
 }
@@ -1060,22 +1349,46 @@ async function fetchAllVideos(){
   return normalized;
 }
 
-// ── Image helper with gradient fallback ───────────
+// ── Image helper with shimmer skeleton, fade-in, and graceful fallback ──
+// Single source of truth for "how a thumbnail loads" across the whole
+// app: card grids, episode rows, and the next-episode card all call this
+// so lazy-loading/skeleton/error-fallback behavior stays identical
+// everywhere instead of being reimplemented (and potentially drifting)
+// at each call site.
+//   container: an element that already has its final box size set via
+//              CSS (aspect-ratio or fixed px) and position:relative —
+//              the shimmer/image/fallback all fill it via inset:0, so
+//              swapping between states never changes the box size.
+//   src:       image URL, or falsy to skip straight to the fallback.
+//   gradient:  CSS gradient shown immediately as the base background,
+//              and left in place (visible through the fallback icon) if
+//              the image never loads.
+//   category:  used to pick which icon renders as the fallback.
+function applyThumbImage(container,{src,gradient,category,iconSize=28}={}){
+  container.style.position='relative';
+  container.style.overflow='hidden';
+  container.style.background=gradient||'var(--bg-e)';
+  const showFallback=()=>{
+    const em=document.createElement('div');
+    em.className='thumb-fallback';
+    em.innerHTML=catIconSvg(category,iconSize);
+    container.appendChild(em);
+  };
+  if(!src){showFallback();return null;}
+  container.classList.add('img-loading');
+  const img=document.createElement('img');
+  img.className='thumb-img';
+  img.src=src;img.alt='';img.loading='lazy';img.decoding='async';
+  img.onload=()=>{container.classList.remove('img-loading');img.classList.add('loaded');};
+  img.onerror=()=>{img.remove();container.classList.remove('img-loading');showFallback();};
+  container.appendChild(img);
+  return img;
+}
+
 function mkThumb(v,cls=''){
   const d=document.createElement('div');
-  d.style.cssText=`width:100%;height:100%;position:relative;${v.gradient?'background:'+v.gradient:'background:var(--bg-e)'}`;
-  if(v.image){
-    const img=document.createElement('img');
-    img.src=v.image;img.alt='';img.loading='lazy';
-    img.style.cssText='width:100%;height:100%;object-fit:cover';
-    img.onerror=()=>{img.remove();};
-    d.appendChild(img);
-  } else {
-    const em=document.createElement('div');
-    em.style.cssText='position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:28px;opacity:.35';
-    em.textContent=catIcon(v.category);
-    d.appendChild(em);
-  }
+  d.style.cssText='width:100%;height:100%';
+  applyThumbImage(d,{src:v.image,gradient:v.gradient,category:v.category,iconSize:32});
   return d;
 }
 
@@ -1094,10 +1407,12 @@ function mkCard(v,wide=false){
   const th=document.createElement('div');th.className='card-thumb';
   th.appendChild(mkThumb(v));
   if(v.category){const b=document.createElement('span');b.className=`cbadge ${badgeClass(v.category)}`;b.textContent=v.category;th.appendChild(b);}
-  if(S.favs.has(v.id)){const p=document.createElement('div');p.className='pip';p.textContent='❤️';th.appendChild(p);}
+  if(S.favs.has(v.id)){const p=document.createElement('div');p.className='pip';p.innerHTML='<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>';th.appendChild(p);}
   if(prog>0){const pr=document.createElement('div');pr.className='card-prog';pr.innerHTML=`<div class="card-prog-fill" style="width:${prog}%"></div>`;th.appendChild(pr);}
   const ti=document.createElement('div');ti.className='card-title';ti.textContent=v.title;
-  const me=document.createElement('div');me.className='card-meta';me.textContent=fmtD(v.duration)||v.genre||'';
+  const me=document.createElement('div');me.className='card-meta';
+  const epLabel=(v.season!=null&&v.episode!=null)?`S${v.season} E${v.episode}`:null;
+  me.textContent=[epLabel,fmtD(v.duration)||v.genre||''].filter(Boolean).join(' • ');
   d.appendChild(th);d.appendChild(ti);d.appendChild(me);
   d.addEventListener('click',()=>{hap('light');showDetail(v)});
   return d;
@@ -1115,7 +1430,7 @@ function mkGridCard(v){
   const d=document.createElement('div');d.className='gc ca';
   const th=document.createElement('div');th.className='gc-thumb';
   th.appendChild(mkThumb(v));
-  if(S.favs.has(v.id)){const p=document.createElement('div');p.style.cssText='position:absolute;top:6px;right:6px;font-size:13px;filter:drop-shadow(0 1px 3px rgba(0,0,0,.8))';p.textContent='❤️';th.appendChild(p);}
+  if(S.favs.has(v.id)){const p=document.createElement('div');p.style.cssText='position:absolute;top:6px;right:6px;color:var(--red);filter:drop-shadow(0 1px 3px rgba(0,0,0,.8))';p.innerHTML='<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>';th.appendChild(p);}
   const ti=document.createElement('div');ti.className='gc-title';ti.textContent=v.title;
   const me=document.createElement('div');me.className='gc-meta';me.textContent=fmtD(v.duration)||v.genre||'';
   d.appendChild(th);d.appendChild(ti);d.appendChild(me);
@@ -1151,9 +1466,13 @@ function renderHero(){
   const bg=$('hero-bg');
   if(bg){bg.style.cssText=`${bgStyle(v)};position:absolute;inset:0`;}
   $('hero-title').textContent=v.title;
-  $('hero-badge').textContent=v.category?`${catIcon(v.category)} ${v.category}`:'🔥 Featured';
+  $('hero-badge').innerHTML=v.category?`${catIconSvg(v.category,12)}<span>${esc(v.category)}</span>`:`${svgIcon('flame',12)}<span>Featured</span>`;
   const m=$('hero-meta');m.innerHTML='';
-  [v.year,v.rating?`⭐ ${v.rating}`:null,fmtD(v.duration),v.genre].filter(Boolean).forEach(t=>{const s=document.createElement('span');s.className='hero-tag';s.textContent=t;m.appendChild(s);});
+  [v.year,v.rating?{icon:'star',text:v.rating}:null,fmtD(v.duration),v.genre].filter(Boolean).forEach(t=>{
+    const s=document.createElement('span');s.className='hero-tag';
+    if(typeof t==='object'){s.style.cssText='display:inline-flex;align-items:center;gap:3px';s.innerHTML=`${svgIcon('star',10)}<span>${esc(String(t.text))}</span>`;}else{s.textContent=t;}
+    m.appendChild(s);
+  });
   const dots=$('hero-dots');dots.innerHTML='';
   S.featured.forEach((_,i)=>{const d=document.createElement('button');d.className=`dot${i===S.heroIdx?' on':''}`;d.onclick=()=>{S.heroIdx=i;renderHero();startHeroLoop()};dots.appendChild(d);});
   $('hero-play').onclick=()=>{hap('medium');playVideo(v)};
@@ -1183,7 +1502,10 @@ function applyContinueWatching(items){
     seen.add(id);
     deduped.push(item);
   }
-  S.cont=deduped.map((item,i)=>({...normalize(item.video,i),watchProgress:item.video.watchProgress||0}));
+  S.cont=deduped.map((item,i)=>({
+    ...normalize({...item.video, episodeThumbnail:item.episode?.thumbnail||item.video.episodeThumbnail},i),
+    watchProgress:item.video.watchProgress||0,
+  }));
   $('cont-row').style.display=S.cont.length?'':'none';
   fillCar('cont-car',S.cont,true);
 }
@@ -1197,22 +1519,35 @@ async function refreshContinueWatching(){
 }
 
 function showDetail(v){
-  S.curVid=v;hap('medium');
+  // Continue Watching / Watch History records describe a single episode
+  // and never carry the full `.seasons` list — pull it from the matching
+  // series entry already loaded in S.all (matched by title) so the
+  // episode list AND Play/Previous/Next-episode navigation all see the
+  // real season/episode data instead of a fabricated fake list.
+  const hasSeasons=v.seasons?.length;
+  const seriesMatch=!hasSeasons ? S.all.find(x=>x.seasons?.length && x.title===v.title) : null;
+  const ev=seriesMatch ? {...v,seasons:seriesMatch.seasons} : v;
+
+  S.curVid=ev;hap('medium');
   const ov=$('modal-ov');ov.classList.remove('hidden');requestAnimationFrame(()=>ov.classList.add('vis'));
   const pbg=$('modal-pbg');
-  pbg.style.cssText=`${bgStyle(v)};width:100%;height:100%`;
-  $('modal-badge').textContent=v.category||'Video';
-  $('modal-title').textContent=v.title||'';
-  $('modal-desc').textContent=v.description||'';
+  pbg.style.cssText=`${bgStyle(ev)};width:100%;height:100%`;
+  $('modal-badge').textContent=ev.category||'Video';
+  $('modal-title').textContent=ev.title||'';
+  $('modal-desc').textContent=ev.description||'';
   const meta=$('modal-meta');meta.innerHTML='';
-  [v.year,v.rating?`⭐ ${v.rating}`:null,fmtD(v.duration),v.genre].filter(Boolean).forEach(t=>{const s=document.createElement('span');s.className='mmt';s.textContent=t;meta.appendChild(s);});
-  const fb=$('mbtn-fav');setFavBtn(fb,S.favs.has(v.id));
-  fb.onclick=()=>toggleFav(v,fb);
-  $('mbtn-play').onclick=()=>{closeDetail();playVideo(v)};
-  $('mbtn-save').onclick=()=>toast('💾 Download feature coming soon!');
+  [ev.year,ev.rating?{icon:'star',text:ev.rating}:null,fmtD(ev.duration),ev.genre].filter(Boolean).forEach(t=>{
+    const s=document.createElement('span');s.className='mmt';
+    if(typeof t==='object'){s.style.cssText='display:inline-flex;align-items:center;gap:3px';s.innerHTML=`${svgIcon('star',11)}<span>${esc(String(t.text))}</span>`;}else{s.textContent=t;}
+    meta.appendChild(s);
+  });
+  const fb=$('mbtn-fav');setFavBtn(fb,S.favs.has(ev.id));
+  fb.onclick=()=>toggleFav(ev,fb);
+  $('mbtn-play').onclick=()=>{closeDetail();playVideo(ev)};
   const ep=$('eps-sec');
-  if(v.seasons?.length||v.category==='Anime'||v.category==='Web Series'||v.category==='Series'){
-    ep.classList.remove('hidden');buildEps(v);
+  if(ev.seasons?.length||ev.category==='Anime'||ev.category==='Web Series'||ev.category==='Series'){
+    ep.classList.remove('hidden');
+    buildEps(ev);
   } else {
     ep.classList.add('hidden');
   }
@@ -1230,7 +1565,7 @@ async function toggleFav(v,btn){
   const wasFav=S.favs.has(v.id);
   // Optimistic UI update
   if(wasFav){S.favs.delete(v.id);setFavBtn(btn,false);toast('Removed from favourites');}
-  else{S.favs.add(v.id);setFavBtn(btn,true);toast('❤️ Added to favourites');}
+  else{S.favs.add(v.id);setFavBtn(btn,true);toastIcon('heart','Added to favourites');}
   refreshFavRows();updateProfStats();
 
   try{
@@ -1262,14 +1597,10 @@ function buildEps(v){
     eps.forEach(e=>{
       const row=document.createElement('div');row.className='ep-row';
       const thd=document.createElement('div');thd.className='ep-thumb';
-      if(e.thumbnail){
-        const img=document.createElement('img');img.src=e.thumbnail;img.loading='lazy';
-        img.style.cssText='width:100%;height:100%;object-fit:cover';
-        thd.appendChild(img);
-      } else {
-        const thdInner=document.createElement('div');thdInner.style.cssText=`width:100%;height:100%;${e.gradient||thumb(e.ep%12+1)}`;
-        thd.appendChild(thdInner);
-      }
+      // Episode-specific thumbnail (never the parent show's poster) —
+      // falls back to a gradient + category icon if this episode has no
+      // thumbnail of its own yet.
+      applyThumbImage(thd,{src:e.thumbnail,gradient:e.gradient||thumb(e.ep%12+1),category:v.category,iconSize:18});
       const epNum=document.createElement('div');epNum.className='ep-n';epNum.textContent=`E${e.ep}`;
       thd.appendChild(epNum);
       const prog=e.prog||0;
@@ -1311,7 +1642,7 @@ const PLY={
   introEnd:0, creditsStart:null,
   nextInterval:null, previewVideo:null,
   _lastTapAt:0, _lastTapHalf:null, _tapTimer:null,
-  pseudoFs:false,
+  pseudoFs:false, seeking:false,
 };
 let _progTimer=null;
 let _curPlayVid=null;
@@ -1371,7 +1702,7 @@ async function playVideo(v){
   stage.classList.remove('portrait');
   vid.style.transform='';PLY.scale=1;
   vid.style.filter='';PLY.brightness=1;
-  setSpeed(1);
+  setSpeed(APP_SETTINGS.speed||1);
   showControls();
 
   buildEpisodeContext(v);
@@ -1498,7 +1829,7 @@ async function playVideo(v){
       ld.style.display='none';vid.style.display='none';
       errBox.classList.remove('hidden');
       errBox.innerHTML=`<div style="text-align:center;padding:20px">
-        <div style="font-size:42px;margin-bottom:14px">📡</div>
+        <div style="color:rgba(255,255,255,.35);margin-bottom:14px;display:flex;justify-content:center">${svgIcon('wifiOff',40)}</div>
         <p style="font-size:15px;font-weight:700;margin-bottom:8px;color:#fff">Playback Error</p>
         <p style="font-size:12px;color:rgba(255,255,255,.45);margin-bottom:20px">The video could not be played. Please try again.</p>
         <button onclick="closePlayer()" style="padding:10px 26px;background:var(--red);color:#fff;border-radius:10px;font-size:14px;font-weight:700;border:none;cursor:pointer;box-shadow:0 4px 14px var(--red-g)">Close</button>
@@ -1522,7 +1853,7 @@ async function playVideo(v){
     ld.style.display='none';
     errBox.classList.remove('hidden');
     errBox.innerHTML=`<div style="text-align:center;padding:20px">
-      <div style="font-size:42px;margin-bottom:14px">${catIcon(v.category)}</div>
+      <div style="color:rgba(255,255,255,.35);margin-bottom:14px;display:flex;justify-content:center">${catIconSvg(v.category,40)}</div>
       <p style="font-size:16px;font-weight:800;margin-bottom:6px;color:#fff">${esc(v.title)}</p>
       <p style="font-size:12px;color:rgba(255,255,255,.45);margin-bottom:6px">${esc(err.message)}</p>
       <button onclick="closePlayer()" style="padding:10px 26px;background:var(--red);color:#fff;border-radius:10px;font-size:14px;font-weight:700;border:none;cursor:pointer;box-shadow:0 4px 14px var(--red-g)">Close</button>
@@ -1733,6 +2064,7 @@ function updateSkipVisibility(){
 const NEXT_COUNTDOWN_S=10;
 function onVideoEnded(){
   pulseCenter(false);
+  if(!APP_SETTINGS.autoplay) return;
   if(PLY.episodeList.length && PLY.episodeIndex>=0 && PLY.episodeIndex+1<PLY.episodeList.length){
     showNextEpisodeCountdown();
   }
@@ -1740,12 +2072,8 @@ function onVideoEnded(){
 function showNextEpisodeCountdown(){
   const nextEp=PLY.episodeList[PLY.episodeIndex+1];
   $('pnc-title').textContent=nextEp.title||`Episode ${nextEp.ep}`;
-  const thumbEl=$('pnc-thumb');thumbEl.innerHTML='';
-  if(nextEp.thumbnail){
-    const img=document.createElement('img');img.src=nextEp.thumbnail;img.style.cssText='width:100%;height:100%;object-fit:cover';thumbEl.appendChild(img);
-  }else{
-    thumbEl.style.cssText=`width:100%;height:100%;${nextEp.gradient||thumb(((nextEp.ep||1)%12)+1)}`;
-  }
+  const thumbEl=$('pnc-thumb');thumbEl.innerHTML='';thumbEl.style.cssText='';
+  applyThumbImage(thumbEl,{src:nextEp.thumbnail,gradient:nextEp.gradient||thumb(((nextEp.ep||1)%12)+1),category:PLY.showBase?.category,iconSize:16});
   $('ply-next-card').classList.add('show');
   const circumference=75.4;
   let remaining=NEXT_COUNTDOWN_S;
@@ -1766,11 +2094,6 @@ function cancelNextEpisodeCountdown(){
 }
 
 // ── Seek bar (drag-to-scrub + real-frame preview) ──
-function pctFromSeekEvent(e,seekEl){
-  const rect=seekEl.getBoundingClientRect();
-  const x=(e.touches?e.touches[0].clientX:e.clientX)-rect.left;
-  return Math.min(1,Math.max(0,x/rect.width));
-}
 let _previewTimer=null;
 function schedulePreviewFrame(t){
   clearTimeout(_previewTimer);
@@ -1801,27 +2124,54 @@ function renderPreviewFrame(t){
 }
 function setupSeekBar(){
   const seek=$('ply-seek'),vid=$('vid-el'),preview=$('ply-preview');
+  seek.style.touchAction='none'; // stop the page/stage from scrolling or double-handling the drag
   let dragging=false;
+  let wasPlaying=false;
+  function pctFromPointer(e){
+    const rect=seek.getBoundingClientRect();
+    const x=e.clientX-rect.left;
+    return Math.min(1,Math.max(0,x/rect.width));
+  }
   function apply(pct,commit){
     $('ply-seek-play').style.width=(pct*100)+'%';
     $('ply-seek-handle').style.left=(pct*100)+'%';
     if(vid.duration){
       const t=pct*vid.duration;
       $('ply-preview-t').textContent=fmtTime(t);
+      $('ply-cur').textContent=fmtTime(t); // instant current-time feedback while scrubbing
       preview.style.left=`${pct*100}%`;
       schedulePreviewFrame(t);
-      if(commit) vid.currentTime=t;
+      if(commit){
+        vid.currentTime=t;
+        // Seeking can leave a <video> paused even if it was playing before the
+        // scrub started (some browsers auto-pause on seek); resume explicitly
+        // so "keep playing after seeking" holds on every platform.
+        if(wasPlaying) vid.play().catch(()=>{});
+      }
     }
   }
-  function start(e){dragging=true;seek.classList.add('dragging');preview.classList.remove('hidden');apply(pctFromSeekEvent(e,seek),false);}
-  function move(e){if(!dragging)return;apply(pctFromSeekEvent(e,seek),false);}
-  function end(e){if(!dragging)return;dragging=false;seek.classList.remove('dragging');preview.classList.add('hidden');apply(pctFromSeekEvent(e,seek),true);showControls();}
-  seek.addEventListener('mousedown',start);
-  document.addEventListener('mousemove',move);
-  document.addEventListener('mouseup',end);
-  seek.addEventListener('touchstart',start,{passive:true});
-  seek.addEventListener('touchmove',move,{passive:true});
-  seek.addEventListener('touchend',end);
+  function start(e){
+    dragging=true;PLY.seeking=true;wasPlaying=!vid.paused;
+    seek.classList.add('dragging');preview.classList.remove('hidden');
+    seek.setPointerCapture?.(e.pointerId);
+    apply(pctFromPointer(e),false);
+  }
+  function move(e){if(!dragging)return;apply(pctFromPointer(e),false);}
+  function end(e){
+    if(!dragging)return;
+    dragging=false;PLY.seeking=false;
+    seek.classList.remove('dragging');preview.classList.add('hidden');
+    apply(pctFromPointer(e),true);
+    showControls();
+  }
+  // Pointer Events unify mouse + touch + pen in one path, and setPointerCapture
+  // keeps delivering move/up events to `seek` even once the finger drifts off
+  // the (thin) bar — the old separate touch listeners lost the drag the moment
+  // that happened, which is why the thumb used to snap back mid-scrub.
+  seek.addEventListener('pointerdown',start);
+  seek.addEventListener('pointermove',move);
+  seek.addEventListener('pointerup',end);
+  seek.addEventListener('pointercancel',end);
 }
 
 // ── Gestures: double-tap seek, swipe brightness/volume, swipe-seek, pinch-zoom ──
@@ -1863,6 +2213,7 @@ function setupGestures(){
       ts.mode=Math.abs(dx)>Math.abs(dy)?'seek':(ts.half==='left'?'bright':'volume');
     }
     if(ts.mode==='seek' && vid.duration){
+      PLY.seeking=true;
       const seekDelta=(dx/window.innerWidth)*Math.min(150,vid.duration*0.4);
       const t2=Math.min(vid.duration,Math.max(0,ts.startCurrentTime+seekDelta));
       flashSeek(seekDelta>=0?'right':'left',Math.round(Math.abs(t2-ts.startCurrentTime)));
@@ -1887,7 +2238,13 @@ function setupGestures(){
     const state=ts;ts=null;
     $('bright-flash').classList.remove('show');$('vol-flash').classList.remove('show');
     if(state.mode==='pinch'){if(PLY.scale<1.05){PLY.scale=1;vid.style.transform='';}return;}
-    if(state.mode==='seek'){if(state.pendingSeek!=null)vid.currentTime=state.pendingSeek;showControls();return;}
+    if(state.mode==='seek'){
+      const wasPlaying=!vid.paused;
+      if(state.pendingSeek!=null)vid.currentTime=state.pendingSeek;
+      PLY.seeking=false;
+      if(wasPlaying) vid.play().catch(()=>{});
+      showControls();return;
+    }
     if(state.mode==='bright'||state.mode==='volume') return;
     // Never moved beyond the tap threshold - it was a tap, not a drag.
     const now=Date.now();
@@ -1944,6 +2301,7 @@ function initPlayerOnce(){
 
   vid.addEventListener('timeupdate',()=>{
     if(!vid.duration) return;
+    if(PLY.seeking) return; // an active scrub owns the UI until it commits — don't fight it
     const pct=(vid.currentTime/vid.duration)*100;
     $('ply-seek-play').style.width=pct+'%';
     $('ply-seek-handle').style.left=pct+'%';
@@ -2039,12 +2397,8 @@ function buildPlayerEpisodesUI(v){
       const row=document.createElement('div');row.className='ep-row';
       const isPlaying=e.videoId===v.id;
       const thd=document.createElement('div');thd.className='ep-thumb';
-      if(e.thumbnail){
-        const img=document.createElement('img');img.src=e.thumbnail;img.loading='lazy';
-        img.style.cssText='width:100%;height:100%;object-fit:cover';thd.appendChild(img);
-      }else{
-        const inner=document.createElement('div');inner.style.cssText=`width:100%;height:100%;${e.gradient||thumb((e.ep%12)+1)}`;thd.appendChild(inner);
-      }
+      // Episode-specific thumbnail (never the parent show's poster).
+      applyThumbImage(thd,{src:e.thumbnail,gradient:e.gradient||thumb((e.ep%12)+1),category:v.category,iconSize:18});
       const epNum=document.createElement('div');epNum.className='ep-n';epNum.textContent=`E${e.ep}`;thd.appendChild(epNum);
       const inf=document.createElement('div');inf.className='ep-inf';
       inf.innerHTML=`<div class="ep-ttl" style="${isPlaying?'color:var(--red)':''}">${esc(e.title||`Episode ${e.ep}`)}</div><div class="ep-dur">${fmtD(e.duration)||'~24m'}</div>`;
@@ -2097,15 +2451,12 @@ function loadRecommendations(v){
   const key=catKey(v.category);
   const pool=CAT[key]||[];
   const others=pool.filter(x=>x.id!==v.id);
-  fillPlayerRow('ply-car-recommended',shuffleSlice(others,10));
+  const label={anime:'Similar Anime',series:'Similar Web Series',movies:'Similar Movies',cartoons:'Similar Cartoons'}[key]||'Similar Titles';
+  $('ply-similar-title').textContent=label;
+  // Same-genre matches surface first, then the rest of the same category fills out the row.
   const sameGenre=others.filter(x=>x.genre && x.genre===v.genre);
-  fillPlayerRow('ply-car-morelike',(sameGenre.length?sameGenre:others).slice(0,10));
-  fillPlayerRow('ply-car-trending',shuffleSlice(CAT.anime.filter(x=>x.id!==v.id),10));
-  fillPlayerRow('ply-car-popular',[...CAT.anime].filter(x=>x.id!==v.id).sort((a,b)=>(b.rating||0)-(a.rating||0)).slice(0,10));
-  fillPlayerRow('ply-car-recent',S.all.slice(-12).reverse());
-  $('ply-because-title').textContent=`Because You Watched ${v.title}`;
-  fillPlayerRow('ply-car-becausewatched',others.slice().reverse().slice(0,10));
-  fillPlayerRow('ply-car-similar',pool.filter(x=>x.id!==v.id).slice(0,12));
+  const rest=others.filter(x=>!(x.genre && x.genre===v.genre));
+  fillPlayerRow('ply-car-similar',[...sameGenre,...shuffleSlice(rest,12)].slice(0,12));
 }
 
 initPlayerOnce();
@@ -2165,7 +2516,7 @@ function updateProfStats(){
 }
 
 // ── Navigation ────────────────────────────────────
-const PAGE_IDS={anime:'page-anime',series:'page-series',movies:'page-movies',downloads:'page-downloads'};
+const PAGE_IDS={anime:'page-anime',series:'page-series',movies:'page-movies',history:'page-history',favorites:'page-favorites',plans:'page-plans'};
 function closeAllPages(){Object.values(PAGE_IDS).forEach(id=>{const el=$(id);if(el){el.classList.remove('open');}});}
 function syncNav(page){
   document.querySelectorAll('.nb').forEach(b=>b.classList.toggle('on',b.dataset.p===page));
@@ -2176,7 +2527,6 @@ function openSecPage(sec){const id=PAGE_IDS[sec];if(!id)return;closeAllPages();$
 document.querySelectorAll('.nb').forEach(btn=>btn.addEventListener('click',()=>{
   hap('light');const p=btn.dataset.p;closeAllPages();syncNav(p);
   if(p==='home')return;
-  if(p==='downloads'){$('page-downloads').classList.add('open');return;}
   openSecPage(p);
 }));
 document.querySelectorAll('.chip').forEach(c=>c.addEventListener('click',()=>{
@@ -2185,10 +2535,82 @@ document.querySelectorAll('.chip').forEach(c=>c.addEventListener('click',()=>{
 }));
 document.querySelectorAll('.see-all[data-open]').forEach(b=>b.addEventListener('click',()=>openSecPage(b.dataset.open)));
 document.querySelectorAll('.sp-back[data-pg]').forEach(b=>b.addEventListener('click',()=>{
-  const id=PAGE_IDS[b.dataset.pg]||'page-downloads';$(id)?.classList.remove('open');syncNav('home');
+  const id=PAGE_IDS[b.dataset.pg];if(id)$(id)?.classList.remove('open');syncNav('home');
 }));
 $('nav-prof').addEventListener('click',()=>{hap('light');$('prof-page').classList.add('open')});
 $('pp-close').addEventListener('click',()=>$('prof-page').classList.remove('open'));
+
+// ── Watch History & All Favourites (real pages, real data) ─────────
+function renderFavoritesPage(){
+  const vids=S.all.filter(v=>S.favs.has(v.id));
+  fillGrid('favorites-grid',vids);
+}
+async function openHistoryPage(){
+  $('page-history').classList.add('open');syncNav('');
+  const grid=$('history-grid');
+  grid.innerHTML='<div class="sk-p skel" style="width:100%;aspect-ratio:2/3"></div><div class="sk-p skel" style="width:100%;aspect-ratio:2/3"></div><div class="sk-p skel" style="width:100%;aspect-ratio:2/3"></div><div class="sk-p skel" style="width:100%;aspect-ratio:2/3"></div>';
+  try{
+    const {history}=await Api.history();
+    const seen=new Set();
+    const vids=[];
+    for(const entry of (history||[])){
+      const raw=entry.video||entry;
+      const id=raw?.id||entry.videoId;
+      if(!id||seen.has(id))continue;
+      seen.add(id);
+      // Deliberately NOT falling back to the matching S.all show-level
+      // record here — Watch History is about the specific episode that
+      // was watched, and must show that episode's own thumbnail, not
+      // the parent show's poster (pickThumbnail() inside normalize()
+      // already prefers an episode-specific thumbnail field when the
+      // backend provides one).
+      vids.push(normalize({...raw, episodeThumbnail:entry.episode?.thumbnail||raw.episodeThumbnail},vids.length));
+    }
+    fillGrid('history-grid',vids);
+  }catch(err){
+    console.warn('[MYFLIX] Watch History load failed',err.message);
+    grid.innerHTML='<div class="empty" style="grid-column:1/-1">Couldn\'t load your watch history</div>';
+  }
+}
+$('pp-history-item').addEventListener('click',()=>{hap('light');$('prof-page').classList.remove('open');openHistoryPage();});
+$('pp-allfav-item').addEventListener('click',()=>{
+  hap('light');$('prof-page').classList.remove('open');
+  renderFavoritesPage();$('page-favorites').classList.add('open');syncNav('');
+});
+$('pp-premium-item').addEventListener('click',()=>{hap('light');renderPlans();$('page-plans').classList.add('open');syncNav('');});
+
+// ── Premium Plans ────────────────────────────────
+const PLANS=[
+  {id:'basic',name:'Basic',price:30,popular:false,feats:['No ads','720p HD streaming','Hindi audio','Priority support']},
+  {id:'standard',name:'Standard',price:60,popular:true,feats:['No ads','720p HD streaming','Hindi audio','English subtitles','Higher priority support']},
+  {id:'advance',name:'Advance',price:100,popular:false,feats:['No ads','720p HD streaming','English & Hindi audio','English subtitles','Highest priority support','Priority wishlist requests']},
+];
+function renderPlans(){
+  const list=$('plans-list');list.innerHTML='';
+  const f=document.createDocumentFragment();
+  PLANS.forEach(p=>{
+    const card=document.createElement('div');
+    card.className='plan-card'+(p.popular?' popular':'');
+    card.innerHTML=`
+      ${p.popular?'<div class="plan-badge">Most Popular</div>':''}
+      <div class="plan-head">
+        <div class="plan-name">${esc(p.name)}</div>
+        <div class="plan-price">₹${p.price}<span>/mo</span></div>
+      </div>
+      <ul class="plan-feats">
+        ${p.feats.map(t=>`<li class="plan-feat">${svgIcon('check',15)}<span>${esc(t)}</span></li>`).join('')}
+      </ul>
+      <button class="plan-cta" data-plan="${p.id}">Choose ${esc(p.name)}</button>
+    `;
+    f.appendChild(card);
+  });
+  list.appendChild(f);
+  list.querySelectorAll('.plan-cta').forEach(btn=>btn.addEventListener('click',()=>{
+    hap('medium');
+    const plan=PLANS.find(x=>x.id===btn.dataset.plan);
+    toastIcon('crown',`To activate the ${plan.name} plan (₹${plan.price}/mo), message our team — we'll confirm and switch it on for you.`,3600);
+  }));
+}
 $('modal-x').addEventListener('click',closeDetail);
 $('modal-ov').addEventListener('click',e=>{if(e.target===$('modal-ov'))closeDetail();});
 document.addEventListener('keydown',e=>{
