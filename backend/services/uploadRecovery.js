@@ -133,6 +133,17 @@ async function getSessionMaster(chatId) {
   return doc.exists ? doc.data() : null;
 }
 
+/** 
+ * Fetches all active sessions matching `completed == false`. 
+ */
+async function getPendingSessions() {
+  const db = getDB();
+  const snap = await db.collection(SESSIONS_COLLECTION).where('completed', '==', false).get();
+  const sessions = [];
+  snap.forEach((d) => sessions.push({ id: d.id, ...d.data() }));
+  return sessions;
+}
+
 /**
  * Upserts one job (episode/video) document from a live pipeline item.
  * Fire-and-forget from the caller's perspective — never throws.
@@ -254,6 +265,7 @@ module.exports = {
   upsertSessionMaster,
   markSessionCompleted,
   getSessionMaster,
+  getPendingSessions,
   recordItem,
   incrementRetryAndCheck,
   getPendingJobs,
