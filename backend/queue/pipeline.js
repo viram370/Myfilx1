@@ -940,6 +940,51 @@ async function uploadPreparedFile(session, item) {
       if (!item.probe || !item.probe.valid) {
         throw new Error('uploadPreparedFile: item reached the upload step with no verified ffprobe result — refusing to upload with unverified video metadata.');
       }
+
+      // ROOT-CAUSE FIX ("plays in Telegram, broken/corrupted icon in the
+      // app"): see services/compress.js#remuxToFaststart for the full
+      // explanation. In short — this pipeline no longer transcodes
+      // uploads, so files whose moov atom sits at the end of the file
+      // (common for many camera/phone exports and non-web-optimized
+      // sources) never get fixed anymore, and this app's own HTML5
+      // <video> player (routes/stream.js's HTTP-Range proxy) can't play
+      // those at all, even though Telegram's own apps don't care and
+      // play them fine. Detected here and fixed with a PURE STREAM COPY
+      // (-c copy, zero re-encoding) — only the container's box layout
+      // changes; every audio/video sample byte is preserved exactly.
+      // Skipped entirely (zero cost) for files that are already
+      // faststart. Falls back to uploading the original file unmodified
+      // if the remux itself fails for any reason — this must never be
+      // the reason an otherwise-good upload gets blocked.
+      const faststartCheck = compress.checkFaststart(item.tempOut);
+      if (!faststartCheck.ok) {
+        const remuxedPath = `${item.tempOut}.faststart.mp4`;
+        try {
+          log.info('uploadPreparedFile', 'Source is not faststart — remuxing losslessly before upload', {
+            chatId: session.chatId, seq: item.seq, path: item.tempOut, reason: faststartCheck.reason,
+          });
+          await compress.remuxToFaststart(item.tempOut, remuxedPath);
+          const remuxVerify = await compress.verifyOutputFile(remuxedPath);
+          if (!remuxVerify.valid) {
+            throw new Error(`remuxed file failed verification: ${remuxVerify.reason}`);
+          }
+          const oldPath = item.tempOut;
+          item.tempIn = remuxedPath;
+          item.tempOut = remuxedPath;
+          item.probe = remuxVerify;
+          item.remuxedToFaststart = true; // filename must now say .mp4 regardless of the source's original container — see resolveExtension()
+          cleanupFile(oldPath);
+          log.success('uploadPreparedFile', 'Remux to faststart succeeded (lossless — no re-encoding)', {
+            chatId: session.chatId, seq: item.seq, path: remuxedPath,
+          });
+        } catch (remuxErr) {
+          cleanupFile(remuxedPath);
+          log.warn('uploadPreparedFile', 'Faststart remux failed — uploading the original file unmodified (will still play in Telegram itself; may not stream correctly in-app)', {
+            chatId: session.chatId, seq: item.seq, reason: remuxErr.message,
+          });
+        }
+      }
+
       const fileName = buildFileName(session, item, item.episode);
       const result = await transfer.uploadEpisode(session.storageChannelId, item.tempOut, {
         fileName,
@@ -1047,6 +1092,14 @@ function extensionForMimeType(mimeType) {
  * never assumed to always be MP4.
  */
 function resolveExtension(item) {
+  // A faststart remux (see uploadPreparedFile) always outputs a real MP4
+  // container via `-f mp4`, regardless of what the source container was
+  // — the filename must reflect that, or a re-muxed .mkv source would
+  // end up uploaded as "Title.mkv" while actually containing MP4 bytes,
+  // which can confuse filename-based type detection (including our own
+  // routes/stream.js#normalizeMimeType) right back into the exact bug
+  // this remux exists to fix.
+  if (item.remuxedToFaststart) return '.mp4';
   if (item.originalFileName) {
     const ext = path.extname(item.originalFileName);
     if (ext) return ext;
