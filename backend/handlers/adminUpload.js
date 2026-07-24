@@ -42,6 +42,7 @@ const { makeLogger } = require('../utils/logger');
 const log = makeLogger('handlers/adminUpload.js');
 const pipeline = require('../queue/pipeline');
 const mtproto = require('../services/mtproto');
+const recovery = require('../services/uploadRecovery');
 
 const KIND_ALIASES = {
   anime: 'anime',
@@ -163,6 +164,25 @@ function registerAdminUpload(bot, { isAdmin, safeSendMessage, safeEditMessageTex
     wizards.set(chatId, { kind, steps, stepIndex: 0, fields: {} });
 
     await safeSendMessage(chatId, `🎬 <b>Add ${KIND_LABEL[kind]}</b>\n\n${promptFor(steps[0])}`, { parse_mode: 'HTML' });
+  });
+
+  // ---- /continue — admin-only manual recovery trigger (Requirement 4) --
+  bot.onText(/^\/continue(?:@\w+)?\s*$/i, async (msg) => {
+    const chatId = msg.chat.id;
+    if (!isAdmin(chatId)) return;
+    try {
+      const jobs = await recovery.getPendingJobs();
+      if (jobs.length === 0) {
+        await safeSendMessage(chatId, 'No pending uploads.');
+        return;
+      }
+      await safeSendMessage(chatId, `🔎 Found ${jobs.length} pending upload(s) — resuming…`);
+      const result = await resumeAllPendingSessions();
+      await safeSendMessage(chatId, `✅ Resumed ${result.resumed} upload(s) across ${result.sessions} session(s).`);
+    } catch (err) {
+      log.error('/continue', 'failed to resume pending uploads', err, { stack: err.stack });
+      await safeSendMessage(chatId, `❌ Failed to resume uploads: ${err.message}`);
+    }
   });
 
   bot.onText(/^\/canceladd(?:@\w+)?\s*$/i, async (msg) => {
@@ -415,12 +435,68 @@ async function enterBatchMode(id, wizard, safeSendMessage) {
   session.progressMessageId = null;
   session.lastRenderAt = 0;
 
+  recovery.upsertSessionMaster(id, session).catch(() => {}); // Requirement 1 — persist immediately on acceptance
+
   await safeSendMessage(
     id,
     `✅ Got it. Now send the video files (one at a time or in a row) — each will be buffered, nothing is ` +
     `processed yet.\n\nSend <b>Done</b> (or /done) when you've sent them all to start processing.`,
     { parse_mode: 'HTML' }
   );
+}
+
+/**
+ * Programmatic entry point for handlers/browseAdmin.js's "➕ Add Season" /
+ * "➕ Add Episode" buttons — every field a fresh /add wizard would normally
+ * ask for is already known for an existing title, so this builds the EXACT
+ * same wizard + pipeline-session state enterBatchMode() builds, just with
+ * every field pre-filled instead of asked for. Everything else (video
+ * capture via the existing bot.on('video'/'document') listeners, the
+ * "Done"/"/done" trigger, batch locking, episode auto-numbering, Firestore
+ * writes) runs completely unchanged, through the SAME pipeline.
+ *
+ * @param {number} chatId
+ * @param {'anime'|'webseries'|'movie'|'anime-movie'} kind
+ * @param {{title:string, season?:number|null, language:string, quality?:string|null, year?:number|null, thumbnailFileId?:string|null}} fields
+ * @returns {boolean} false if a wizard/session is already active in this chat
+ */
+function startPrefilledBatch(chatId, kind, fields) {
+  if (isSessionActive(chatId)) return false;
+
+  const steps = stepsFor(kind);
+  wizards.set(chatId, {
+    kind,
+    steps,
+    stepIndex: steps.length, // pre-filled -> treated exactly like an already-completed wizard
+    fields: { ...fields },
+    thumbnailFileId: fields.thumbnailFileId || null,
+    awaitingThumbnail: false,
+  });
+
+  const session = pipeline.createSession(chatId, {
+    kind,
+    category: KIND_CATEGORY[kind],
+    hasSeason: HAS_SEASON[kind],
+    title: fields.title,
+    season: fields.season || null,
+    language: fields.language,
+    quality: fields.quality || null,
+    year: fields.year || null,
+    thumbnailFileId: fields.thumbnailFileId || null,
+    storageChannelId: process.env.STORAGE_CHANNEL_ID,
+  }, {
+    onProgress: makeProgressRenderer(chatId),
+    onFinished: makeFinishedHandler(chatId),
+  });
+  session.progressMessageId = null;
+  session.lastRenderAt = 0;
+
+  recovery.upsertSessionMaster(chatId, session).catch(() => {}); // Requirement 1 — persist immediately on acceptance
+
+  log.info('startPrefilledBatch', 'Pre-filled batch session started (Add Season / Add Episode)', {
+    chatId, kind, title: fields.title, season: fields.season || null,
+  });
+  return true;
 }
 
 // ============================================================================
@@ -488,60 +564,6 @@ async function captureChannelEpisode(msg, source) {
   }
 }
 
-/**
- * Programmatic entry point for handlers/browseAdmin.js's "➕ Add Season" /
- * "➕ Add Episode" buttons (and anything else that already knows every
- * field an admin would normally have to type). Builds the EXACT same
- * wizard + pipeline-session state enterBatchMode() builds for the normal
- * /add text-prompt flow — just with every field already known instead of
- * asked for — so every other piece of this module (video capture via the
- * existing bot.on('video'/'document') listeners, the "Done"/"/done"
- * trigger, batch locking, progress rendering, episode auto-numbering,
- * Firestore writes) runs completely unchanged, through the SAME pipeline,
- * with zero new routing and zero changes to any existing function here.
- *
- * @param {number} chatId
- * @param {'anime'|'webseries'|'movie'|'anime-movie'} kind
- * @param {{title:string, season?:number|null, language:string, quality?:string|null, year?:number|null, thumbnailFileId?:string|null}} fields
- * @returns {boolean} false if a wizard/session is already active in this chat (caller should ask the admin to finish/cancel it first)
- */
-function startPrefilledBatch(chatId, kind, fields) {
-  if (isSessionActive(chatId)) return false;
-
-  const steps = stepsFor(kind);
-  wizards.set(chatId, {
-    kind,
-    steps,
-    stepIndex: steps.length, // pre-filled -> treated exactly like an already-completed wizard
-    fields: { ...fields },
-    thumbnailFileId: fields.thumbnailFileId || null,
-    awaitingThumbnail: false,
-  });
-
-  const session = pipeline.createSession(chatId, {
-    kind,
-    category: KIND_CATEGORY[kind],
-    hasSeason: HAS_SEASON[kind],
-    title: fields.title,
-    season: fields.season || null,
-    language: fields.language,
-    quality: fields.quality || null,
-    year: fields.year || null,
-    thumbnailFileId: fields.thumbnailFileId || null,
-    storageChannelId: process.env.STORAGE_CHANNEL_ID,
-  }, {
-    onProgress: makeProgressRenderer(chatId),
-    onFinished: makeFinishedHandler(chatId),
-  });
-  session.progressMessageId = null;
-  session.lastRenderAt = 0;
-
-  log.info('startPrefilledBatch', 'Pre-filled batch session started (Add Season / Add Episode)', {
-    chatId, kind, title: fields.title, season: fields.season || null,
-  });
-  return true;
-}
-
 async function lockAndStartBatch(id, safeSendMessage) {
   const session = pipeline.getSession(id);
   if (!session) {
@@ -587,6 +609,13 @@ async function renderProgressBySession(session, id, { force = false } = {}) {
 
   const text = pipeline.renderSessionText(session);
 
+  // Requirement 1/2 — snapshot every item's status/progress to Firestore on
+  // every render tick. Fire-and-forget: recordItem() never throws and must
+  // never add latency to the admin-facing progress message.
+  for (const item of session.items) {
+    recovery.recordItem(id, item, { title: session.title, category: session.category, season: session.season }).catch(() => {});
+  }
+
   try {
     if (session.progressMessageId) {
       await sharedSafeEditMessageText(text, { chat_id: id, message_id: session.progressMessageId, parse_mode: 'HTML' });
@@ -630,6 +659,15 @@ async function renderProgressBySession(session, id, { force = false } = {}) {
 function makeFinishedHandler(id) {
   return async (session) => {
     wizards.delete(id);
+
+    // Requirement 1/2 — final sweep so every item's terminal status
+    // (done/failed/skipped) lands in Firestore, then mark the session
+    // itself completed so it's excluded from future /continue recovery.
+    for (const item of session.items) {
+      recovery.recordItem(id, item, { title: session.title, category: session.category, season: session.season }).catch(() => {});
+    }
+    recovery.markSessionCompleted(id).catch(() => {});
+
     const done = session.items.filter((it) => it.status === 'done').length;
     const failed = session.items.filter((it) => it.status === 'failed').length;
     const skipped = session.items.filter((it) => it.status === 'skipped').length;
@@ -658,4 +696,135 @@ function makeFinishedHandler(id) {
   };
 }
 
-module.exports = { registerAdminUpload, isSessionActive, startPrefilledBatch };
+// ============================================================================
+// RECOVERY — rebuild and resume unfinished sessions (Requirements 3, 5, 6, 7)
+// ============================================================================
+
+/**
+ * Called on process startup (services/bot.js#initBot) and by /continue.
+ *
+ * For every job Firestore says isn't finished:
+ *   - skip it if a chat's session is already active in THIS process
+ *     (nothing to recover, it's already running)
+ *   - skip it (and mark it completed) if it's already in the `videos`
+ *     library — Requirement 6, never upload the same episode twice
+ *     (pipeline.js's own startBatch()->detectDuplicates() would also
+ *     catch this, but checking here means /continue can report it
+ *     immediately instead of only after the batch runs)
+ *   - otherwise bump its retry count; past MAX_RETRY_COUNT it's marked
+ *     failed and left alone (Requirement 7)
+ *   - everything else gets re-added to a freshly rebuilt pipeline session
+ *     (via the exact same startPrefilledBatch() used by Add Season / Add
+ *     Episode) and the batch is (re)started. pipeline.js's own validation/
+ *     download/upload/save logic then runs completely unmodified: a fresh
+ *     addItem() + startBatch() always begins an item at 'buffered' ->
+ *     'validated' -> 'waiting' -> 'downloading', satisfying the
+ *     "waiting -> start download" and "downloading -> restart download"
+ *     rules for free, and pipeline's own findExistingDocId() re-check
+ *     inside detectDuplicates() covers "uploading -> verify Telegram
+ *     storage" — since nothing is written to Firestore until upload
+ *     fully succeeds, "not yet in the videos collection" IS "incomplete",
+ *     so it correctly gets re-uploaded rather than skipped.
+ */
+async function resumeAllPendingSessions() {
+  let jobs;
+  try {
+    jobs = await recovery.getPendingJobs();
+  } catch (err) {
+    log.error('resumeAllPendingSessions', 'failed to query pending jobs', err, { stack: err.stack });
+    return { resumed: 0, sessions: 0 };
+  }
+  if (jobs.length === 0) return { resumed: 0, sessions: 0 };
+
+  const grouped = recovery.groupJobsBySession(jobs);
+  let resumedCount = 0;
+  let sessionsResumed = 0;
+
+  for (const [sessionIdStr, sessionJobs] of grouped.entries()) {
+    const chatId = Number(sessionIdStr);
+    if (!Number.isFinite(chatId)) continue;
+    if (isSessionActive(chatId)) continue; // already running in this process — nothing to recover
+
+    const master = await recovery.getSessionMaster(chatId).catch(() => null);
+    if (!master) {
+      log.warn('resumeAllPendingSessions', 'Pending jobs found with no session context — cannot rebuild, skipping', { chatId, count: sessionJobs.length });
+      continue;
+    }
+
+    const itemsToResume = [];
+    for (const job of sessionJobs) {
+      const alreadyThere = await recovery.isAlreadyInLibrary(job.fileUniqueId).catch(() => false);
+      if (alreadyThere) {
+        // Requirement 6 — already uploaded under a previous run; just mark it done.
+        await recovery.recordItem(chatId, { fileUniqueId: job.fileUniqueId, status: 'done' }, { title: master.title, category: master.category, season: master.season }).catch(() => {});
+        continue;
+      }
+
+      const { retryCount, exceeded } = await recovery.incrementRetryAndCheck(job).catch(() => ({ retryCount: job.retryCount || 0, exceeded: false }));
+      if (exceeded) {
+        log.warn('resumeAllPendingSessions', 'Job exceeded max retries — marked failed', { chatId, title: master.title, episode: job.episode, retryCount });
+        continue;
+      }
+      itemsToResume.push(job);
+    }
+
+    if (itemsToResume.length === 0) continue;
+
+    const started = startPrefilledBatch(chatId, master.kind, {
+      title: master.title,
+      season: master.season,
+      language: master.language,
+      quality: master.quality,
+      year: master.year,
+      thumbnailFileId: master.thumbnailFileId,
+    });
+    if (!started) {
+      log.warn('resumeAllPendingSessions', 'Could not start a rebuilt session — chat already busy', { chatId });
+      continue;
+    }
+
+    const session = pipeline.getSession(chatId);
+    for (const job of itemsToResume) {
+      // A stored fileId (direct upload) always wins — it needs no channel
+      // context and works even if the job was originally 'forwarded' but
+      // we don't have forward metadata for some reason. Otherwise rebuild
+      // the channel origin via the channelNative path, which addItem's
+      // detectChannelOrigin() accepts for ANY real channel+message id,
+      // regardless of whether the original video was forwarded-to-bot or
+      // posted natively into the storage channel — both need the exact
+      // same MTProto re-download on resume.
+      const media = { file_id: job.fileId, file_unique_id: job.fileUniqueId, file_size: job.fileSizeBytes, file_name: job.originalFileName, mime_type: job.originalMimeType };
+      const usesChannel = !job.fileId && job.forwardChatId && job.forwardMessageId;
+      const fakeMsg = usesChannel
+        ? { chat: { id: job.forwardChatId }, message_id: job.forwardMessageId }
+        : { message_id: job.chatMessageId || 0 };
+      try {
+        pipeline.addItem(session, media, fakeMsg, { channelNative: usesChannel });
+        log.info('resumeAllPendingSessions', recovery.formatRecoveryLog({
+          title: master.title, episode: job.episode, previousStatus: job.status, newStatus: 'waiting',
+        }));
+      } catch (err) {
+        log.error('resumeAllPendingSessions', 'Failed to re-add a job to the rebuilt session', err, { chatId, episode: job.episode });
+      }
+    }
+
+    try {
+      await pipeline.startBatch(chatId);
+      resumedCount += itemsToResume.length;
+      sessionsResumed += 1;
+      if (sharedSafeSendMessage) {
+        await sharedSafeSendMessage(
+          chatId,
+          `♻️ Recovered ${itemsToResume.length} unfinished upload(s) for <b>${master.title}</b> after a restart. Resuming now…`,
+          { parse_mode: 'HTML' }
+        ).catch(() => {});
+      }
+    } catch (err) {
+      log.error('resumeAllPendingSessions', 'Failed to start the rebuilt batch', err, { chatId });
+    }
+  }
+
+  return { resumed: resumedCount, sessions: sessionsResumed };
+}
+
+module.exports = { registerAdminUpload, isSessionActive, startPrefilledBatch, resumeAllPendingSessions };
