@@ -53,6 +53,30 @@ router.get('/', softAuth, async (req, res) => {
         const rep = episodes[0];
         const serialized = await serializeVideo(rep, { withImage: true });
         serialized.title = seriesTitle;
+        // ROOT CAUSE FIX (anime/episode thumbnails "mixed together"):
+        // `rep` is a single EPISODE document (whichever happened to be
+        // episodes[0] for this series) used only to build the anime-level
+        // card. serializeVideo() correctly returns `rep`'s OWN per-episode
+        // `episodeThumbnail` alongside the anime poster (`thumbnail`) —
+        // that's the right behavior for an actual episode object. But the
+        // frontend's shared pickThumbnail() helper (public/index.html)
+        // prefers `episodeThumbnail` over `thumbnail` whenever it's
+        // present, on the assumption that a populated episodeThumbnail
+        // means "this object describes a specific episode". Handing that
+        // same field straight through on the anime-level card object
+        // broke that assumption: Home/Search/Categories/Recommendations/
+        // the anime detail view (which all render this exact object) were
+        // silently showing episodes[0]'s own generated frame instead of
+        // the anime poster the admin uploaded in /addanime — and since
+        // which episode happens to be episodes[0] can change as episodes
+        // are added, the anime card's image could visibly change even
+        // though nothing about the anime poster itself ever did.
+        // The anime-level card must always resolve to the anime poster,
+        // so episodeThumbnail is reset to match `thumbnail` here — this
+        // does not touch `serialized.seasons[].eps[].thumbnail` below,
+        // which groupIntoSeasons() already resolves independently per
+        // episode from each episode's own episodeThumbnailFileId.
+        serialized.episodeThumbnail = serialized.thumbnail;
         serialized.seasons = await groupIntoSeasons(episodes, serialized.thumbnail);
         return serialized;
       })),

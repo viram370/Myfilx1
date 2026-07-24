@@ -21,6 +21,16 @@ router.get('/:id', softAuth, async (req, res) => {
     const serialized = await serializeVideo(doc, { withImage: true });
 
     if (doc.season != null) {
+      // Same fix as routes/videos.js: `doc` here is a single EPISODE
+      // record (fetched by id — often episodes[0] of the series from the
+      // list view). Its own episodeThumbnail is correct when this
+      // response is used to represent THAT episode, but this branch
+      // builds the ANIME detail view (title/seasons for the whole
+      // series), which must always show the anime poster, never
+      // whichever episode happened to be requested. Reset before the
+      // seasons/episodes are grouped below (those keep their own
+      // per-episode thumbnails independently, untouched).
+      serialized.episodeThumbnail = serialized.thumbnail;
       const seriesTitle = doc.seriesTitle || doc.title;
       let episodes = await queryDocs('videos', [['published', '==', true], ['seriesTitle', '==', seriesTitle]]);
       if (!episodes.length) {
