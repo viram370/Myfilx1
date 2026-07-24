@@ -872,6 +872,62 @@ function checkFaststart(filePath) {
 }
 
 /**
+ * ROOT-CAUSE FIX for "plays correctly in Telegram, shows a broken/
+ * corrupted video icon in the app": since this pipeline no longer
+ * transcodes uploads (processFile() is unused dead code, kept only for
+ * reference — see queue/pipeline.js), the faststart guarantee that used
+ * to come for free from the old mandatory `-movflags +faststart` encode
+ * is gone. Telegram's own apps don't care where the moov atom sits (they
+ * index/remux server-side before playback), but this app's own player
+ * streams bytes straight from Telegram via HTTP Range requests
+ * (routes/stream.js -> services/mtproto.js#streamRange) into a plain
+ * HTML5 <video> element — and a browser's <video> tag CANNOT begin
+ * decoding a file whose moov atom is at the END, because the Range
+ * requests it issues assume the container's index is readable from the
+ * front. That mismatch (native Telegram player = fine, HTTP-Range-fed
+ * <video> element = broken) is a precise, mechanical match for the
+ * reported symptom, and checkFaststart() above already had the detection
+ * logic — it just wasn't wired up to a fix.
+ *
+ * This is a PURE STREAM COPY (`-c copy`) — zero re-encoding, not a single
+ * audio/video sample byte is touched or recompressed, only the
+ * container's box layout is rewritten. It is not the "compression/
+ * transcoding pipeline" that was removed; it is a lossless container
+ * remux, the same category of operation as the thumbnail extraction
+ * that already runs on every upload.
+ *
+ * Throws on failure (e.g. a codec Telegram accepts but that can't be
+ * losslessly boxed into MP4) — callers should treat that as "leave the
+ * original file exactly as it was" rather than a hard failure; this must
+ * never be the reason an otherwise-good upload gets blocked.
+ */
+async function remuxToFaststart(inputPath, outputPath) {
+  try {
+    // Attempt 1: preserve every stream (video, audio, subtitles, etc.)
+    // exactly as-is — this is the only attempt needed for the vast
+    // majority of sources (plain MP4/MOV video+audio).
+    await runFfmpeg(['-y', '-i', inputPath, '-map', '0', '-c', 'copy', '-movflags', '+faststart', '-f', 'mp4', outputPath], null, 0);
+  } catch (err) {
+    // Common failure mode: a source (often MKV) carries a subtitle codec
+    // (e.g. SubRip/ASS) that the MP4 container simply cannot hold via a
+    // lossless copy — MP4 only supports the very different `mov_text`
+    // subtitle format, and re-encoding subtitles is out of scope for a
+    // "never re-encode" remux. Retry restricted to video+audio only,
+    // which is the actual thing this fix is for (playback), at the cost
+    // of dropping subtitle tracks that weren't going to render in this
+    // app's plain <video> element anyway.
+    log.warn('remuxToFaststart', 'Full-stream remux failed — retrying video+audio only (likely an MP4-incompatible subtitle codec)', { inputPath, reason: err.message });
+    await runFfmpeg(['-y', '-i', inputPath, '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', '-movflags', '+faststart', '-f', 'mp4', outputPath], null, 0);
+  }
+
+  const stat = fs.statSync(outputPath);
+  if (!stat.size) {
+    throw new Error('Faststart remux produced an empty output file');
+  }
+  return outputPath;
+}
+
+/**
  * Extracts a single JPEG frame to use as the video's Telegram thumbnail.
  * Telegram's own server-side auto-thumbnail generation for MTProto
  * uploads isn't fully reliable — it can silently fail or time out, which
@@ -1102,4 +1158,4 @@ async function processFile(inputPath, outputPath, onProgress) {
   throw new Error(`FFmpeg compression failed after ${tiers.length} attempt(s): ${lastErr ? lastErr.message : 'unknown error'}`);
 }
 
-module.exports = { probe, analyze, processFile, verifyOutputFile, generateThumbnail, generateEpisodeThumbnail, ensureAvailable, detectHardwareEncoder };
+module.exports = { probe, analyze, processFile, verifyOutputFile, generateThumbnail, generateEpisodeThumbnail, ensureAvailable, detectHardwareEncoder, checkFaststart, remuxToFaststart };
