@@ -488,6 +488,60 @@ async function captureChannelEpisode(msg, source) {
   }
 }
 
+/**
+ * Programmatic entry point for handlers/browseAdmin.js's "➕ Add Season" /
+ * "➕ Add Episode" buttons (and anything else that already knows every
+ * field an admin would normally have to type). Builds the EXACT same
+ * wizard + pipeline-session state enterBatchMode() builds for the normal
+ * /add text-prompt flow — just with every field already known instead of
+ * asked for — so every other piece of this module (video capture via the
+ * existing bot.on('video'/'document') listeners, the "Done"/"/done"
+ * trigger, batch locking, progress rendering, episode auto-numbering,
+ * Firestore writes) runs completely unchanged, through the SAME pipeline,
+ * with zero new routing and zero changes to any existing function here.
+ *
+ * @param {number} chatId
+ * @param {'anime'|'webseries'|'movie'|'anime-movie'} kind
+ * @param {{title:string, season?:number|null, language:string, quality?:string|null, year?:number|null, thumbnailFileId?:string|null}} fields
+ * @returns {boolean} false if a wizard/session is already active in this chat (caller should ask the admin to finish/cancel it first)
+ */
+function startPrefilledBatch(chatId, kind, fields) {
+  if (isSessionActive(chatId)) return false;
+
+  const steps = stepsFor(kind);
+  wizards.set(chatId, {
+    kind,
+    steps,
+    stepIndex: steps.length, // pre-filled -> treated exactly like an already-completed wizard
+    fields: { ...fields },
+    thumbnailFileId: fields.thumbnailFileId || null,
+    awaitingThumbnail: false,
+  });
+
+  const session = pipeline.createSession(chatId, {
+    kind,
+    category: KIND_CATEGORY[kind],
+    hasSeason: HAS_SEASON[kind],
+    title: fields.title,
+    season: fields.season || null,
+    language: fields.language,
+    quality: fields.quality || null,
+    year: fields.year || null,
+    thumbnailFileId: fields.thumbnailFileId || null,
+    storageChannelId: process.env.STORAGE_CHANNEL_ID,
+  }, {
+    onProgress: makeProgressRenderer(chatId),
+    onFinished: makeFinishedHandler(chatId),
+  });
+  session.progressMessageId = null;
+  session.lastRenderAt = 0;
+
+  log.info('startPrefilledBatch', 'Pre-filled batch session started (Add Season / Add Episode)', {
+    chatId, kind, title: fields.title, season: fields.season || null,
+  });
+  return true;
+}
+
 async function lockAndStartBatch(id, safeSendMessage) {
   const session = pipeline.getSession(id);
   if (!session) {
@@ -604,4 +658,4 @@ function makeFinishedHandler(id) {
   };
 }
 
-module.exports = { registerAdminUpload, isSessionActive };
+module.exports = { registerAdminUpload, isSessionActive, startPrefilledBatch };

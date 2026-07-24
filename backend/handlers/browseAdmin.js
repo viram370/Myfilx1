@@ -39,6 +39,11 @@ const VIDEOS_COLLECTION = 'videos';
 const CATEGORIES = Object.freeze({ ANIME: 'Anime', MOVIES: 'Movies', WEBSERIES: 'Web Series' });
 const CATEGORY_CODE = { [CATEGORIES.ANIME]: 'A', [CATEGORIES.MOVIES]: 'M', [CATEGORIES.WEBSERIES]: 'W' };
 const CODE_CATEGORY = { A: CATEGORIES.ANIME, M: CATEGORIES.MOVIES, W: CATEGORIES.WEBSERIES };
+// Only anime/webseries ever reach the season/episode screens (movies branch
+// to renderMovieScreen before this matters) — used by the new Add Season /
+// Add Episode buttons to call adminUpload.startPrefilledBatch() with the
+// same "kind" the normal /add command would have used.
+const KIND_FOR_CATEGORY = { [CATEGORIES.ANIME]: 'anime', [CATEGORIES.WEBSERIES]: 'webseries' };
 
 const TITLE_CACHE_TTL_MS = 20_000;
 const PENDING_TTL_MS = 2 * 60_000;
@@ -93,7 +98,7 @@ function extractVideoMedia(msg) {
   return null;
 }
 
-let bot, isAdmin, safeSendMessage, safeEditMessageText, isAddSessionActive;
+let bot, isAdmin, safeSendMessage, safeEditMessageText, isAddSessionActive, startPrefilledBatch;
 
 function registerBrowseAdmin(botInstance, deps) {
   bot = botInstance;
@@ -101,6 +106,7 @@ function registerBrowseAdmin(botInstance, deps) {
   safeSendMessage = deps.safeSendMessage;
   safeEditMessageText = deps.safeEditMessageText;
   isAddSessionActive = deps.isAddSessionActive || (() => false);
+  startPrefilledBatch = deps.startPrefilledBatch;
 
   bot.onText(/^\/anime(?:@\w+)?\s*$/i, (msg) => handleEntry(msg, CATEGORIES.ANIME).catch(logErr('handleEntry(anime)')));
   bot.onText(/^\/movie(?:@\w+)?\s*$/i, (msg) => handleEntry(msg, CATEGORIES.MOVIES).catch(logErr('handleEntry(movie)')));
@@ -206,6 +212,25 @@ async function renderTitleList(chatId, category, page, messageId) {
   else await safeSendMessage(chatId, text, options);
 }
 
+/**
+ * Every field a fresh /add wizard would normally ask for is already known
+ * for an EXISTING title — reused here (never re-asked) so Add Season /
+ * Add Episode only ever need the video file itself. Poster thumbnail is
+ * deliberately taken from an existing doc so it's preserved exactly, per
+ * requirement ("Preserve anime thumbnail").
+ */
+function prefillFieldsFor(t, overrides = {}) {
+  const rep = t.docs[t.docs.length - 1];
+  return {
+    title: t.title,
+    language: rep.language || 'Hindi',
+    quality: rep.quality || null,
+    year: rep.year || null,
+    thumbnailFileId: rep.thumbnailFileId || null,
+    ...overrides,
+  };
+}
+
 async function renderTitleScreen(chatId, titleIdx, messageId, page = 0) {
   const state = browseState.get(chatId);
   if (!state) return;
@@ -223,6 +248,7 @@ async function renderTitleScreen(chatId, titleIdx, messageId, page = 0) {
   const text = `${fieldBlock(t, state.category)}\n\nChoose a season:${pageInfo}`;
   const rows = slice.map((s) => [{ text: `Season ${s}`, callback_data: `bx:s:${s}` }]);
   rows.push(...navRowFor('bx:sp:', clamped, totalPages));
+  rows.push([{ text: '➕ Add Season', callback_data: 'bx:addSeason' }]);
   const deleteLabel = state.category === CATEGORIES.WEBSERIES ? '🗑 Delete Series' : '🗑 Delete Anime';
   rows.push([{ text: deleteLabel, callback_data: 'bx:delTitle' }]);
   rows.push([{ text: '⬅ Back', callback_data: 'bx:back:cat' }]);
@@ -260,6 +286,7 @@ async function renderSeasonScreen(chatId, season, messageId, page = 0) {
     rows.push(slice.slice(i, i + 4).map((e) => ({ text: `Episode ${e}`, callback_data: `bx:e:${e}` })));
   }
   rows.push(...navRowFor('bx:ep:', clamped, totalPages));
+  rows.push([{ text: '➕ Add Episode', callback_data: 'bx:addEpisode' }]);
   rows.push([{ text: '🗑 Delete Season', callback_data: 'bx:delSeason' }]);
   rows.push([{ text: '⬅ Back', callback_data: 'bx:back:title' }]);
   await safeEditMessageText(text, { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: rows } });
@@ -335,6 +362,41 @@ async function handleCallback(query) {
   if (data === 'bx:delSeason') { await confirmDelete(chatId, messageId, state, 'deleteSeason'); await ack(); return; }
   if (data === 'bx:delEpisode') { await confirmDelete(chatId, messageId, state, 'deleteEpisode'); await ack(); return; }
   if (data === 'bx:delMovie') { await confirmDelete(chatId, messageId, state, 'deleteMovie'); await ack(); return; }
+
+  if (data === 'bx:addSeason') {
+    if (!KIND_FOR_CATEGORY[state.category]) { await ack(); return; } // movies have no seasons — button is never rendered for them, but guard anyway
+    if (isAddSessionActive(chatId)) {
+      await ack({ text: 'Finish or /done your current /add batch first.', show_alert: true });
+      return;
+    }
+    state.awaiting = 'addSeason';
+    await safeEditMessageText('🔢 Send the new season number (e.g. 4).', { chat_id: chatId, message_id: messageId });
+    await ack();
+    return;
+  }
+
+  if (data === 'bx:addEpisode') {
+    if (!KIND_FOR_CATEGORY[state.category]) { await ack(); return; }
+    if (isAddSessionActive(chatId)) {
+      await ack({ text: 'Finish or /done your current /add batch first.', show_alert: true });
+      return;
+    }
+    const t = state.titles[state.titleIdx];
+    const kind = KIND_FOR_CATEGORY[state.category];
+    const started = startPrefilledBatch(chatId, kind, prefillFieldsFor(t, { season: state.season }));
+    if (!started) {
+      await ack({ text: 'Finish or /done your current /add batch first.', show_alert: true });
+      return;
+    }
+    await safeEditMessageText(
+      `✅ <b>${escapeHtml(t.title)}</b> — Season ${state.season}\n\n` +
+      `Send the video for the next episode, then send <b>Done</b> (or /done). ` +
+      `The episode number is assigned automatically.`,
+      { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
+    );
+    await ack();
+    return;
+  }
 
   if (data === 'bx:replaceVideo') {
     state.awaiting = 'replaceVideo';
@@ -489,6 +551,41 @@ async function handleText(msg) {
         ]],
       },
     });
+    return;
+  }
+
+  if (state.awaiting === 'addSeason') {
+    const raw = msg.text.trim();
+    const n = parseInt(raw, 10);
+    if (!Number.isInteger(n) || String(n) !== raw || n < 1 || n > 999) {
+      await safeSendMessage(chatId, '⚠️ Season must be a whole number between 1 and 999. Send it again.');
+      return;
+    }
+    const t = state.titles[state.titleIdx];
+    if (!t) { state.awaiting = null; return; }
+    const existingSeasons = new Set(t.docs.map((d) => d.season).filter((s) => s != null));
+    if (existingSeasons.has(n)) {
+      await safeSendMessage(chatId, `⚠️ Season ${n} already exists — open it from the season list to add more episodes, or send a different season number.`);
+      return; // stay in 'addSeason' so they can just retry
+    }
+    state.awaiting = null;
+
+    if (isAddSessionActive(chatId)) {
+      await safeSendMessage(chatId, '⚠️ Finish or /done your current /add batch first, then try Add Season again.');
+      return;
+    }
+    const kind = KIND_FOR_CATEGORY[state.category];
+    const started = startPrefilledBatch(chatId, kind, prefillFieldsFor(t, { season: n }));
+    if (!started) {
+      await safeSendMessage(chatId, '⚠️ Finish or /done your current /add batch first, then try Add Season again.');
+      return;
+    }
+    invalidateTitles(state.category); // the season won't actually appear until an episode is uploaded, but keeps the cache honest for whatever's pending
+    await safeSendMessage(
+      chatId,
+      `✅ <b>${escapeHtml(t.title)}</b> — Season ${n} will be created with its first episode.\n\n` +
+      `Send the video for Season ${n} Episode 1, then send <b>Done</b> (or /done).`
+    );
     return;
   }
 }
