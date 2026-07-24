@@ -42,7 +42,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { getDB, getAdmin } = require('./firebase');
 const { parseMediaInfo } = require('./parser');
 const mtproto = require('./mtproto');
-const { registerAdminUpload, isSessionActive: isAddSessionActive } = require('../handlers/adminUpload');
+const { registerAdminUpload, isSessionActive: isAddSessionActive, startPrefilledBatch } = require('../handlers/adminUpload');
 const { registerBrowseAdmin, isAwaitingMedia: isBrowseAwaitingMedia } = require('../handlers/browseAdmin');
 
 // ============================================================================
@@ -476,7 +476,7 @@ function surfaceIndexLink(chatId, err) {
 // Separate module (handlers/adminUpload.js + queue/pipeline.js) — registered
 // here, alongside the existing /saveanime family, not replacing it.
 registerAdminUpload(bot, { isAdmin, safeSendMessage, safeEditMessageText });
-registerBrowseAdmin(bot, { isAdmin, safeSendMessage, safeEditMessageText, isAddSessionActive });
+registerBrowseAdmin(bot, { isAdmin, safeSendMessage, safeEditMessageText, isAddSessionActive, startPrefilledBatch });
 
 // ============================================================================
 // SECTION 8 — RATE LIMITING & COMMAND WRAPPER
