@@ -2127,12 +2127,17 @@ function setupSeekBar(){
   seek.style.touchAction='none'; // stop the page/stage from scrolling or double-handling the drag
   let dragging=false;
   let wasPlaying=false;
-  function pctFromPointer(e){
-    const rect=seek.getBoundingClientRect();
-    const x=e.clientX-rect.left;
-    return Math.min(1,Math.max(0,x/rect.width));
+  let rect=null;         // cached once per drag — NOT re-read on every move (that forces a synchronous layout every event, a major source of the reported lag)
+  let pendingPct=null;   // latest pointer position, written synchronously by the (high-frequency) input event
+  let rafId=null;        // a single in-flight rAF while dragging — actual DOM writes happen at most once per frame
+  let activePointerId=null;
+
+  function calcPct(clientX){
+    if(!rect) rect=seek.getBoundingClientRect();
+    return Math.min(1,Math.max(0,(clientX-rect.left)/rect.width));
   }
-  function apply(pct,commit){
+
+  function paint(pct,commit){
     $('ply-seek-play').style.width=(pct*100)+'%';
     $('ply-seek-handle').style.left=(pct*100)+'%';
     if(vid.duration){
@@ -2150,28 +2155,100 @@ function setupSeekBar(){
       }
     }
   }
-  function start(e){
-    dragging=true;PLY.seeking=true;wasPlaying=!vid.paused;
-    seek.classList.add('dragging');preview.classList.remove('hidden');
-    seek.setPointerCapture?.(e.pointerId);
-    apply(pctFromPointer(e),false);
+
+  // ROOT CAUSE of the reported lag: the previous version called paint()
+  // directly from every raw pointermove/touchmove event. Touch input can
+  // fire at 60-120+ events/sec on modern phones, and each of those calls
+  // also triggered a fresh getBoundingClientRect() layout read — the
+  // main thread simply can't keep a synchronous style write + forced
+  // layout in lockstep with that event rate, so the visible thumb falls
+  // behind the finger and "catches up" in jumps. Decoupling input from
+  // painting (record the latest position instantly and cheaply; paint at
+  // most once per animation frame) is the standard fix for this class of
+  // drag-interaction jank and is exactly what YouTube/Netflix-style
+  // scrubbers do.
+  function tick(){
+    rafId=null;
+    if(pendingPct==null||!dragging) return;
+    paint(pendingPct,false);
+    rafId=requestAnimationFrame(tick);
   }
-  function move(e){if(!dragging)return;apply(pctFromPointer(e),false);}
-  function end(e){
+  function queuePaint(pct){
+    pendingPct=pct;
+    if(rafId==null) rafId=requestAnimationFrame(tick);
+  }
+
+  function begin(clientX,pointerId){
+    dragging=true;PLY.seeking=true;wasPlaying=!vid.paused;
+    rect=seek.getBoundingClientRect();
+    activePointerId=pointerId;
+    seek.classList.add('dragging');preview.classList.remove('hidden');
+    queuePaint(calcPct(clientX));
+  }
+  function moveTo(clientX){
+    if(!dragging)return;
+    queuePaint(calcPct(clientX));
+  }
+  function finish(clientX){
     if(!dragging)return;
     dragging=false;PLY.seeking=false;
+    if(rafId!=null){cancelAnimationFrame(rafId);rafId=null;}
     seek.classList.remove('dragging');preview.classList.add('hidden');
-    apply(pctFromPointer(e),true);
+    // The final commit always runs synchronously (never deferred to the
+    // next frame) so the actual seek lands exactly where the finger let
+    // go, even if a paint frame was still pending.
+    paint(clientX==null?(pendingPct??0):calcPct(clientX),true);
+    pendingPct=null;rect=null;activePointerId=null;
     showControls();
   }
-  // Pointer Events unify mouse + touch + pen in one path, and setPointerCapture
-  // keeps delivering move/up events to `seek` even once the finger drifts off
-  // the (thin) bar — the old separate touch listeners lost the drag the moment
-  // that happened, which is why the thumb used to snap back mid-scrub.
-  seek.addEventListener('pointerdown',start);
-  seek.addEventListener('pointermove',move);
-  seek.addEventListener('pointerup',end);
-  seek.addEventListener('pointercancel',end);
+
+  if(window.PointerEvent){
+    // Pointer Events unify mouse + touch + pen in one path. Listening on
+    // `document` for move/up (rather than only on the thin `seek` bar)
+    // is what makes dragging keep working even once the finger drifts
+    // well outside the bar's bounds, or on WebViews (Telegram's included)
+    // where setPointerCapture support is inconsistent — the capture call
+    // below is still made as a first line of defense where it IS
+    // supported, but the drag no longer depends on it.
+    seek.addEventListener('pointerdown',(e)=>{
+      seek.setPointerCapture?.(e.pointerId);
+      begin(e.clientX,e.pointerId);
+      e.preventDefault();
+    });
+    document.addEventListener('pointermove',(e)=>{
+      if(!dragging||e.pointerId!==activePointerId)return;
+      moveTo(e.clientX);
+    });
+    document.addEventListener('pointerup',(e)=>{
+      if(!dragging||e.pointerId!==activePointerId)return;
+      finish(e.clientX);
+    });
+    document.addEventListener('pointercancel',(e)=>{
+      if(!dragging||e.pointerId!==activePointerId)return;
+      finish(e.clientX);
+    });
+  } else {
+    // Touch Events fallback for older/embedded WebViews without Pointer
+    // Events support.
+    seek.addEventListener('touchstart',(e)=>{
+      begin(e.touches[0].clientX,null);
+      e.preventDefault();
+    },{passive:false});
+    document.addEventListener('touchmove',(e)=>{
+      if(!dragging)return;
+      moveTo(e.touches[0].clientX);
+      e.preventDefault();
+    },{passive:false});
+    document.addEventListener('touchend',(e)=>{
+      if(!dragging)return;
+      finish(e.changedTouches[0]?.clientX);
+    });
+    document.addEventListener('touchcancel',()=>{if(dragging)finish(null);});
+    // Mouse fallback for desktop browsers in this same code path.
+    seek.addEventListener('mousedown',(e)=>{begin(e.clientX,null);e.preventDefault();});
+    document.addEventListener('mousemove',(e)=>{if(dragging)moveTo(e.clientX);});
+    document.addEventListener('mouseup',(e)=>{if(dragging)finish(e.clientX);});
+  }
 }
 
 // ── Gestures: double-tap seek, swipe brightness/volume, swipe-seek, pinch-zoom ──
