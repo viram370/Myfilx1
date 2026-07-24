@@ -175,23 +175,27 @@ function registerAdminUpload(bot, { isAdmin, safeSendMessage, safeEditMessageTex
       const jobs = await recovery.getPendingJobs();
 
       if (sessions.length === 0 && jobs.length === 0) {
+        // Fallback check to satisfy requirement: "If the query returns zero while Firestore contains documents, log WHY."
+        const allJobsCount = await recovery.getAllJobsCount();
+        if (allJobsCount > 0) {
+          log.warn('/continue', `Firestore contains ${allJobsCount} jobs total, but 0 pending. If this is wrong, the status/completed filters failed to match any documents.`);
+        }
         await safeSendMessage(chatId, 'No pending uploads.');
         return;
       }
 
-      let logMsg = `Found pending sessions: ${sessions.length}\nFound pending jobs: ${jobs.length}\n\n`;
+      let logMsg = `Recovery Sessions Found: ${sessions.length}\n`;
+      logMsg += `Recovery Jobs Found: ${jobs.length}\n`;
+      logMsg += `Pending Jobs Found: ${jobs.length}\n`;
 
-      const groupedJobs = recovery.groupJobsBySession(jobs);
-      for (const master of sessions) {
-        const sessionJobs = groupedJobs.get(String(master.chatId)) || [];
-        logMsg += `Recovered Session:\n`;
-        logMsg += `Anime: ${master.title}\n`;
-        if (master.hasSeason) {
-          logMsg += `Season: ${master.season}\n`;
-        }
-        logMsg += `Pending Episodes: ${sessionJobs.length}\n\n`;
+      if (jobs.length > 0) {
+        logMsg += `\nPending Statuses:\n`;
+        jobs.forEach(j => {
+          logMsg += `Episode ${j.episode || 'Unknown'} -> ${j.status}\n`;
+        });
       }
-      logMsg += `Queue restarted successfully.`;
+
+      logMsg += `\nQueue rebuilt.\nWorker restarted.\nRecovery started.`;
 
       await safeSendMessage(chatId, logMsg);
       await resumeAllPendingSessions();
@@ -760,12 +764,31 @@ async function resumeAllPendingSessions() {
   let resumedCount = 0;
   let sessionsResumed = 0;
 
-  for (const master of sessions) {
-    const chatId = master.chatId;
+  // ROOT CAUSE FIX: Process a Set of all session IDs found across *both* collections.
+  // Previously, this loop only iterated over `sessions`. If a session was missing 
+  // or erroneously marked `completed: true`, its pending jobs were skipped entirely.
+  const sessionIdsToProcess = new Set([
+    ...sessions.map(s => String(s.chatId)),
+    ...Array.from(grouped.keys())
+  ]);
+
+  for (const sessionIdStr of sessionIdsToProcess) {
+    const chatId = Number(sessionIdStr);
     if (!Number.isFinite(chatId)) continue;
     if (isSessionActive(chatId)) continue; // already running in this process — nothing to recover
 
-    const sessionJobs = grouped.get(String(chatId)) || [];
+    const sessionJobs = grouped.get(sessionIdStr) || [];
+    
+    let master = sessions.find(s => String(s.chatId) === sessionIdStr);
+    if (!master) {
+      // Session missing from the filtered array? Fetch it directly to ensure jobs can rebuild
+      master = await recovery.getSessionMaster(chatId);
+    }
+    if (!master) {
+      log.warn('resumeAllPendingSessions', 'Pending jobs found with no session context — cannot rebuild, skipping', { chatId, count: sessionJobs.length });
+      continue;
+    }
+
     const itemsToResume = [];
 
     for (const job of sessionJobs) {
@@ -784,6 +807,8 @@ async function resumeAllPendingSessions() {
       itemsToResume.push(job);
     }
 
+    // Always pre-fill and start the batch so the bot recreates the queue and accepts new buffers,
+    // even if it was just sitting at 'awaiting uploads' with 0 pending jobs.
     const started = startPrefilledBatch(chatId, master.kind, {
       title: master.title,
       season: master.season,
@@ -792,6 +817,7 @@ async function resumeAllPendingSessions() {
       year: master.year,
       thumbnailFileId: master.thumbnailFileId,
     });
+
     if (!started) {
       log.warn('resumeAllPendingSessions', 'Could not start a rebuilt session — chat already busy', { chatId });
       continue;
@@ -811,7 +837,7 @@ async function resumeAllPendingSessions() {
       const usesChannel = !job.fileId && job.forwardChatId && job.forwardMessageId;
       const fakeMsg = usesChannel
         ? { chat: { id: job.forwardChatId }, message_id: job.forwardMessageId }
-        : { chat: { id: chatId }, message_id: job.chatMessageId || 0 }; // Re-added `chat: { id }` to prevent crashes in addItem
+        : { chat: { id: chatId }, message_id: job.chatMessageId || 0 };
       
       try {
         pipeline.addItem(session, media, fakeMsg, { channelNative: usesChannel });
