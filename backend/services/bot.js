@@ -42,7 +42,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { getDB, getAdmin } = require('./firebase');
 const { parseMediaInfo } = require('./parser');
 const mtproto = require('./mtproto');
-const { registerAdminUpload, isSessionActive: isAddSessionActive, startPrefilledBatch } = require('../handlers/adminUpload');
+const { registerAdminUpload, isSessionActive: isAddSessionActive, startPrefilledBatch, resumeAllPendingSessions } = require('../handlers/adminUpload');
 const { registerBrowseAdmin, isAwaitingMedia: isBrowseAwaitingMedia } = require('../handlers/browseAdmin');
 
 // ============================================================================
@@ -392,6 +392,19 @@ async function initBot() {
     }
 
     logSuccess('MYFLIX Admin Bot started', { admins: ADMIN_IDS.length });
+
+    // Requirement 3 — on startup, rebuild and resume any upload sessions
+    // that were left unfinished by a previous (e.g. OOM-killed) process.
+    try {
+      const result = await resumeAllPendingSessions();
+      if (result.resumed > 0) {
+        logSuccess('Recovered pending uploads after restart', result);
+      } else {
+        logInfo('No pending uploads to recover on startup');
+      }
+    } catch (err) {
+      logError('Startup upload recovery failed', err);
+    }
   } catch (err) {
     logError('initBot() failed', err);
   }
@@ -830,6 +843,7 @@ registerCommand('help', async (msg) => {
     '<b>Upload &amp; auto-convert pipeline</b>',
     '/add anime | webseries | anime-movie | movie',
     '<i>Walks you through Title (+Season)/Language/Quality(/Year), then accepts videos, auto re-encodes any that aren\'t browser-streamable, auto-numbers episodes, and uploads in order. Send "Done" when finished. /canceladd to abandon.</i>',
+    '/continue — resume any upload(s) left unfinished by a restart',
     '',
     '<b>Buffer</b>',
     '/showbuffer — view current buffer',
@@ -1703,7 +1717,7 @@ bot.onText(/^\/(\w+)/, async (msg, match) => {
     'deleteanime', 'deletemovie', 'deleteseries',
     'deletelanguage', 'deleteallanime', 'deleteallmovies', 'deleteallwebseries',
     'anime', 'movie', 'webseries', 'stats', 'storage', 'health', 'logs', 'ping',
-    'maxbuffer', 'showbuffer', 'clearbuffer', 'find', 'add', 'canceladd', 'done',
+    'maxbuffer', 'showbuffer', 'clearbuffer', 'find', 'add', 'canceladd', 'done', 'continue',
   ]);
   const cmd = match[1].toLowerCase();
   if (known.has(cmd)) return; // already handled by a dedicated listener
