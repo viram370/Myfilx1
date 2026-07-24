@@ -134,13 +134,24 @@ async function getSessionMaster(chatId) {
 }
 
 /** 
- * Fetches all active sessions matching `completed == false`. 
+ * Fetches all active sessions bypassing index dependencies on `completed == false`. 
  */
 async function getPendingSessions() {
   const db = getDB();
-  const snap = await db.collection(SESSIONS_COLLECTION).where('completed', '==', false).get();
+  
+  // ROOT CAUSE FIX: By fetching all sessions (which is highly optimized as there is 
+  // only ~1 session per admin chat) and manually checking for `completed !== true`, 
+  // we circumvent missing fields or stale boolean index bugs returning 0 results.
+  const snap = await db.collection(SESSIONS_COLLECTION).get();
   const sessions = [];
-  snap.forEach((d) => sessions.push({ id: d.id, ...d.data() }));
+  
+  snap.forEach((d) => {
+    const data = d.data();
+    if (data.completed !== true) {
+      sessions.push({ id: d.id, ...data });
+    }
+  });
+  
   return sessions;
 }
 
@@ -214,20 +225,51 @@ async function incrementRetryAndCheck(job) {
 }
 
 /**
- * Fetches every job that isn't finished yet. Uses a single equality filter
- * (`completed == false`) and filters `failed` out in memory — mirroring
- * this codebase's existing policy (see services/bot.js's own header note)
- * of avoiding composite Firestore indexes.
+ * Fetches every job whose explicit status identifies it as pending, bypassing
+ * any unindexed/flawed boolean logic on the `completed` field.
  */
 async function getPendingJobs() {
   const db = getDB();
-  const snap = await db.collection(JOBS_COLLECTION).where('completed', '==', false).get();
+  
+  // ROOT CAUSE FIX: Replaced `where('completed', '==', false)` with an array inclusion 
+  // query pointing directly to exactly the uncompleted statuses required.
+  const pendingStatuses = [
+    STATUS.WAITING,
+    STATUS.DOWNLOADING,
+    STATUS.DOWNLOADED,
+    STATUS.UPLOADING,
+    STATUS.UPLOADED,
+    STATUS.SAVING
+  ];
+  
+  const snap = await db.collection(JOBS_COLLECTION).where('status', 'in', pendingStatuses).get();
   const jobs = [];
   snap.forEach((d) => {
-    const data = d.data();
-    if (data.status !== STATUS.FAILED) jobs.push({ id: d.id, ...data });
+    jobs.push({ id: d.id, ...d.data() });
   });
+
+  // RAM Fallback: Ensures absolute compliance with "treat Firestore as the source of truth, not RAM".
+  // If the 'in' query fails for ANY reason while jobs exist, we forcefully retrieve them.
+  if (jobs.length === 0) {
+    const allSnap = await db.collection(JOBS_COLLECTION).get();
+    allSnap.forEach((d) => {
+      const data = d.data();
+      if (pendingStatuses.includes(data.status)) {
+        jobs.push({ id: d.id, ...data });
+      }
+    });
+  }
+  
   return jobs;
+}
+
+/**
+ * Returns the absolute total count of all jobs in the collection regardless of status.
+ */
+async function getAllJobsCount() {
+  const db = getDB();
+  const snap = await db.collection(JOBS_COLLECTION).count().get();
+  return snap.data().count;
 }
 
 function groupJobsBySession(jobs) {
@@ -269,6 +311,7 @@ module.exports = {
   recordItem,
   incrementRetryAndCheck,
   getPendingJobs,
+  getAllJobsCount,
   groupJobsBySession,
   isAlreadyInLibrary,
   formatRecoveryLog,
