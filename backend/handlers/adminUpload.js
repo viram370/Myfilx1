@@ -171,14 +171,30 @@ function registerAdminUpload(bot, { isAdmin, safeSendMessage, safeEditMessageTex
     const chatId = msg.chat.id;
     if (!isAdmin(chatId)) return;
     try {
+      const sessions = await recovery.getPendingSessions();
       const jobs = await recovery.getPendingJobs();
-      if (jobs.length === 0) {
+
+      if (sessions.length === 0 && jobs.length === 0) {
         await safeSendMessage(chatId, 'No pending uploads.');
         return;
       }
-      await safeSendMessage(chatId, `🔎 Found ${jobs.length} pending upload(s) — resuming…`);
-      const result = await resumeAllPendingSessions();
-      await safeSendMessage(chatId, `✅ Resumed ${result.resumed} upload(s) across ${result.sessions} session(s).`);
+
+      let logMsg = `Found pending sessions: ${sessions.length}\nFound pending jobs: ${jobs.length}\n\n`;
+
+      const groupedJobs = recovery.groupJobsBySession(jobs);
+      for (const master of sessions) {
+        const sessionJobs = groupedJobs.get(String(master.chatId)) || [];
+        logMsg += `Recovered Session:\n`;
+        logMsg += `Anime: ${master.title}\n`;
+        if (master.hasSeason) {
+          logMsg += `Season: ${master.season}\n`;
+        }
+        logMsg += `Pending Episodes: ${sessionJobs.length}\n\n`;
+      }
+      logMsg += `Queue restarted successfully.`;
+
+      await safeSendMessage(chatId, logMsg);
+      await resumeAllPendingSessions();
     } catch (err) {
       log.error('/continue', 'failed to resume pending uploads', err, { stack: err.stack });
       await safeSendMessage(chatId, `❌ Failed to resume uploads: ${err.message}`);
@@ -727,31 +743,31 @@ function makeFinishedHandler(id) {
  *     so it correctly gets re-uploaded rather than skipped.
  */
 async function resumeAllPendingSessions() {
-  let jobs;
+  let jobs = [];
+  let sessions = [];
+
   try {
     jobs = await recovery.getPendingJobs();
+    sessions = await recovery.getPendingSessions();
   } catch (err) {
-    log.error('resumeAllPendingSessions', 'failed to query pending jobs', err, { stack: err.stack });
+    log.error('resumeAllPendingSessions', 'failed to query pending jobs/sessions', err, { stack: err.stack });
     return { resumed: 0, sessions: 0 };
   }
-  if (jobs.length === 0) return { resumed: 0, sessions: 0 };
+
+  if (jobs.length === 0 && sessions.length === 0) return { resumed: 0, sessions: 0 };
 
   const grouped = recovery.groupJobsBySession(jobs);
   let resumedCount = 0;
   let sessionsResumed = 0;
 
-  for (const [sessionIdStr, sessionJobs] of grouped.entries()) {
-    const chatId = Number(sessionIdStr);
+  for (const master of sessions) {
+    const chatId = master.chatId;
     if (!Number.isFinite(chatId)) continue;
     if (isSessionActive(chatId)) continue; // already running in this process — nothing to recover
 
-    const master = await recovery.getSessionMaster(chatId).catch(() => null);
-    if (!master) {
-      log.warn('resumeAllPendingSessions', 'Pending jobs found with no session context — cannot rebuild, skipping', { chatId, count: sessionJobs.length });
-      continue;
-    }
-
+    const sessionJobs = grouped.get(String(chatId)) || [];
     const itemsToResume = [];
+
     for (const job of sessionJobs) {
       const alreadyThere = await recovery.isAlreadyInLibrary(job.fileUniqueId).catch(() => false);
       if (alreadyThere) {
@@ -767,8 +783,6 @@ async function resumeAllPendingSessions() {
       }
       itemsToResume.push(job);
     }
-
-    if (itemsToResume.length === 0) continue;
 
     const started = startPrefilledBatch(chatId, master.kind, {
       title: master.title,
@@ -797,31 +811,36 @@ async function resumeAllPendingSessions() {
       const usesChannel = !job.fileId && job.forwardChatId && job.forwardMessageId;
       const fakeMsg = usesChannel
         ? { chat: { id: job.forwardChatId }, message_id: job.forwardMessageId }
-        : { message_id: job.chatMessageId || 0 };
+        : { chat: { id: chatId }, message_id: job.chatMessageId || 0 }; // Re-added `chat: { id }` to prevent crashes in addItem
+      
       try {
         pipeline.addItem(session, media, fakeMsg, { channelNative: usesChannel });
+
+        // Restore exact state so the queue worker accurately identifies them as pending items 
+        // retaining their original episode sequence, rather than stripping them as new 'buffered' elements.
+        const addedItem = session.items[session.items.length - 1];
+        addedItem.episode = job.episode;
+        addedItem.status = 'waiting';
+        
         log.info('resumeAllPendingSessions', recovery.formatRecoveryLog({
-          title: master.title, episode: job.episode, previousStatus: job.status, newStatus: 'waiting',
+          title: master.title, episode: job.episode, previousStatus: job.status, newStatus: addedItem.status,
         }));
       } catch (err) {
         log.error('resumeAllPendingSessions', 'Failed to re-add a job to the rebuilt session', err, { chatId, episode: job.episode });
       }
     }
 
-    try {
-      await pipeline.startBatch(chatId);
-      resumedCount += itemsToResume.length;
-      sessionsResumed += 1;
-      if (sharedSafeSendMessage) {
-        await sharedSafeSendMessage(
-          chatId,
-          `♻️ Recovered ${itemsToResume.length} unfinished upload(s) for <b>${master.title}</b> after a restart. Resuming now…`,
-          { parse_mode: 'HTML' }
-        ).catch(() => {});
+    if (itemsToResume.length > 0) {
+      try {
+        await pipeline.startBatch(chatId);
+        // Guarantee progress message is generated so edits function effectively sequentially
+        await renderProgressBySession(session, chatId, { force: true });
+        resumedCount += itemsToResume.length;
+      } catch (err) {
+        log.error('resumeAllPendingSessions', 'Failed to start the rebuilt batch', err, { chatId });
       }
-    } catch (err) {
-      log.error('resumeAllPendingSessions', 'Failed to start the rebuilt batch', err, { chatId });
     }
+    sessionsResumed += 1;
   }
 
   return { resumed: resumedCount, sessions: sessionsResumed };
