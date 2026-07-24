@@ -710,9 +710,23 @@ async function verifyOutputFile(outputPath) {
   if (badAudio) {
     log.warn('verifyOutputFile', `Audio codec is "${badAudio.codec_name || 'unknown'}", not AAC — uploading unmodified anyway and letting Telegram decide playability`, { outputPath, audioCodec: badAudio.codec_name || 'unknown' });
   }
+  // INTENTIONALLY NOT a rejection: frame rate is a purely local metric
+  // with NO corresponding field in Telegram's DocumentAttributeVideo at
+  // all (duration/width/height are sent to Telegram; fps is not) — so a
+  // zero/undetectable frame rate can never be why Telegram accepts or
+  // rejects a video, and hard-failing on it here was a stricter-than-
+  // Telegram local rule left over from before the codec/faststart gates
+  // were relaxed. Some legitimately valid, Telegram-playable files (VFR
+  // content, or files remuxed by third-party tools that didn't populate
+  // avg_frame_rate/r_frame_rate) report "0/0" for both and were being
+  // rejected outright by this check — failing the whole item before
+  // upload OR thumbnail generation ever ran, which is why affected
+  // episodes showed up as both "rejected by validation" and "missing/
+  // broken thumbnail" together. Now logged for visibility only; 0 is
+  // reported honestly in the returned metadata rather than rejecting.
   const frameRate = parseFrameRate(videoStream.avg_frame_rate) || parseFrameRate(videoStream.r_frame_rate);
   if (!(frameRate > 0)) {
-    return { valid: false, reason: `output reports an invalid/zero frame rate ("${videoStream.avg_frame_rate || videoStream.r_frame_rate || 'unknown'}")` };
+    log.warn('verifyOutputFile', `Frame rate could not be determined ("${videoStream.avg_frame_rate || videoStream.r_frame_rate || 'unknown'}") — uploading unmodified anyway, this has no effect on Telegram's video classification`, { outputPath });
   }
   // INTENTIONALLY NOT a rejection: moov-atom position ("faststart") is
   // no longer enforced. A non-faststart MP4 is still a perfectly valid,
