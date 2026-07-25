@@ -710,29 +710,28 @@ async function resumeAllPendingSessions() {
         mime_type: job.originalMimeType
       };
 
-      // REQUIREMENT FIX: Check if source is forwarded or carries forward metadata
+      // Requirement fix: detectChannelOrigin() with opts.channelNative:true
+      // reads ONLY msg.chat.id/msg.message_id — it does not look at
+      // forward_origin at all in that branch (see queue/pipeline.js). So
+      // for a channel-sourced job, msg.chat.id/message_id must themselves
+      // BE the original storage-channel coordinates — never the admin
+      // chat, and never wrapped inside a forward_origin object, which
+      // would silently be ignored and let the wrong (admin-chat) values
+      // through instead.
       const isForwarded = job.sourceType === 'forwarded' || (job.forwardChatId && job.forwardMessageId);
-      
+
       let fakeMsg;
-      let opts = {};
+      const opts = {};
 
       if (isForwarded) {
-        fakeMsg = {
-          chat: { id: chatId },
-          message_id: job.chatMessageId || 0,
-          forward_origin: {
-            type: 'channel',
-            chat: { id: job.forwardChatId },
-            message_id: job.forwardMessageId
-          }
-        };
-        // Ensure channelNative handling if direct forward metadata structure is leveraged
+        if (!job.forwardChatId || !job.forwardMessageId) {
+          log.error('resumeAllPendingSessions', 'Forwarded job missing forwardChatId/forwardMessageId — cannot safely resume, skipping rather than guessing', null, { chatId, episode: job.episode, jobId: job.id });
+          continue;
+        }
+        fakeMsg = { chat: { id: job.forwardChatId }, message_id: job.forwardMessageId };
         opts.channelNative = true;
       } else {
-        fakeMsg = {
-          chat: { id: chatId },
-          message_id: job.chatMessageId || 0
-        };
+        fakeMsg = { message_id: job.chatMessageId || 0 };
       }
 
       try {
@@ -741,7 +740,25 @@ async function resumeAllPendingSessions() {
         const addedItem = session.items[session.items.length - 1];
         addedItem.episode = job.episode;
         addedItem.status = 'waiting';
-        
+
+        // Defense in depth: if the coordinates addItem() actually recorded
+        // ever drift from what Firestore had stored, that's this exact bug
+        // class recurring — fail loudly instead of silently querying the
+        // wrong channel.
+        if (isForwarded && (addedItem.forwardChatId !== job.forwardChatId || addedItem.forwardMessageId !== job.forwardMessageId)) {
+          log.error('resumeAllPendingSessions', 'Restored forwardChatId/forwardMessageId do not match Firestore — refusing to resume this item', null, {
+            chatId, episode: job.episode, expected: { chatId: job.forwardChatId, messageId: job.forwardMessageId }, got: { chatId: addedItem.forwardChatId, messageId: addedItem.forwardMessageId },
+          });
+          addedItem.status = 'failed';
+          addedItem.error = 'Recovery mismatch: restored source coordinates did not match the stored forward metadata.';
+          continue;
+        }
+
+        log.info('resumeAllPendingSessions', 'Recovery loaded — restored original source coordinates', {
+          chatId, episode: job.episode, sourceType: addedItem.sourceType,
+          forwardChatId: addedItem.forwardChatId, forwardMessageId: addedItem.forwardMessageId,
+          storedForwardChatId: job.forwardChatId, storedForwardMessageId: job.forwardMessageId,
+        });
         log.info('resumeAllPendingSessions', recovery.formatRecoveryLog({
           title: master.title, episode: job.episode, previousStatus: job.status, newStatus: addedItem.status,
         }));
