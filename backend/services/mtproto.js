@@ -403,10 +403,16 @@ async function resolveEntity(channelId, { retried = false } = {}) {
   const c = await connect();
   if (!c) throw new MTProtoDisabledError();
   const id = normalizeChannelId(channelId);
+  log.info('resolveEntity', 'Resolving peer...', { channelId: id, retried });
   try {
-    return await c.getEntity(id);
+    const entity = await c.getEntity(id);
+    log.info('resolveEntity', 'Peer resolved', {
+      channelId: id, entityClassName: entity?.className || null, entityId: entity?.id ? String(entity.id) : null,
+    });
+    return entity;
   } catch (err) {
     if (!retried) {
+      log.warn('resolveEntity', 'Peer not in local cache — refreshing dialogs and retrying once', { channelId: id, reason: err.message });
       try {
         await c.getDialogs({ limit: 200 });
       } catch (e2) {
@@ -414,6 +420,21 @@ async function resolveEntity(channelId, { retried = false } = {}) {
       }
       return resolveEntity(id, { retried: true });
     }
+    // Distinguish "we can't see this channel at all" (almost always means
+    // the MTProto account isn't a member of it) from a genuine per-message
+    // problem, which can only be checked AFTER the peer itself resolves —
+    // see resolveVideoSource(). Reporting "not a member" here instead of
+    // letting this bubble up as a generic/mistaken "message deleted" is
+    // the whole point: the message may be perfectly intact, we just can't
+    // reach its channel.
+    const notFoundLike = /cannot find any entity|no user has|could not find the input entity/i.test(err.message || '');
+    if (notFoundLike) {
+      log.error('resolveEntity', 'MTProto account cannot resolve this channel — likely not a member', err, { channelId: id });
+      throw new SourceNotFoundError(
+        `MTProto account is not a member of the source channel (channelId=${channelId}).`
+      );
+    }
+    log.error('resolveEntity', 'Peer resolution failed for an unrecognized reason', err, { channelId: id });
     throw new SourceNotFoundError(
       `Wrong source channel: cannot resolve Telegram channel ${channelId} (${err.message}).`
     );
@@ -441,17 +462,32 @@ async function resolveVideoSource(channelId, messageId, { forceRefresh = false }
     throw new MTProtoValidationError(`Invalid messageId: ${messageId}`);
   }
 
+  log.info('resolveVideoSource', 'Stored source coordinates', { storedChannelId: channelId, storedMessageId: messageIdNum });
+
   const entity = await resolveEntity(channelId);
+  const resolvedPeerId = entity?.id ? String(entity.id) : null;
+  log.info('resolveVideoSource', 'Fetching message...', {
+    storedChannelId: channelId, resolvedChannelId: normalizeChannelId(channelId), resolvedPeer: resolvedPeerId, storedMessageId: messageIdNum,
+  });
+
   let messages;
   try {
     messages = await c.getMessages(entity, { ids: [messageIdNum] });
   } catch (err) {
+    log.error('resolveVideoSource', 'getMessages RPC failed', err, { storedChannelId: channelId, resolvedPeer: resolvedPeerId, storedMessageId: messageIdNum });
     throw new SourceNotFoundError(
       `Could not verify message ${messageId} in channel ${channelId}: Telegram getMessages failed (${err.message}).`
     );
   }
 
+  log.info('resolveVideoSource', 'Messages returned', {
+    storedChannelId: channelId, resolvedPeer: resolvedPeerId, storedMessageId: messageIdNum, messageCount: messages ? messages.length : 0,
+  });
+
   if (!messages || messages.length === 0) {
+    log.error('resolveVideoSource', 'Zero messages returned for a resolved peer — either the message id genuinely does not exist in THIS channel, or the wrong channel/message id pair was supplied to this call', null, {
+      storedChannelId: channelId, resolvedPeer: resolvedPeerId, storedMessageId: messageIdNum,
+    });
     throw new SourceNotFoundError(
       `Could not verify message ${messageId} exists in channel ${channelId}.`
     );
@@ -459,6 +495,9 @@ async function resolveVideoSource(channelId, messageId, { forceRefresh = false }
 
   const message = messages[0];
   if (!message || message.className === 'MessageEmpty') {
+    log.error('resolveVideoSource', 'Telegram returned MessageEmpty — peer resolved correctly but this exact message id is gone from it', null, {
+      storedChannelId: channelId, resolvedPeer: resolvedPeerId, storedMessageId: messageIdNum,
+    });
     throw new SourceNotFoundError(
       `Source message not found (channelId=${channelId}, messageId=${messageId}) — it has been deleted.`
     );
