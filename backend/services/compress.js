@@ -88,6 +88,13 @@ const log = makeLogger('services/compress.js');
 
 const FFMPEG_BIN = process.env.FFMPEG_PATH || 'ffmpeg';
 const FFPROBE_BIN = process.env.FFPROBE_PATH || 'ffprobe';
+// Smart Video Processing system requirement (STEP 4): pin thread count to 1
+// on the CPU (libx264) re-encode path so a re-encode never competes with the
+// rest of the Node process (or sibling jobs) for every core on a
+// resource-constrained host like Render. Overridable via FFMPEG_THREADS for
+// hosts with headroom to spare, but the default is always the conservative
+// "1" the spec asks for — never "0"/auto.
+const FFMPEG_THREADS = process.env.FFMPEG_THREADS || '1';
 
 // Text-based subtitle codecs FFmpeg can losslessly convert to MP4's
 // `mov_text` codec.
@@ -812,10 +819,13 @@ function buildFfmpegArgs(inputPath, outputPath, tier, info, hwEncoder = null) {
         '-crf', String(crf),
         '-pix_fmt', 'yuv420p',
         '-profile:v', 'high',
-        // Explicit auto thread count — libx264 already defaults to this,
-        // but pins it instead of leaving it implicit so every core on the
-        // host actually gets used for the video encode.
-        '-threads', '0',
+        // Smart Video Processing STEP 4: pinned to a low, explicit thread
+        // count (default 1, see FFMPEG_THREADS above) rather than "0"/auto.
+        // Re-encodes only ever happen for genuinely incompatible sources —
+        // when they do, this keeps CPU usage predictable and low instead of
+        // letting libx264 claim every core on a shared/low-resource host
+        // (e.g. Render), where that would starve the rest of the process.
+        '-threads', FFMPEG_THREADS,
         // Constant frame rate: many MKV/phone-camera/screen-recording
         // sources are variable-frame-rate (frames stored irregularly in
         // time). VFR H.264 is legal but several players — Telegram's
@@ -1135,12 +1145,12 @@ function checkFaststart(filePath) {
  * original file exactly as it was" rather than a hard failure; this must
  * never be the reason an otherwise-good upload gets blocked.
  */
-async function remuxToFaststart(inputPath, outputPath) {
+async function remuxToFaststart(inputPath, outputPath, onProgress = null, totalDurationSeconds = 0) {
   try {
     // Attempt 1: preserve every stream (video, audio, subtitles, etc.)
     // exactly as-is — this is the only attempt needed for the vast
     // majority of sources (plain MP4/MOV video+audio).
-    await runFfmpeg(['-y', '-i', inputPath, '-map', '0', '-c', 'copy', '-movflags', '+faststart', '-f', 'mp4', outputPath], null, 0);
+    await runFfmpeg(['-y', '-i', inputPath, '-map', '0', '-c', 'copy', '-movflags', '+faststart', '-f', 'mp4', outputPath], onProgress, totalDurationSeconds, outputPath);
   } catch (err) {
     // Common failure mode: a source (often MKV) carries a subtitle codec
     // (e.g. SubRip/ASS) that the MP4 container simply cannot hold via a
@@ -1151,7 +1161,7 @@ async function remuxToFaststart(inputPath, outputPath) {
     // of dropping subtitle tracks that weren't going to render in this
     // app's plain <video> element anyway.
     log.warn('remuxToFaststart', 'Full-stream remux failed — retrying video+audio only (likely an MP4-incompatible subtitle codec)', { inputPath, reason: err.message });
-    await runFfmpeg(['-y', '-i', inputPath, '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', '-movflags', '+faststart', '-f', 'mp4', outputPath], null, 0);
+    await runFfmpeg(['-y', '-i', inputPath, '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', '-movflags', '+faststart', '-f', 'mp4', outputPath], onProgress, totalDurationSeconds, outputPath);
   }
 
   const stat = fs.statSync(outputPath);
@@ -1398,4 +1408,102 @@ async function processFile(inputPath, outputPath, onProgress) {
   throw new Error(`FFmpeg compression failed after ${tiers.length} attempt(s): ${lastErr ? lastErr.message : 'unknown error'}`);
 }
 
-module.exports = { probe, analyze, processFile, verifyOutputFile, generateThumbnail, generateEpisodeThumbnail, ensureAvailable, detectHardwareEncoder, checkFaststart, remuxToFaststart };
+/**
+ * ============================================================================
+ * SMART VIDEO PROCESSING SYSTEM
+ * ----------------------------------------------------------------------
+ * This is the single entry point the /add upload pipeline (queue/pipeline.js)
+ * calls, right after a source file finishes downloading and right before it
+ * is handed to the upload step. It implements the full decision flow:
+ *
+ *   1. ANALYZE  — probe the real source with FFprobe (container, video/audio
+ *      codec, resolution, fps, bitrate, duration, rotation, pixel format —
+ *      see analyze() above, which this function delegates to).
+ *   2. DECIDE   — if the video is already Telegram/HTML5 streaming
+ *      compatible (H.264 in a browser-safe yuv420p pixel format + AAC LC
+ *      stereo audio, or no audio at all), it needs no re-encode at all.
+ *   3a. COMPATIBLE  -> FAST REMUX: `-c copy -movflags +faststart`, a pure
+ *      container rewrite that only takes a few seconds and is 100%
+ *      lossless — not a single audio/video sample is touched.
+ *   3b. INCOMPATIBLE -> RE-ENCODE: only now does a real CRF-based libx264
+ *      (or hardware-accelerated) encode run, using the fast `veryfast`
+ *      preset and a low, pinned thread count (STEP 4) so it never hogs a
+ *      shared host — see buildFfmpegArgs()/pickCrf() above.
+ *   4. FALLBACK — if the fast remux attempt itself fails for any reason
+ *      (e.g. an exotic stream FFmpeg's stream-copy path rejects), this
+ *      automatically falls back to a full re-encode instead of failing the
+ *      upload outright.
+ *   5. VERIFY   — whichever path is used, the output is re-probed with
+ *      verifyOutputFile() before it's handed back, so a corrupt/partial
+ *      result is caught here rather than at upload time.
+ *
+ * "Compatible" is judged purely on the stream properties Telegram/HTML5
+ * playback actually cares about (analyze()'s videoOk/audioOk — H.264 +
+ * yuv420p + AAC-LC stereo), not on the *source* container. A remux always
+ * *outputs* a real MP4 regardless of what the source container was (MOV,
+ * TS, MKV, AVI, ...), so gating "can we skip the re-encode" on the input
+ * extension would force unnecessary, expensive re-encodes of e.g. a
+ * perfectly fine H.264/AAC .mov or .ts file — the opposite of this
+ * system's stated goal ("never compress unless absolutely necessary").
+ *
+ * @param {string} inputPath
+ * @param {string} outputPath
+ * @param {(info:{phase:'analyzing'|'remuxing'|'reencoding', compatible:?boolean, method:?string, timemark?:string, seconds?:number, percent:?number, frame?:?number, fps?:?number, speed?:?number})=>void} [onProgress]
+ * @returns {Promise<{method:'remux'|'reencode', compatible:boolean, sourceInfo:object, verified:object}>}
+ */
+async function smartProcess(inputPath, outputPath, onProgress = null) {
+  const emit = (partial) => { if (onProgress) { try { onProgress(partial); } catch (_) { /* never let a UI callback crash processing */ } } };
+
+  // STEP 1 — Analyze. Always a real FFprobe pass over the actual source
+  // bytes on disk, never assumed from a file extension or Telegram's own
+  // (frequently missing/stale) message metadata.
+  emit({ phase: 'analyzing', compatible: null, method: null, percent: null });
+  const sourceInfo = await analyze(inputPath);
+
+  // STEP 2 — Decide. videoOk/audioOk (from analyze(), see above) are exactly
+  // "H.264 in a browser-safe 4:2:0 pixel format" and "AAC-LC, <=2 channels,
+  // or no audio at all" — precisely Telegram/HTML5 streaming compatibility.
+  const compatible = sourceInfo.videoOk && sourceInfo.audioOk;
+  log.info('smartProcess', `Compatibility decision: ${compatible ? 'COMPATIBLE — fast remux' : 'INCOMPATIBLE — re-encode required'}`, {
+    inputPath, compatible, videoCodec: sourceInfo.videoCodec, audioCodec: sourceInfo.audioCodec,
+    pixFmt: sourceInfo.videoOk ? 'yuv420p-compatible' : 'incompatible', container: sourceInfo.container,
+  });
+
+  if (compatible) {
+    // STEP 3a — Fast remux: `-c copy -movflags +faststart`. A few seconds,
+    // zero quality loss, no re-encode.
+    emit({ phase: 'remuxing', compatible: true, method: 'Fast Remux', percent: 0 });
+    try {
+      await remuxToFaststart(inputPath, outputPath, (p) => emit({ phase: 'remuxing', compatible: true, method: 'Fast Remux', ...p }), sourceInfo.duration);
+      const verified = await verifyOutputFile(outputPath);
+      if (!verified.valid) throw new Error(`Fast remux output failed verification: ${verified.reason}`);
+      log.success('smartProcess', 'Fast Remux completed — no re-encode performed, quality is bit-identical to source', {
+        inputPath, outputPath, sizeBytes: verified.sizeBytes,
+      });
+      emit({ phase: 'remuxing', compatible: true, method: 'Fast Remux', percent: 100 });
+      return { method: 'remux', compatible: true, sourceInfo, verified };
+    } catch (err) {
+      // STEP 7 — Fast Remux failed for some reason (rare — a stream-copy
+      // rejection FFmpeg didn't hit during analysis). Never fail the whole
+      // item over this: fall through to a full, guaranteed-to-work re-encode.
+      log.warn('smartProcess', 'Fast Remux failed — automatically falling back to full re-encode', { inputPath, reason: err.message });
+      cleanupTierOutput(outputPath);
+    }
+  }
+
+  // STEP 3b / STEP 7 fallback — Re-encode. Only ever reached for a source
+  // that isn't already streaming-compatible, or where the remux attempt
+  // itself failed. Delegates to processFile(), which already implements
+  // CRF-based, veryfast-preset, pinned-thread encoding with hardware-
+  // encoder auto-detection and its own ordered fallback tiers (drop
+  // subtitles -> force transcode -> drop audio) — see buildFfmpegArgs() and
+  // pickCrf() above.
+  emit({ phase: 'reencoding', compatible: false, method: 'Re-encode', percent: 0 });
+  const tierResult = await processFile(inputPath, outputPath, (p) => emit({ phase: 'reencoding', compatible: false, method: 'Re-encode', ...p }));
+  const verified = await verifyOutputFile(outputPath);
+  if (!verified.valid) throw new Error(`Re-encode output failed verification: ${verified.reason}`);
+  emit({ phase: 'reencoding', compatible: false, method: 'Re-encode', percent: 100 });
+  return { method: 'reencode', compatible: false, sourceInfo: { ...sourceInfo, ...tierResult }, verified };
+}
+
+module.exports = { probe, analyze, processFile, smartProcess, verifyOutputFile, generateThumbnail, generateEpisodeThumbnail, ensureAvailable, detectHardwareEncoder, checkFaststart, remuxToFaststart };
