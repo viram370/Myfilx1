@@ -31,7 +31,14 @@
 'use strict';
 
 const crypto = require('crypto');
-const { queryDocs, updateDoc, deleteDoc, batchDelete } = require('../services/firebase');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const { queryDocs, getDoc, updateDoc, deleteDoc, batchDelete } = require('../services/firebase');
+const compress = require('../services/compress');
+const transfer = require('../services/telegramUpload');
+const mtproto = require('../services/mtproto');
+const uploadRecovery = require('../services/uploadRecovery');
 const { makeLogger } = require('../utils/logger');
 const log = makeLogger('handlers/browseAdmin.js');
 
@@ -47,6 +54,12 @@ const KIND_FOR_CATEGORY = { [CATEGORIES.ANIME]: 'anime', [CATEGORIES.WEBSERIES]:
 
 const TITLE_CACHE_TTL_MS = 20_000;
 const PENDING_TTL_MS = 2 * 60_000;
+
+// Compress & Replace Episode feature — its own temp dir, entirely separate
+// from queue/pipeline.js's UPLOADS_DIR/CONVERTED_DIR (never shares state
+// with the /add pipeline).
+const COMPRESS_TMP_DIR = path.join(os.tmpdir(), 'myflix-compress-episode');
+fs.mkdirSync(COMPRESS_TMP_DIR, { recursive: true });
 
 // Button budget (per admin request): every screen tops out at 27 buttons
 // total, counting the Delete button and any pagination arrows. That means
@@ -119,6 +132,10 @@ function registerBrowseAdmin(botInstance, deps) {
     const media = extractVideoMedia(msg);
     if (media) handleMedia(msg, media).catch(logErr('handleMedia(document)'));
   });
+
+  // Compress & Replace Episode: resume anything a Render restart
+  // interrupted. Fire-and-forget — must never block bot startup.
+  resumePendingCompressJobs().catch(logErr('resumePendingCompressJobs'));
 }
 
 function logErr(label) {
@@ -302,6 +319,7 @@ async function renderEpisodeScreen(chatId, episode, messageId) {
   const text = `${fieldBlock(t, state.category, { season: state.season, episode })}\n\nManage this episode:`;
   const rows = [
     [{ text: '🎥 Replace Video', callback_data: 'bx:replaceVideo' }],
+    [{ text: '🎥 Compress', callback_data: 'bx:compress' }],
     [{ text: '✏ Edit Details', callback_data: 'bx:editDetails' }],
     [{ text: '🗑 Delete Episode', callback_data: 'bx:delEpisode' }],
     [{ text: '⬅ Back', callback_data: 'bx:back:season' }],
@@ -346,6 +364,14 @@ async function handleCallback(query) {
     return;
   }
 
+  if (data.startsWith('bx:cxo:') || data.startsWith('bx:cxf:')) {
+    const docId = data.slice(7);
+    const resolver = pendingQualityChoice.get(docId);
+    if (resolver) { resolver(data.startsWith('bx:cxo:') ? 'original' : 'force'); await ack(); }
+    else await ack({ text: '⌛ This prompt expired.', show_alert: true });
+    return;
+  }
+
   const state = browseState.get(chatId);
   if (!state) { await ack({ text: 'Session expired — send /anime, /movie or /webseries again.', show_alert: true }); return; }
 
@@ -362,6 +388,7 @@ async function handleCallback(query) {
   if (data === 'bx:delSeason') { await confirmDelete(chatId, messageId, state, 'deleteSeason'); await ack(); return; }
   if (data === 'bx:delEpisode') { await confirmDelete(chatId, messageId, state, 'deleteEpisode'); await ack(); return; }
   if (data === 'bx:delMovie') { await confirmDelete(chatId, messageId, state, 'deleteMovie'); await ack(); return; }
+  if (data === 'bx:compress') { await confirmCompress(chatId, messageId, state); await ack(); return; }
 
   if (data === 'bx:addSeason') {
     if (!KIND_FOR_CATEGORY[state.category]) { await ack(); return; } // movies have no seasons — button is never rendered for them, but guard anyway
@@ -494,6 +521,13 @@ async function runPendingAction(pending, messageId) {
       await updateDoc(VIDEOS_COLLECTION, payload.docId, { title: payload.newTitle, seriesTitle: payload.newTitle });
       invalidateTitles(payload.category);
       await safeEditMessageText(`✅ Renamed to <b>${escapeHtml(payload.newTitle)}</b>.`, { chat_id: chatId, message_id: messageId, reply_markup: backRow(payload.category) });
+    } else if (kind === 'compressEpisode') {
+      // Long-running (download+compress+upload can take minutes) — this
+      // manages its own progress message via renderCompressProgress() as
+      // it moves through phases, so nothing further happens here after
+      // it returns; see runCompressEpisodeJob for the full flow and its
+      // safety ordering (Firestore/delete only after full verification).
+      await runCompressEpisodeJob({ ...payload, chatId, messageId });
     }
   } catch (err) {
     log.error('runPendingAction', `${kind} failed`, err, { stack: err.stack });
@@ -617,6 +651,294 @@ async function handleMedia(msg, media) {
   state.awaiting = null;
   const label = state.category === CATEGORIES.MOVIES ? 'Movie' : 'Episode';
   await safeSendMessage(chatId, `✅ ${label} updated successfully.`);
+}
+
+// ============================================================================
+// COMPRESS & REPLACE EPISODE
+// ----------------------------------------------------------------------
+// Reuses the existing download/verify/upload primitives (services/
+// telegramUpload.js, services/compress.js) exactly as the main pipeline
+// does — this is not a second pipeline, just a new caller of the same
+// building blocks, for a single admin-triggered episode instead of a
+// batch. queue/pipeline.js itself is never imported here and is not
+// touched by this feature.
+//
+// Safety ordering (see runCompressEpisodeJob): download -> analyze ->
+// compress -> upload -> verify -> generate thumbnail -> update Firestore
+// -> ONLY THEN delete the old Telegram video. Any failure before the
+// Firestore update leaves the existing episode completely untouched.
+// ============================================================================
+
+const pendingQualityChoice = new Map(); // docId -> resolver function, while askQualityChoice() is awaiting a button press
+
+function progressBlocks(pct) {
+  const filled = Math.max(0, Math.min(5, Math.round((pct || 0) / 20)));
+  return '⬛'.repeat(filled) + '⬜'.repeat(5 - filled);
+}
+
+const COMPRESS_PHASE_ORDER = ['download', 'compress', 'upload', 'replacing', 'deleting', 'done'];
+
+async function renderCompressProgress(chatId, messageId, label, state) {
+  const idx = COMPRESS_PHASE_ORDER.indexOf(state.phase);
+  const lines = [`Compressing <b>${escapeHtml(label)}</b>`, ''];
+  const phaseInfo = [['download', '⬇ Downloading'], ['compress', '🗜 Compressing'], ['upload', '⬆ Uploading']];
+  for (const [phase, phaseLabel] of phaseInfo) {
+    if (COMPRESS_PHASE_ORDER.indexOf(phase) > idx) continue;
+    const pct = phase === state.phase ? state.pct : 100;
+    lines.push(phaseLabel, `${pct}%`, progressBlocks(pct), '');
+  }
+  if (idx >= COMPRESS_PHASE_ORDER.indexOf('replacing')) lines.push('Replacing metadata...');
+  if (idx >= COMPRESS_PHASE_ORDER.indexOf('deleting')) lines.push('Deleting old Telegram video...');
+  if (state.phase === 'done') lines.push('', '✅ Completed.');
+  const text = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  await safeEditMessageText(text, { chat_id: chatId, message_id: messageId }).catch(() => {});
+}
+
+function buildCompressedFileName(title, season, episode) {
+  const base = season != null ? `${title} S${season}E${episode}` : title;
+  return `${base}.mp4`.replace(/[\\/:*?"<>|]/g, '_').slice(0, 180);
+}
+
+function cleanupCompressFile(p) {
+  if (!p) return;
+  fs.unlink(p, (err) => { if (err && err.code !== 'ENOENT') log.warn('cleanupCompressFile', 'Failed to remove temp file', { path: p, reason: err.message }); });
+}
+
+/**
+ * Pauses a compress job on an already-compatible source and asks the
+ * admin whether to keep it as-is or force a recompress. Resolves via the
+ * bx:cxo:/bx:cxf: callback branch in handleCallback(), or to 'force'
+ * after 5 minutes of no response (a safe default — it always produces a
+ * compliant file either way, this only decides whether libx264 runs).
+ */
+function askQualityChoice(chatId, messageId, docId, label) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timeout = setTimeout(() => { if (settled) return; settled = true; pendingQualityChoice.delete(docId); resolve('force'); }, 5 * 60_000);
+    pendingQualityChoice.set(docId, (choice) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      pendingQualityChoice.delete(docId);
+      resolve(choice);
+    });
+    safeEditMessageText(
+      `ℹ️ <b>${escapeHtml(label)}</b> is already stream-compatible (H.264/AAC).\n\nCompress it anyway, or keep the current quality?`,
+      { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [[
+        { text: '✅ Use Original', callback_data: `bx:cxo:${docId}` },
+        { text: '🗜 Force Recompress', callback_data: `bx:cxf:${docId}` },
+      ]] } }
+    ).catch(() => { const r = pendingQualityChoice.get(docId); if (r) r('force'); });
+  });
+}
+
+async function confirmCompress(chatId, messageId, state) {
+  const t = state.titles[state.titleIdx];
+  const doc = state.category === CATEGORIES.MOVIES
+    ? t?.docs[0]
+    : t?.docs.find((d) => d.season === state.season && d.episode === state.episode);
+  if (!doc) {
+    await safeEditMessageText('❌ Original source video not found.', { chat_id: chatId, message_id: messageId });
+    return;
+  }
+  const payload = {
+    docId: doc.id, category: state.category, title: t.title,
+    season: state.category === CATEGORIES.MOVIES ? null : state.season,
+    episode: state.category === CATEGORIES.MOVIES ? null : state.episode,
+  };
+  const tok = shortToken();
+  pendingActions.set(tok, { chatId, kind: 'compressEpisode', payload, createdAt: Date.now() });
+  await safeEditMessageText(
+    'Compress this episode?\n\n⚠ This will replace the current Telegram video.',
+    { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [[
+      { text: '✅ Compress', callback_data: `bx:cy:${tok}` },
+      { text: '❌ Cancel', callback_data: `bx:cn:${tok}` },
+    ]] } }
+  );
+}
+
+/**
+ * The actual Compress & Replace flow. Reused as-is on bot startup for any
+ * job a Render restart interrupted (see resumePendingCompressJobs) — this
+ * always restarts from step 1 (download) rather than trying to resume a
+ * partial download/encode, since a temp file on disk doesn't survive a
+ * process restart anyway.
+ */
+async function runCompressEpisodeJob({ chatId, messageId, docId, category, title, season, episode }) {
+  const label = season != null ? `${title} S${season} E${episode}` : title;
+
+  await uploadRecovery.upsertCompressJob(docId, { chatId, messageId, title, season, episode, category, status: 'downloading' });
+
+  const doc = await getDoc(VIDEOS_COLLECTION, docId);
+  if (!doc) {
+    await safeEditMessageText('❌ Original source video not found.', { chat_id: chatId, message_id: messageId }).catch(() => {});
+    await uploadRecovery.clearCompressJob(docId);
+    return;
+  }
+
+  const progress = { phase: 'download', pct: 0 };
+  let lastRenderKey = '';
+  const render = async (force) => {
+    const key = `${progress.phase}:${progress.pct}`;
+    if (!force && key === lastRenderKey) return;
+    lastRenderKey = key;
+    await renderCompressProgress(chatId, messageId, label, progress);
+  };
+  await render(true);
+
+  const stamp = `compress_${docId}_${Date.now()}`;
+  const srcPath = path.join(COMPRESS_TMP_DIR, `${stamp}.src`);
+  let compressedPath = null;
+  let thumbPath = null;
+
+  try {
+    // 1. Locate + download the ORIGINAL source video — the exact same
+    // MTProto download primitive the main pipeline uses. downloadFromChannel
+    // throws mtproto.SourceNotFoundError if the message is gone, which is
+    // exactly the "original source video not found" case.
+    await transfer.downloadFromChannel(doc.channelId, doc.messageId, srcPath, {
+      onProgress: (written, total) => {
+        if (!total) return;
+        progress.phase = 'download';
+        progress.pct = Math.max(0, Math.min(100, Math.floor(((written / total) * 100) / 10) * 10));
+        render();
+      },
+    });
+
+    // 2. Analyze codec.
+    await uploadRecovery.upsertCompressJob(docId, { status: 'compressing' });
+    const info = await compress.analyze(srcPath);
+
+    // Already stream-compatible? Let the admin choose, per requirements.
+    let useOriginal = false;
+    if (info.videoOk && info.audioOk) {
+      const choice = await askQualityChoice(chatId, messageId, docId, label);
+      useOriginal = choice === 'original';
+      progress.phase = 'compress'; progress.pct = 0;
+    }
+
+    // 3. Compress using FFmpeg (existing dormant compression pipeline —
+    // H.264/High/yuv420p/AAC/faststart/CRF, hardware-accel with automatic
+    // CPU fallback — reused unmodified from services/compress.js).
+    progress.phase = 'compress'; progress.pct = 0; await render(true);
+    compressedPath = path.join(COMPRESS_TMP_DIR, `${stamp}.mp4`);
+
+    let result;
+    if (useOriginal) {
+      // "Use Original" still guarantees a streaming-compatible faststart
+      // MP4 (the one thing this feature must never skip) via the exact
+      // same lossless remux the main upload pipeline uses — never a full
+      // re-encode, so quality is genuinely untouched.
+      const faststartCheck = compress.checkFaststart(srcPath);
+      if (faststartCheck.ok) fs.copyFileSync(srcPath, compressedPath);
+      else await compress.remuxToFaststart(srcPath, compressedPath);
+      const verified = await compress.verifyOutputFile(compressedPath);
+      if (!verified.valid) throw new Error(`Original file failed verification: ${verified.reason}`);
+      result = { ...info, ...verified, mode: 'original+faststart' };
+      progress.pct = 100; await render(true);
+    } else {
+      result = await compress.processFile(srcPath, compressedPath, ({ percent }) => {
+        progress.phase = 'compress';
+        progress.pct = Math.max(0, Math.min(100, Math.floor((percent || 0) / 10) * 10));
+        render();
+      });
+    }
+
+    // 4/5. Streaming-compatible MP4 confirmed by verifyOutputFile() above
+    // (called internally by processFile(), or explicitly for the
+    // "Use Original" path) — upload through the EXISTING MTProto upload.
+    await uploadRecovery.upsertCompressJob(docId, { status: 'uploading' });
+    progress.phase = 'upload'; progress.pct = 0; await render(true);
+
+    const uploadResult = await transfer.uploadEpisode(doc.channelId, compressedPath, {
+      fileName: buildCompressedFileName(title, season, episode),
+      duration: result.duration || doc.duration || 0,
+      width: result.width || 0,
+      height: result.height || 0,
+      mimeType: result.mimeType || 'video/mp4',
+      videoCodec: result.videoCodec, audioCodec: result.audioCodec, container: result.container,
+      onProgress: (percent) => {
+        progress.phase = 'upload';
+        progress.pct = Math.max(0, Math.min(100, Math.floor((percent || 0) / 10) * 10));
+        render();
+      },
+    });
+    // 6. uploadEpisode() only returns after Telegram confirms a real
+    // DocumentAttributeVideo came back — that IS the upload verification.
+
+    // 7. Generate a new episode thumbnail from the NEW file — reuses the
+    // exact thumbnail-generation/upload primitives the main pipeline
+    // uses; thumbnail GENERATION logic itself is untouched.
+    let episodeThumbnailFileId = doc.episodeThumbnailFileId || null;
+    try {
+      thumbPath = path.join(COMPRESS_TMP_DIR, `${stamp}.jpg`);
+      await compress.generateEpisodeThumbnail(compressedPath, thumbPath, result.duration || 0);
+      episodeThumbnailFileId = await transfer.uploadEpisodeThumbnailPhoto(bot, uploadResult.channelId, thumbPath);
+    } catch (thumbErr) {
+      log.warn('runCompressEpisodeJob', 'New thumbnail generation failed — keeping the existing thumbnail', { docId, reason: thumbErr.message });
+    }
+
+    // 8. SAFETY: Firestore is only ever updated here, after the new
+    // upload is fully verified — never before.
+    await uploadRecovery.upsertCompressJob(docId, { status: 'replacing' });
+    progress.phase = 'replacing'; await render(true);
+
+    await updateDoc(VIDEOS_COLLECTION, docId, {
+      channelId: Number(uploadResult.channelId),
+      messageId: uploadResult.messageId,
+      telegram_file_id: uploadResult.documentId,
+      file_unique_id: uploadResult.documentId,
+      fileSizeBytes: uploadResult.size,
+      mimeType: uploadResult.mimeType,
+      duration: result.duration || doc.duration || 0,
+      episodeThumbnailFileId,
+      compressedAt: new Date().toISOString(),
+    });
+    invalidateTitles(category);
+
+    // 9. SAFETY: the OLD Telegram video is only deleted now — strictly
+    // after the new upload succeeded AND Firestore was updated above.
+    // Never delete first.
+    const oldChannelId = doc.channelId;
+    const oldMessageId = doc.messageId;
+    progress.phase = 'deleting'; await render(true);
+    await transfer.deleteChannelMessages(oldChannelId, [oldMessageId]);
+
+    progress.phase = 'done'; await render(true);
+    await uploadRecovery.clearCompressJob(docId);
+    log.success('runCompressEpisodeJob', 'Compress & Replace completed', { docId, title, season, episode });
+  } catch (err) {
+    // FAILURE: do not delete the old video, do not touch Firestore —
+    // both of those only ever happen after this point in the try block,
+    // so any error above them leaves the existing episode exactly as it
+    // was.
+    log.error('runCompressEpisodeJob', 'Compress & Replace failed — existing episode left untouched', err, { docId, stack: err.stack });
+    const reason = err instanceof mtproto.SourceNotFoundError
+      ? '❌ Original source video not found.'
+      : `❌ Compression failed — the existing episode was <b>not</b> modified.\n\nReason: ${escapeHtml((err.message || 'Unknown error').slice(0, 300))}`;
+    await safeEditMessageText(reason, { chat_id: chatId, message_id: messageId }).catch(() => {});
+    await uploadRecovery.upsertCompressJob(docId, { status: 'failed', error: (err.message || '').slice(0, 500) });
+  } finally {
+    cleanupCompressFile(srcPath);
+    cleanupCompressFile(compressedPath);
+    cleanupCompressFile(thumbPath);
+  }
+}
+
+/** Checked once at startup — resumes any compress job a Render restart interrupted. */
+async function resumePendingCompressJobs() {
+  try {
+    const jobs = await uploadRecovery.getPendingCompressJobs();
+    for (const job of jobs) {
+      log.info('resumePendingCompressJobs', 'Resuming an interrupted compress job after restart', { docId: job.id, title: job.title, episode: job.episode });
+      runCompressEpisodeJob({
+        chatId: job.chatId, messageId: job.messageId, docId: job.id,
+        category: job.category, title: job.title, season: job.season, episode: job.episode,
+      }).catch((err) => log.error('resumePendingCompressJobs', 'Resumed compress job failed', err, { docId: job.id, stack: err.stack }));
+    }
+  } catch (err) {
+    log.warn('resumePendingCompressJobs', 'Failed to check for pending compress jobs', { reason: err.message });
+  }
 }
 
 module.exports = { registerBrowseAdmin, isAwaitingMedia };
