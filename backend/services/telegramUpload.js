@@ -668,10 +668,38 @@ async function uploadEpisodeThumbnailPhoto(bot, targetChannelId, jpgPath) {
   return best.file_id;
 }
 
+/**
+ * Deletes one or more messages from a channel via MTProto. Used by the new
+ * "Compress & Replace Episode" feature (handlers/browseAdmin.js) to remove
+ * the OLD Telegram video AFTER the new compressed upload has been fully
+ * verified and Firestore has been updated — never before (see that
+ * feature's safety ordering). Purely additive: nothing in the existing
+ * upload pipeline calls this.
+ *
+ * Never throws — a failed delete leaves an orphaned (unused, harmless)
+ * message in the storage channel rather than blocking on cleanup, which
+ * matters far less than the new video already being live.
+ *
+ * @param {number|string} channelId
+ * @param {number[]} messageIds
+ */
+async function deleteChannelMessages(channelId, messageIds) {
+  try {
+    const client = await mtproto.connect();
+    if (!client) return;
+    const entity = await mtproto.resolveEntity(channelId);
+    await client.deleteMessages(entity, messageIds, { revoke: true });
+    log.success('deleteChannelMessages', 'Deleted', { channelId, messageIds });
+  } catch (err) {
+    log.warn('deleteChannelMessages', 'Failed to delete (leaving an orphaned, harmless message behind)', { channelId, messageIds, reason: err.message });
+  }
+}
+
 module.exports = {
   downloadViaBotApi,
   downloadFromChannel,
   uploadEpisode,
   uploadEpisodeThumbnailPhoto,
+  deleteChannelMessages,
   BOT_API_DOWNLOAD_LIMIT_BYTES,
 };

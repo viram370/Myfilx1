@@ -300,6 +300,63 @@ function formatRecoveryLog({ title, episode, previousStatus, newStatus }) {
   return `Recovered upload:\nAnime: ${title}\nEpisode: ${episode ?? '—'}\nPrevious status: ${previousStatus}\nNew status: ${newStatus}`;
 }
 
+// ----------------------------------------------------------------------
+// Compress & Replace Episode recovery (handlers/browseAdmin.js)
+// ----------------------------------------------------------------------
+// Same file, same "Firestore is the source of truth, not RAM" philosophy
+// as everything above, in its own collection (`compress_jobs`) since a
+// compress job isn't a batch/session — it's a single episode, tracked by
+// its own video doc id, not a chatId. Kept in this file rather than a
+// separate module so there's exactly one place recovery bookkeeping lives.
+//
+// Same restart-from-scratch philosophy as the /add recovery above: a temp
+// file on disk doesn't survive a Render free-tier restart, so there is
+// nothing to meaningfully resume mid-download/mid-encode — recovery here
+// means "notice an interrupted job and restart it from step 1", not
+// resuming a partial download/encode.
+const COMPRESS_JOBS_COLLECTION = 'compress_jobs';
+const COMPRESS_TERMINAL_STATUSES = new Set(['done', 'failed']);
+
+/** Upserts a compress job's current phase/progress. Never throws. */
+async function upsertCompressJob(docId, data) {
+  try {
+    const db = getDB();
+    const admin = getAdmin();
+    await db.collection(COMPRESS_JOBS_COLLECTION).doc(docId).set({
+      ...data,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  } catch (err) {
+    log.error('upsertCompressJob', 'Failed to persist compress job state (recovery-on-restart only — the compress itself is unaffected)', err, { docId });
+  }
+}
+
+/** Removes a compress job's recovery record. */
+async function clearCompressJob(docId) {
+  try {
+    await getDB().collection(COMPRESS_JOBS_COLLECTION).doc(docId).delete();
+  } catch (err) {
+    log.error('clearCompressJob', 'Failed to clear compress job recovery record', err, { docId });
+  }
+}
+
+/** Every non-terminal compress job — checked once at bot startup. */
+async function getPendingCompressJobs() {
+  try {
+    const db = getDB();
+    const snap = await db.collection(COMPRESS_JOBS_COLLECTION).get();
+    const jobs = [];
+    snap.forEach((d) => {
+      const data = d.data();
+      if (!COMPRESS_TERMINAL_STATUSES.has(data.status)) jobs.push({ id: d.id, ...data });
+    });
+    return jobs;
+  } catch (err) {
+    log.error('getPendingCompressJobs', 'Failed to list pending compress jobs', err);
+    return [];
+  }
+}
+
 module.exports = {
   STATUS,
   MAX_RETRY_COUNT,
@@ -315,4 +372,7 @@ module.exports = {
   groupJobsBySession,
   isAlreadyInLibrary,
   formatRecoveryLog,
+  upsertCompressJob,
+  clearCompressJob,
+  getPendingCompressJobs,
 };
