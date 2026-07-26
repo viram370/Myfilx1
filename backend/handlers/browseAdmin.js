@@ -684,6 +684,14 @@ async function renderCompressProgress(chatId, messageId, label, state) {
   const phaseInfo = [['download', '⬇ Downloading'], ['compress', '🗜 Compressing'], ['upload', '⬆ Uploading']];
   for (const [phase, phaseLabel] of phaseInfo) {
     if (COMPRESS_PHASE_ORDER.indexOf(phase) > idx) continue;
+    if (phase === state.phase && state.started === false) {
+      // Requirement: never show "0%" before FFmpeg has actually started
+      // processing frames — this is the in-between state where the
+      // phase has begun (download kicked off / FFmpeg spawned) but no
+      // real progress has been reported back yet.
+      lines.push(phaseLabel, 'Starting…', '');
+      continue;
+    }
     const pct = phase === state.phase ? state.pct : 100;
     lines.push(phaseLabel, `${pct}%`, progressBlocks(pct), '');
   }
@@ -776,10 +784,10 @@ async function runCompressEpisodeJob({ chatId, messageId, docId, category, title
     return;
   }
 
-  const progress = { phase: 'download', pct: 0 };
+  const progress = { phase: 'download', pct: 0, started: true };
   let lastRenderKey = '';
   const render = async (force) => {
-    const key = `${progress.phase}:${progress.pct}`;
+    const key = `${progress.phase}:${progress.pct}:${progress.started}`;
     if (!force && key === lastRenderKey) return;
     lastRenderKey = key;
     await renderCompressProgress(chatId, messageId, label, progress);
@@ -814,13 +822,13 @@ async function runCompressEpisodeJob({ chatId, messageId, docId, category, title
     if (info.videoOk && info.audioOk) {
       const choice = await askQualityChoice(chatId, messageId, docId, label);
       useOriginal = choice === 'original';
-      progress.phase = 'compress'; progress.pct = 0;
+      progress.phase = 'compress'; progress.pct = 0; progress.started = false;
     }
 
     // 3. Compress using FFmpeg (existing dormant compression pipeline —
     // H.264/High/yuv420p/AAC/faststart/CRF, hardware-accel with automatic
     // CPU fallback — reused unmodified from services/compress.js).
-    progress.phase = 'compress'; progress.pct = 0; await render(true);
+    progress.phase = 'compress'; progress.pct = 0; progress.started = false; await render(true);
     compressedPath = path.join(COMPRESS_TMP_DIR, `${stamp}.mp4`);
 
     let result;
@@ -835,11 +843,25 @@ async function runCompressEpisodeJob({ chatId, messageId, docId, category, title
       const verified = await compress.verifyOutputFile(compressedPath);
       if (!verified.valid) throw new Error(`Original file failed verification: ${verified.reason}`);
       result = { ...info, ...verified, mode: 'original+faststart' };
-      progress.pct = 100; await render(true);
+      progress.pct = 100; progress.started = true; await render(true);
     } else {
-      result = await compress.processFile(srcPath, compressedPath, ({ percent }) => {
+      result = await compress.processFile(srcPath, compressedPath, ({ percent, frame }) => {
         progress.phase = 'compress';
-        progress.pct = Math.max(0, Math.min(100, Math.floor((percent || 0) / 10) * 10));
+        // FIX (requirement 5): only start showing a percentage once
+        // FFmpeg has actually reported real progress (a parsed stats
+        // line with a frame count, or — once duration is known — a real
+        // percent). Before that first tick, renderCompressProgress()
+        // shows "Starting..." instead of a misleading "0%" that used to
+        // display the instant this phase began, before FFmpeg had even
+        // started processing a single frame.
+        if (!progress.started && (frame > 0 || percent != null)) progress.started = true;
+        // A still-null percent (source duration unknown even after the
+        // analyze() fallback chain) no longer gets coerced to 0 — once
+        // started, it holds the last known percent rather than falsely
+        // reporting 0% while genuinely mid-encode.
+        if (percent != null) {
+          progress.pct = Math.max(0, Math.min(100, Math.floor(percent / 10) * 10));
+        }
         render();
       });
     }
@@ -848,7 +870,7 @@ async function runCompressEpisodeJob({ chatId, messageId, docId, category, title
     // (called internally by processFile(), or explicitly for the
     // "Use Original" path) — upload through the EXISTING MTProto upload.
     await uploadRecovery.upsertCompressJob(docId, { status: 'uploading' });
-    progress.phase = 'upload'; progress.pct = 0; await render(true);
+    progress.phase = 'upload'; progress.pct = 0; progress.started = true; await render(true);
 
     const uploadResult = await transfer.uploadEpisode(doc.channelId, compressedPath, {
       fileName: buildCompressedFileName(title, season, episode),
