@@ -81,6 +81,8 @@
 
 const { spawn } = require('child_process');
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { makeLogger } = require('../utils/logger');
 const log = makeLogger('services/compress.js');
 
@@ -152,6 +154,108 @@ function ensureAvailable() {
     })();
   }
   return availabilityPromise;
+}
+
+/**
+ * Snapshots host resource state — free/used memory, disk space, CPU load
+ * — so a stall or an abnormal FFmpeg exit can be explained instead of
+ * just logged as "it stopped". Render's free tier is memory-constrained
+ * enough that the OS OOM-killing FFmpeg mid-encode is a real, common
+ * cause of exactly this "stuck" symptom, and this is what makes that
+ * diagnosable from the logs instead of guessed at.
+ */
+function logResourceUsage(stage, extra = {}) {
+  const totalMemMB = Math.round(os.totalmem() / 1024 / 1024);
+  const freeMemMB = Math.round(os.freemem() / 1024 / 1024);
+  const usedMemMB = totalMemMB - freeMemMB;
+  const proc = process.memoryUsage();
+  let disk = null;
+  try {
+    const stat = fs.statfsSync(os.tmpdir());
+    disk = {
+      freeMB: Math.round((stat.bavail * stat.bsize) / 1024 / 1024),
+      totalMB: Math.round((stat.blocks * stat.bsize) / 1024 / 1024),
+    };
+  } catch (_) { /* statfsSync isn't available on every platform/Node version — omit rather than fail */ }
+
+  log.info('resourceUsage', `[${stage}] Host resource snapshot`, {
+    systemMemoryUsedMB: usedMemMB, systemMemoryTotalMB: totalMemMB,
+    systemMemoryFreePercent: totalMemMB ? Math.round((freeMemMB / totalMemMB) * 100) : null,
+    processRssMB: Math.round(proc.rss / 1024 / 1024),
+    processHeapUsedMB: Math.round(proc.heapUsed / 1024 / 1024),
+    diskFreeMB: disk?.freeMB ?? null, diskTotalMB: disk?.totalMB ?? null,
+    cpuLoadAvg1m: os.loadavg()[0]?.toFixed(2) ?? null,
+    ...extra,
+  });
+  return { totalMemMB, freeMemMB, usedMemMB, disk };
+}
+
+/**
+ * Everything that MUST be true before spawning FFmpeg at all, checked
+ * explicitly instead of just letting a missing binary/file/directory/
+ * disk space surface as an opaque spawn ENOENT or a silent hang.
+ */
+async function preflightCheck(inputPath, outputPath) {
+  // 1. FFmpeg/FFprobe exist and are executable — ensureAvailable() runs
+  // `ffmpeg -version` / `ffprobe -version` as a real invocation, not just
+  // a PATH lookup, so a present-but-broken binary (wrong architecture,
+  // missing shared libs) is caught here too, not just a missing one.
+  await ensureAvailable();
+
+  // 2. Input file exists and isn't suspiciously empty (a 0-byte file is
+  // almost always a failed/interrupted download, not a real video).
+  let inputStat;
+  try {
+    inputStat = fs.statSync(inputPath);
+  } catch (err) {
+    throw new Error(`Preflight check failed: input file does not exist (${inputPath}): ${err.message}`);
+  }
+  if (!inputStat.isFile() || inputStat.size === 0) {
+    throw new Error(`Preflight check failed: input file is empty or not a regular file (${inputPath}, ${inputStat.size} bytes)`);
+  }
+
+  // 3. Output directory exists (create it if missing — a missing temp
+  // dir after a Render restart is a plausible, recoverable cause of a
+  // job silently going nowhere) and is actually writable.
+  const outDir = path.dirname(outputPath);
+  try {
+    fs.mkdirSync(outDir, { recursive: true });
+  } catch (err) {
+    throw new Error(`Preflight check failed: could not create/access output directory (${outDir}): ${err.message}`);
+  }
+  try {
+    fs.accessSync(outDir, fs.constants.W_OK);
+  } catch (err) {
+    throw new Error(`Preflight check failed: output directory is not writable (${outDir}): ${err.message}`);
+  }
+
+  // 4. Enough free disk space. Require at least 3x the input size (room
+  // for the re-encoded output alongside the still-present source, plus
+  // headroom) or 500MB, whichever is larger — a rough but effective
+  // guard against FFmpeg silently stalling/erroring mid-write because
+  // the disk filled up, which otherwise just looks like "stuck at 0%"
+  // from the outside.
+  try {
+    const stat = fs.statfsSync(outDir);
+    const freeBytes = stat.bavail * stat.bsize;
+    const requiredBytes = Math.max(inputStat.size * 3, 500 * 1024 * 1024);
+    if (freeBytes < requiredBytes) {
+      throw new Error(
+        `Preflight check failed: only ${Math.round(freeBytes / 1024 / 1024)}MB free on disk, ` +
+        `need at least ${Math.round(requiredBytes / 1024 / 1024)}MB for this ${Math.round(inputStat.size / 1024 / 1024)}MB input.`
+      );
+    }
+  } catch (err) {
+    if (/^Preflight check failed/.test(err.message)) throw err;
+    // statfsSync unsupported on this platform/Node version — log and
+    // continue rather than block every conversion over a check we can't
+    // actually perform here.
+    log.warn('preflightCheck', 'Could not check free disk space (statfsSync unavailable) — continuing without this check', { reason: err.message });
+  }
+
+  log.info('preflightCheck', 'All pre-flight checks passed', {
+    inputPath, outputPath, inputSizeMB: Math.round(inputStat.size / 1024 / 1024),
+  });
 }
 
 async function probe(filePath) {
@@ -306,7 +410,9 @@ function detectRotation(videoStream) {
  * comes from ffprobe's actual stream inspection.
  */
 async function analyze(filePath) {
+  log.info('analyze', '[3/8] FFprobe started', { filePath });
   const meta = await probe(filePath);
+  log.info('analyze', '[4/8] FFprobe completed', { filePath, streamCount: (meta.streams || []).length });
   const streams = meta.streams || [];
   const containerFormat = (meta.format?.format_name || '').toLowerCase();
 
@@ -355,9 +461,33 @@ async function analyze(filePath) {
     });
   }
 
+  // ROOT CAUSE of "compression stuck at 0%": container-level duration
+  // (meta.format.duration) is frequently MISSING on MKV sources — MKV's
+  // Matroska container doesn't always carry a top-level duration the way
+  // MP4 does, and some encoders never write one at all. That silently
+  // produced `duration: 0`, which fed into runFfmpeg() as
+  // `totalDurationSeconds=0`, which made the percent calculation
+  // (`totalDurationSeconds > 0 ? ... : null`) return `null` for the
+  // ENTIRE conversion, every single time, on every single source that
+  // hit this — FFmpeg was actually encoding the whole time, but nothing
+  // ever had a real percentage to report. This falls back to the video
+  // stream's own duration field, then to nb_frames/avg_frame_rate, and
+  // only returns 0 (the caller now handles that as "unknown", not "0%
+  // forever") if none of those are available either.
+  let duration = Number(meta.format?.duration) || 0;
+  if (!(duration > 0)) {
+    duration = Number(videoStream.duration) || 0;
+  }
+  if (!(duration > 0) && videoStream.nb_frames && videoStream.avg_frame_rate) {
+    const [num, den] = String(videoStream.avg_frame_rate).split('/').map(Number);
+    const fps = den ? num / den : num;
+    if (fps > 0) duration = Number(videoStream.nb_frames) / fps;
+  }
+  duration = Math.round(duration);
+
   return {
     mode: videoOk && audioOk ? 'remux' : 'transcode',
-    duration: Math.round(Number(meta.format?.duration) || 0),
+    duration,
     width: videoStream.width || 0,
     height: videoStream.height || 0,
     videoCodec: videoStream.codec_name || null,
@@ -374,12 +504,24 @@ async function analyze(filePath) {
 }
 
 function parseTimemark(stderrChunk) {
-  // ffmpeg prints progress lines like: "... time=00:01:23.45 bitrate=... speed=..."
-  const match = stderrChunk.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
-  if (!match) return null;
-  const [, hh, mm, ss] = match;
+  // ffmpeg prints progress lines like:
+  // "frame=  245 fps= 24 q=23.0 size=    2048kB time=00:01:23.45 bitrate= 198.3kbits/s speed=0.98x"
+  const timeMatch = stderrChunk.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
+  if (!timeMatch) return null;
+  const [, hh, mm, ss] = timeMatch;
   const seconds = Number(hh) * 3600 + Number(mm) * 60 + parseFloat(ss);
-  return { timemark: `${hh}:${mm}:${ss}`, seconds };
+  const frameMatch = stderrChunk.match(/frame=\s*(\d+)/);
+  const fpsMatch = stderrChunk.match(/fps=\s*([\d.]+)/);
+  const speedMatch = stderrChunk.match(/speed=\s*([\d.]+)x/);
+  const sizeMatch = stderrChunk.match(/size=\s*(\d+)kB/);
+  return {
+    timemark: `${hh}:${mm}:${ss}`,
+    seconds,
+    frame: frameMatch ? Number(frameMatch[1]) : null,
+    fps: fpsMatch ? Number(fpsMatch[1]) : null,
+    speed: speedMatch ? Number(speedMatch[1]) : null,
+    outputSizeKB: sizeMatch ? Number(sizeMatch[1]) : null,
+  };
 }
 
 /** Turns a raw FFmpeg failure into a message that names the likely cause instead of just dumping the stderr tail. */
@@ -410,9 +552,13 @@ function describeFfmpegFailure(code, stderrTail, signal) {
  * @param {string[]} args
  * @param {(info:{timemark:string, seconds:number, percent:?number})=>void} [onProgress]
  * @param {number} [totalDurationSeconds]
+ * @param {string} [outputPathForStats] used only for the periodic output-file-size log line
  */
-function runFfmpeg(args, onProgress, totalDurationSeconds) {
+function runFfmpeg(args, onProgress, totalDurationSeconds, outputPathForStats = null) {
   return new Promise((resolve, reject) => {
+    log.info('runFfmpeg', '[5/8] FFmpeg started', {});
+    log.info('runFfmpeg', 'Command', { command: `${FFMPEG_BIN} ${args.join(' ')}` });
+
     let child;
     try {
       child = spawn(FFMPEG_BIN, args);
@@ -421,13 +567,75 @@ function runFfmpeg(args, onProgress, totalDurationSeconds) {
       return;
     }
 
+    const startedAt = Date.now();
+    let lastProgress = null;       // most recent parsed stats line
+    let lastProgressAt = startedAt; // when we last actually heard from ffmpeg
+    let stalledLogged = false;
     let stderrTail = '';
+    let stdoutTail = '';
+
+    // Requirement: "every 5 seconds log elapsed time, current frame, fps,
+    // speed, output file size" — independent of whatever cadence ffmpeg
+    // itself happens to print stats at, and independent of whether
+    // parsing them succeeds, so this keeps producing signal even if a
+    // future ffmpeg build changes its stats line format.
+    const tickTimer = setInterval(() => {
+      const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+      let outputSizeBytes = null;
+      if (outputPathForStats) {
+        try { outputSizeBytes = fs.statSync(outputPathForStats).size; } catch (_) { /* not created yet — fine */ }
+      }
+      log.info('runFfmpeg', 'Progress tick', {
+        elapsedSec,
+        frame: lastProgress?.frame ?? null,
+        fps: lastProgress?.fps ?? null,
+        speed: lastProgress?.speed ?? null,
+        timemark: lastProgress?.timemark ?? null,
+        outputFileSizeBytes: outputSizeBytes,
+      });
+
+      // Stall detection: no progress line parsed from stderr for 60s
+      // straight. This is the exact "compression appears stuck" signal
+      // requested — logged once when it first crosses the threshold
+      // (not spammed every 5s afterwards) alongside a full resource
+      // snapshot, since a stall on Render's free tier is very often a
+      // memory-pressure symptom rather than FFmpeg itself hanging.
+      const sinceProgressSec = Math.round((Date.now() - lastProgressAt) / 1000);
+      if (sinceProgressSec >= 60 && !stalledLogged) {
+        stalledLogged = true;
+        log.warn('runFfmpeg', `Compression appears stalled — no progress for ${sinceProgressSec}s`, {
+          elapsedSec, lastProgress, outputFileSizeBytes: outputSizeBytes,
+        });
+        logResourceUsage('ffmpeg-stall');
+      } else if (sinceProgressSec < 60 && stalledLogged) {
+        stalledLogged = false; // progress resumed — allow re-detecting a later stall
+      }
+    }, 5000);
+
+    child.stdout?.on('data', (d) => {
+      // FFmpeg writes almost nothing to stdout for a normal file-output
+      // encode, but the pipe is drained regardless — an unconsumed
+      // stdout pipe can in principle fill its OS buffer and block the
+      // child process, which would look exactly like a random stall.
+      stdoutTail = (stdoutTail + d.toString()).slice(-2000);
+    });
+
     child.stderr?.on('data', (d) => {
       const text = d.toString();
       stderrTail = (stderrTail + text).slice(-4000);
-      if (onProgress) {
-        const progress = parseTimemark(text);
-        if (progress) {
+      const progress = parseTimemark(text);
+      if (progress) {
+        lastProgress = progress;
+        lastProgressAt = Date.now();
+        if (onProgress) {
+          // `percent` is only ever a real number when we actually know
+          // the source duration. When we don't (see the fallback chain
+          // added to analyze()'s duration calculation), this stays
+          // `null` rather than being silently treated as 0% — callers
+          // must not coerce a null percent to 0, or "hasn't started"
+          // and "duration unknown" become visually indistinguishable
+          // (this was the root cause of progress appearing stuck at 0%
+          // for sources with no reliable container-level duration).
           const percent = totalDurationSeconds > 0
             ? Math.max(0, Math.min(100, Math.round((progress.seconds / totalDurationSeconds) * 100)))
             : null;
@@ -437,6 +645,7 @@ function runFfmpeg(args, onProgress, totalDurationSeconds) {
     });
 
     child.on('error', (err) => {
+      clearInterval(tickTimer);
       if (err.code === 'ENOENT') {
         reject(new Error(`"${FFMPEG_BIN}" was not found on PATH. Install FFmpeg on this host, or set FFMPEG_PATH.`));
       } else {
@@ -445,7 +654,32 @@ function runFfmpeg(args, onProgress, totalDurationSeconds) {
     });
 
     child.on('close', (code, signal) => {
-      log.info('runFfmpeg', 'FFmpeg process exited', { code, signal: signal || null });
+      clearInterval(tickTimer);
+      const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+      log.info('runFfmpeg', 'FFmpeg process exited', {
+        code, signal: signal || null, elapsedSec,
+        stdoutTail: stdoutTail || null, stderrTail,
+      });
+
+      // A null exit code with a signal (SIGKILL almost always, sometimes
+      // SIGTERM) and no FFmpeg-side error message in stderr is the
+      // classic Render-free-tier signature of the OS OOM-killing the
+      // process outright — FFmpeg never gets a chance to log anything
+      // about why it died, which is exactly what makes this look like a
+      // silent stall from the outside instead of a crash.
+      if (signal) {
+        const usage = logResourceUsage('ffmpeg-killed', { signal });
+        const likelyOom = signal === 'SIGKILL' && usage.freeMemMB < 150;
+        log.error(
+          'runFfmpeg',
+          likelyOom
+            ? `FFmpeg was killed by ${signal} — system had only ${usage.freeMemMB}MB free, this is almost certainly an out-of-memory kill (common on Render's free tier under load)`
+            : `FFmpeg was killed by signal ${signal}`,
+          new Error(`killed by ${signal}`),
+          { code, signal, freeMemMB: usage.freeMemMB, elapsedSec }
+        );
+      }
+
       if (code === 0) resolve();
       else reject(new Error(describeFfmpegFailure(code, stderrTail, signal)));
     });
@@ -1030,6 +1264,12 @@ function cleanupTierOutput(outputPath) {
  * may differ from the initial plan after a fallback).
  */
 async function processFile(inputPath, outputPath, onProgress) {
+  // Stages [1/8] Download started / [2/8] Download completed happen
+  // upstream of this function (the caller already has the source file
+  // on disk by the time processFile() is invoked) — logged there, not
+  // here, since touching the download step would mean redesigning the
+  // upload pipeline rather than the compression step this fix targets.
+  await preflightCheck(inputPath, outputPath);
   const info = await analyze(inputPath);
   const hwEncoder = await detectHardwareEncoder();
   let inputSizeBytes = null;
@@ -1093,7 +1333,7 @@ async function processFile(inputPath, outputPath, onProgress) {
       const encoderChoice = encoderChoices[ei];
       try {
         const args = buildFfmpegArgs(inputPath, outputPath, tier, info, encoderChoice);
-        await runFfmpeg(args, onProgress, info.duration);
+        await runFfmpeg(args, onProgress, info.duration, outputPath);
 
         // FFmpeg exiting 0 only means the process didn't crash — it does
         // NOT guarantee a playable file (a killed disk, a race with disk
