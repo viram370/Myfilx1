@@ -152,6 +152,24 @@ function formatSpeed(state) {
   return `${(state.bps / (1024 * 1024)).toFixed(1)} MB/s`;
 }
 
+/** Formats FFmpeg's own realtime "speed=" multiplier, e.g. 2.4 -> "2.4x". */
+function formatFfmpegSpeedX(speed) {
+  if (!Number.isFinite(speed) || speed <= 0) return null;
+  return `${speed.toFixed(1)}x`;
+}
+
+/** Formats a whole number of seconds as "Ns" / "Mm Ss" / "Hh Mm". */
+function formatEta(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  const s = Math.round(seconds);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m < 60) return `${m}m ${rem}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
 /** Renders a 10-block text bar like `██████░░░░` for a 0-100 percent value. */
 function renderProgressBar(percent, size = 10) {
   const pct = Math.max(0, Math.min(100, percent || 0));
@@ -337,6 +355,18 @@ function addItem(session, media, msg, opts = {}) {
     downloadSpeedState: null, // { bytes, ts, bps } rolling speed tracker for the live progress message
     uploadProgress: null, // 0-100 (10% steps), only meaningful while status === 'uploading'
     uploadSpeedState: null, // { bytes, ts, bps } rolling speed tracker for the live progress message
+    // ---- Smart Video Processing (see runSmartProcessing() below) ----
+    // Populated only while status === 'processing'. processMethod stays
+    // null until the FFprobe analysis decides Fast Remux vs Re-encode;
+    // processCompatible mirrors that same decision as a plain boolean for
+    // the progress message ("Compatible: YES/NO").
+    processPhase: null, // 'analyzing' | 'remuxing' | 'reencoding' | null
+    processCompatible: null, // true | false | null (unknown, still analyzing)
+    processMethod: null, // 'Fast Remux' | 'Re-encode' | null
+    processProgress: null, // 0-100 (10% steps)
+    processFps: null, // current encode fps, null when unavailable (e.g. during a pure stream-copy remux)
+    processSpeedX: null, // ffmpeg's own realtime "speed=" multiplier, e.g. 2.4 for "2.4x"
+    processEtaSeconds: null, // estimated seconds remaining, derived from percent + speed
     startedAt: null, // Date.now() when this item's processing (download) began
     finishedAt: null, // Date.now() when this item reached a terminal state
     durationHint: media.duration || 0,
@@ -345,7 +375,9 @@ function addItem(session, media, msg, opts = {}) {
     sourceType: channelOrigin ? 'forwarded' : 'direct',
     forwardChatId: channelOrigin ? channelOrigin.chatId : null,
     forwardMessageId: channelOrigin ? channelOrigin.messageId : null,
-    // No compression stage anymore: buffered -> [validation: failed|skipped|waiting] -> downloading -> ready -> uploading -> done | failed
+    // buffered -> [validation: failed|skipped|waiting] -> downloading -> processing -> ready -> uploading -> done | failed
+    // 'processing' = Smart Video Processing stage (FFprobe analysis, then a
+    // fast remux or, only if genuinely necessary, a re-encode).
     status: 'buffered',
     attempts: { copy: 0, compress: 0, upload: 0 }, // field names kept for compatibility with existing logging/metrics
     episode: null,
@@ -667,6 +699,130 @@ async function verifyDownloadedFile(session, item) {
   return true;
 }
 
+// ============================================================================
+// SMART VIDEO PROCESSING (Smart Detection stage)
+// ----------------------------------------------------------------------
+// Runs once per item, right after the download is verified and BEFORE the
+// episode thumbnail is generated / the item is marked 'ready' for upload.
+// This is purely an additive stage inserted into the existing
+// download -> ??? -> ready -> upload flow — it does not change how items
+// are buffered, validated, deduped, numbered, queued, retried, or
+// recovered; every surrounding step (validateItems, detectDuplicates,
+// assignEpisodeNumbers, the transfer/upload queues, uploadPreparedFile's
+// own faststart safety-net check) is untouched.
+//
+// Delegates ALL of the actual analysis/remux/re-encode decision-making to
+// services/compress.js#smartProcess() (see that file for the full
+// step-by-step breakdown: analyze -> decide -> fast remux OR re-encode ->
+// automatic fallback if the remux fails -> verify). This function's only
+// job is translating that into item state + the live progress message.
+// ============================================================================
+
+/**
+ * @returns {boolean} true if the item is ready to continue to thumbnail
+ * generation / upload; false if it failed and the item was already marked
+ * 'failed' (mirrors verifyDownloadedFile()'s own return-value contract).
+ */
+async function runSmartProcessing(session, item) {
+  const outPath = `${item.tempOut}.smart.mp4`;
+  const processingStartedAt = Date.now();
+
+  item.status = 'processing';
+  item.processPhase = 'analyzing';
+  item.processCompatible = null;
+  item.processMethod = null;
+  item.processProgress = 0;
+  item.processFps = null;
+  item.processSpeedX = null;
+  item.processEtaSeconds = null;
+  log.info('runSmartProcessing', 'Smart Video Processing started — analyzing source with FFprobe', {
+    chatId: session.chatId, seq: item.seq, path: item.tempOut,
+  });
+  await session.onProgress(session, { force: true });
+
+  try {
+    const result = await compress.smartProcess(item.tempOut, outPath, (p) => {
+      // A phase/method transition (analyzing -> remuxing/reencoding, or the
+      // Compatible YES/NO becoming known) must render immediately, not wait
+      // for the next 10%-bucket change — otherwise a fast remux could finish
+      // before "Compatible: YES / Method: Fast Remux" ever got shown.
+      const phaseChanged = item.processPhase !== p.phase;
+      const methodChanged = !!p.method && item.processMethod !== p.method;
+
+      item.processPhase = p.phase;
+      if (typeof p.compatible === 'boolean') item.processCompatible = p.compatible;
+      if (p.method) item.processMethod = p.method;
+      if (Number.isFinite(p.fps)) item.processFps = p.fps;
+      if (Number.isFinite(p.speed)) item.processSpeedX = p.speed;
+
+      if (phaseChanged || methodChanged) {
+        Promise.resolve(session.onProgress(session)).catch(() => {});
+      }
+
+      if (Number.isFinite(p.percent)) {
+        // ETA from the encoder's own realtime speed multiplier: at
+        // "2.4x" speed, 1 real second processes 2.4 seconds of source
+        // video, so remaining-source-seconds / speed = remaining real
+        // seconds. Falls back to elapsed-time extrapolation when FFmpeg
+        // hasn't printed a speed figure yet (first couple of seconds).
+        const remainingPercent = 100 - p.percent;
+        if (item.processSpeedX && Number.isFinite(p.seconds) && item.processSpeedX > 0) {
+          const totalDurationEstimate = p.percent > 0 ? (p.seconds / p.percent) * 100 : 0;
+          const remainingSourceSeconds = Math.max(0, totalDurationEstimate - p.seconds);
+          item.processEtaSeconds = remainingSourceSeconds / item.processSpeedX;
+        } else if (p.percent > 0) {
+          const elapsedSec = (Date.now() - processingStartedAt) / 1000;
+          item.processEtaSeconds = (elapsedSec / p.percent) * remainingPercent;
+        }
+        reportBucketedProgress(session, item, 'processProgress', p.percent);
+      } else {
+        // No known duration to compute a percent against — still surface
+        // phase/method/fps/speed changes immediately rather than waiting
+        // for a 10%-bucket change that may never come.
+        Promise.resolve(session.onProgress(session)).catch(() => {});
+      }
+    });
+
+    // Swap the item onto the processed output — this is now "the file
+    // ready to upload", exactly like tempOut always meant before this
+    // stage existed. The pre-processing source is removed.
+    const oldPath = item.tempOut;
+    item.tempIn = outPath;
+    item.tempOut = outPath;
+    item.probe = result.verified;
+    item.durationHint = result.verified.duration || item.durationHint;
+    item.widthHint = result.verified.width || item.widthHint;
+    item.heightHint = result.verified.height || item.heightHint;
+    cleanupFile(oldPath);
+
+    item.processPhase = null;
+    item.processProgress = 100;
+    log.success('runSmartProcessing', `Smart Video Processing completed via ${result.method === 'remux' ? 'Fast Remux (no re-encode, quality identical)' : 'Re-encode (source was not streaming-compatible)'}`, {
+      chatId: session.chatId, seq: item.seq, method: result.method, compatible: result.compatible,
+      sourceVideoCodec: result.sourceInfo.videoCodec, sourceAudioCodec: result.sourceInfo.audioCodec,
+      elapsedMs: Date.now() - processingStartedAt, outputSizeBytes: result.verified.sizeBytes,
+    });
+    await session.onProgress(session, { force: true });
+    return true;
+  } catch (err) {
+    log.error('runSmartProcessing', 'Smart Video Processing failed — item cannot be uploaded', err, {
+      chatId: session.chatId, seq: item.seq, path: item.tempOut, stack: err.stack,
+    });
+    cleanupFile(outPath);
+    cleanupFile(item.tempOut);
+    item.tempIn = null;
+    item.tempOut = null;
+    item.probe = null;
+    item.processPhase = null;
+    item.status = 'failed';
+    item.error = `Video processing failed: ${err.message}`;
+    item.finishedAt = Date.now();
+    await session.onProgress(session, { force: true });
+    await maybeCompleteSession(session);
+    return false;
+  }
+}
+
 async function generateEpisodeThumbnailForItem(session, item) {
   if (!item.tempIn) return;
   const thumbPath = path.join(UPLOADS_DIR, `${session.chatId}_${item.seq}_${Date.now()}.thumb.jpg`);
@@ -729,10 +885,16 @@ async function runDirectTransferJob({ chatId, seq }) {
       item.tempIn = inPath;
       item.tempOut = inPath;
       item.downloadProgress = 100;
-      log.success('runDirectTransferJob', 'Download completed — verifying before upload (no re-encoding)', { chatId, seq, path: inPath, method: 'bot-api' });
+      log.success('runDirectTransferJob', 'Download completed — verifying before Smart Video Processing', { chatId, seq, path: inPath, method: 'bot-api' });
 
       const verified = await verifyDownloadedFile(session, item);
       if (!verified) { pumpUploadQueue(); return; }
+
+      // Smart Video Processing: analyze the verified download and either
+      // fast-remux it (already streaming-compatible) or re-encode it (only
+      // if genuinely necessary) — see runSmartProcessing() above.
+      const processed = await runSmartProcessing(session, item);
+      if (!processed) { pumpUploadQueue(); return; }
 
       await generateEpisodeThumbnailForItem(session, item);
 
@@ -874,10 +1036,16 @@ async function runForwardedTransferJob({ chatId, seq }) {
       item.tempIn = inPath;
       item.tempOut = inPath;
       item.downloadProgress = 100;
-      log.success('runForwardedTransferJob', 'Download completed — verifying before upload as a new file (no re-encoding, no copy/forward)', { chatId, seq, path: inPath, method: 'mtproto' });
+      log.success('runForwardedTransferJob', 'Download completed — verifying before Smart Video Processing (still no copy/forward, a genuine new upload)', { chatId, seq, path: inPath, method: 'mtproto' });
 
       const verified = await verifyDownloadedFile(session, item);
       if (!verified) { pumpUploadQueue(); return; }
+
+      // Smart Video Processing: analyze the verified download and either
+      // fast-remux it (already streaming-compatible) or re-encode it (only
+      // if genuinely necessary) — see runSmartProcessing() above.
+      const processed = await runSmartProcessing(session, item);
+      if (!processed) { pumpUploadQueue(); return; }
 
       await generateEpisodeThumbnailForItem(session, item);
 
@@ -1188,6 +1356,7 @@ const STATUS_ICON = {
   waiting: '⏳',
   copying: '🔗',
   downloading: '⬇️',
+  processing: '🧠',
   ready: '📦',
   uploading: '⬆️',
   done: '✅',
@@ -1200,6 +1369,7 @@ const STATUS_LABEL = {
   waiting: 'Waiting...',
   copying: 'Copying from channel...',
   downloading: 'Downloading...',
+  processing: 'Analyzing...',
   ready: 'Queued...',
   uploading: 'Uploading...',
   done: 'Completed',
@@ -1251,6 +1421,32 @@ function renderItemBlock(session, item) {
     lines.push(`${renderProgressBar(item.downloadProgress)} ${item.downloadProgress}%`);
     const speed = formatSpeed(item.downloadSpeedState);
     if (speed) lines.push(`Speed: ${speed}`);
+    return lines.join('\n');
+  }
+
+  if (item.status === 'processing') {
+    // Smart Video Processing live status, matching the requested format:
+    //   Analyzing...
+    //   Compatible: YES / NO
+    //   Method: Fast Remux | Re-encode
+    //   ██████░░░░ 63%
+    //   Speed: 2.4x   FPS: 118   ETA: 12s
+    if (item.processPhase === 'analyzing' || !item.processPhase) {
+      lines.push('🔎 Analyzing...');
+    } else {
+      lines.push(`Compatible: ${item.processCompatible ? 'YES' : 'NO'}`);
+      lines.push(`Method: ${item.processMethod || (item.processPhase === 'remuxing' ? 'Fast Remux' : 'Re-encode')}`);
+      if (typeof item.processProgress === 'number') {
+        lines.push(`${renderProgressBar(item.processProgress)} ${item.processProgress}%`);
+      }
+      const speedText = formatFfmpegSpeedX(item.processSpeedX);
+      const etaText = formatEta(item.processEtaSeconds);
+      const statsParts = [];
+      if (speedText) statsParts.push(`Speed: ${speedText}`);
+      if (Number.isFinite(item.processFps) && item.processFps > 0) statsParts.push(`FPS: ${Math.round(item.processFps)}`);
+      if (etaText) statsParts.push(`ETA: ${etaText}`);
+      if (statsParts.length) lines.push(statsParts.join('   '));
+    }
     return lines.join('\n');
   }
 
