@@ -510,26 +510,154 @@ async function analyze(filePath) {
   };
 }
 
-function parseTimemark(stderrChunk) {
-  // ffmpeg prints progress lines like:
-  // "frame=  245 fps= 24 q=23.0 size=    2048kB time=00:01:23.45 bitrate= 198.3kbits/s speed=0.98x"
-  const timeMatch = stderrChunk.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
-  if (!timeMatch) return null;
-  const [, hh, mm, ss] = timeMatch;
-  const seconds = Number(hh) * 3600 + Number(mm) * 60 + parseFloat(ss);
-  const frameMatch = stderrChunk.match(/frame=\s*(\d+)/);
-  const fpsMatch = stderrChunk.match(/fps=\s*([\d.]+)/);
-  const speedMatch = stderrChunk.match(/speed=\s*([\d.]+)x/);
-  const sizeMatch = stderrChunk.match(/size=\s*(\d+)kB/);
-  return {
-    timemark: `${hh}:${mm}:${ss}`,
-    seconds,
-    frame: frameMatch ? Number(frameMatch[1]) : null,
-    fps: fpsMatch ? Number(fpsMatch[1]) : null,
-    speed: speedMatch ? Number(speedMatch[1]) : null,
-    outputSizeKB: sizeMatch ? Number(sizeMatch[1]) : null,
-  };
+/**
+ * ----------------------------------------------------------------------
+ * WHY PROGRESS USED TO FREEZE PARTWAY THROUGH A LONG ENCODE
+ * ----------------------------------------------------------------------
+ * The previous implementation parsed FFmpeg's *default, TTY-oriented*
+ * human stats line ("frame=... fps=... time=... speed=...", each update
+ * overwriting the last via "\r") straight out of raw stderr `data`
+ * events, with a regex applied independently to EACH chunk in isolation
+ * — no buffering or carry-over between chunks.
+ *
+ * That is unsafe because Node.js delivers a child process's stdio in
+ * arbitrary OS-pipe-buffer-sized chunks that have NO relationship to
+ * FFmpeg's own line boundaries. This is directly verifiable: logging raw
+ * chunk boundaries from a real ffmpeg run shows chunks routinely ending
+ * mid-word (e.g. one chunk ending in "...encoder         : ", the next
+ * starting with "Lavc60.31.102 aac") — plain text is split arbitrarily,
+ * and a numeric field like "time=00:14:32.87" is exactly as likely to be
+ * split as any other byte range. Over a 20–30 minute encode, FFmpeg
+ * prints a new stats update roughly every 0.5s — many hundreds of
+ * updates — so a chunk boundary landing inside a `time=` token isn't a
+ * remote edge case, it is close to statistically guaranteed to happen at
+ * least once. When it does, the old code's stateless per-chunk regex
+ * simply fails to match on both halves and silently drops that update —
+ * and because FFmpeg is still running normally in the background, it
+ * keeps encoding correctly the whole time, so nothing ever errors or
+ * exits; only OUR VISIBILITY into its progress got stuck, frozen forever
+ * at whatever percentage happened to be parsed last (this matches the
+ * reported symptom precisely: progress reaches some percentage — ~10%
+ * here, wherever the unlucky split first occurred — and then never
+ * advances again for the rest of the job).
+ *
+ * THE FIX: stop scraping the interactive stats line entirely. FFmpeg has
+ * a purpose-built machine-readable progress protocol for exactly this —
+ * `-progress pipe:1 -nostats`. `-nostats` suppresses the old "\r"
+ * overwritten stats line on stderr; `-progress pipe:1` makes FFmpeg write
+ * a clean, newline-terminated `key=value` block to stdout after every
+ * stats update, always ending the block with a `progress=continue` (or
+ * `progress=end` on the final block) marker line. Below, `feedProgressLines()`
+ * ALSO adds real line-buffering: any chunk that ends mid-line has its
+ * trailing partial line held back and prefixed onto the next chunk,
+ * instead of being parsed (and potentially lost) in isolation — so a
+ * chunk boundary landing inside a token can no longer silently destroy
+ * that update, and worst case only delays it by one chunk.
+ * ----------------------------------------------------------------------
+ */
+
+/**
+ * Stateful line-buffering parser for FFmpeg's `-progress pipe:1` output.
+ * Call `.feed(chunkString)` for every stdout `data` event; it returns an
+ * array of zero or more completed progress blocks (one per
+ * `progress=continue`/`progress=end` marker actually seen), each shaped
+ * like `{ frame, fps, speed, outTimeSeconds, totalSizeBytes, timemark,
+ * progressState }`. Never loses a partial line across chunk boundaries.
+ */
+function createProgressLineParser() {
+  let carry = '';       // an incomplete trailing line held over from the previous chunk
+  let block = {};        // key/value pairs accumulated for the block currently being read
+
+  function parseValue(key, rawValue) {
+    switch (key) {
+      case 'frame': { const n = parseInt(rawValue, 10); return Number.isFinite(n) ? n : null; }
+      case 'fps': { const n = parseFloat(rawValue); return Number.isFinite(n) ? n : null; }
+      case 'speed': { const n = parseFloat(String(rawValue).replace(/x\s*$/, '')); return Number.isFinite(n) ? n : null; }
+      case 'total_size': { const n = parseInt(rawValue, 10); return Number.isFinite(n) ? n : null; }
+      // Both out_time_ms and out_time_us are documented (if confusingly
+      // named — a long-standing, never-fixed FFmpeg naming quirk) to
+      // report MICROSECONDS, not milliseconds. out_time_us is preferred
+      // when present; out_time_ms is the fallback, treated identically.
+      case 'out_time_us':
+      case 'out_time_ms': { const n = parseInt(rawValue, 10); return Number.isFinite(n) ? n : null; }
+      case 'out_time': return rawValue; // "HH:MM:SS.microseconds" string, kept only for display
+      case 'progress': return rawValue; // 'continue' | 'end'
+      default: return rawValue;
+    }
+  }
+
+  function feed(chunkString) {
+    const completedBlocks = [];
+    const text = carry + chunkString;
+    const lines = text.split('\n');
+    // The last element is either '' (chunk ended exactly on a newline) or
+    // a genuinely incomplete trailing line — either way, hold it back for
+    // the next chunk instead of parsing a possibly-truncated line now.
+    carry = lines.pop() || '';
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      const eq = line.indexOf('=');
+      if (eq === -1) continue; // not a key=value line — ignore rather than crash
+      const key = line.slice(0, eq).trim();
+      const value = line.slice(eq + 1).trim();
+      block[key] = parseValue(key, value);
+
+      if (key === 'progress') {
+        // Block complete — normalize into the shape callers use.
+        const outTimeMicros = block.out_time_us ?? block.out_time_ms ?? null;
+        const seconds = outTimeMicros !== null ? outTimeMicros / 1_000_000 : null;
+        completedBlocks.push({
+          frame: block.frame ?? null,
+          fps: block.fps ?? null,
+          speed: block.speed ?? null,
+          totalSizeBytes: block.total_size ?? null,
+          seconds,
+          timemark: block.out_time || null,
+          progressState: value, // 'continue' | 'end'
+        });
+        block = {}; // start accumulating the next block
+      }
+    }
+    return completedBlocks;
+  }
+
+  return { feed };
 }
+
+/**
+ * Best-effort (Linux-only) process diagnostics read from /proc/<pid>/stat
+ * — used only to answer requirement 5's "is CPU time still increasing"
+ * and to distinguish a genuinely blocked process (state 'D', typically
+ * uninterruptible disk I/O wait, or 'T' stopped) from one that's merely
+ * running slowly (state 'R'/'S' with CPU ticks still climbing). Returns
+ * null on any failure (non-Linux host, permission issue, pid already
+ * gone) — never throws, never affects the actual encode.
+ */
+function readProcStat(pid) {
+  try {
+    const raw = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    // Fields: pid (comm) state ... utime(14) stime(15) — the comm field is
+    // parenthesized and may itself contain spaces/parens, so locate the
+    // LAST ')' and split the remainder by spaces to stay correct regardless.
+    const lastParen = raw.lastIndexOf(')');
+    if (lastParen === -1) return null;
+    const rest = raw.slice(lastParen + 2).split(' ');
+    const state = rest[0] || null;
+    const utime = parseInt(rest[11], 10); // index 13 overall - 2 (pid, comm) = 11
+    const stime = parseInt(rest[12], 10); // index 14 overall - 2 = 12
+    if (!Number.isFinite(utime) || !Number.isFinite(stime)) return { state, cpuTicks: null };
+    return { state, cpuTicks: utime + stime };
+  } catch (_) {
+    return null; // not on Linux, pid gone, or /proc unavailable — fine, this is best-effort only
+  }
+}
+
+const PROC_STATE_LABELS = {
+  R: 'Running', S: 'Sleeping (idle/waiting on I/O readiness)', D: 'Uninterruptible sleep (blocked — usually disk/network I/O)',
+  T: 'Stopped', t: 'Tracing stop', Z: 'Zombie (exited, not yet reaped)', X: 'Dead',
+};
 
 /** Turns a raw FFmpeg failure into a message that names the likely cause instead of just dumping the stderr tail. */
 function describeFfmpegFailure(code, stderrTail, signal) {
@@ -556,99 +684,146 @@ function describeFfmpegFailure(code, stderrTail, signal) {
 
 /**
  * Runs FFmpeg with a fully pre-built argument list (see buildFfmpegArgs).
+ * Always adds `-progress pipe:1 -nostats` (see the block comment above
+ * this function) — progress is read from stdout via the machine-readable
+ * key=value protocol, never scraped from stderr.
  * @param {string[]} args
- * @param {(info:{timemark:string, seconds:number, percent:?number})=>void} [onProgress]
+ * @param {(info:{timemark:string, seconds:number, percent:?number, frame:?number, fps:?number, speed:?number, outputSizeKB:?number})=>void} [onProgress]
  * @param {number} [totalDurationSeconds]
  * @param {string} [outputPathForStats] used only for the periodic output-file-size log line
  */
 function runFfmpeg(args, onProgress, totalDurationSeconds, outputPathForStats = null) {
   return new Promise((resolve, reject) => {
+    const fullArgs = ['-progress', 'pipe:1', '-nostats', ...args];
     log.info('runFfmpeg', '[5/8] FFmpeg started', {});
-    log.info('runFfmpeg', 'Command', { command: `${FFMPEG_BIN} ${args.join(' ')}` });
+    log.info('runFfmpeg', 'Command', { command: `${FFMPEG_BIN} ${fullArgs.join(' ')}` });
 
     let child;
     try {
-      child = spawn(FFMPEG_BIN, args);
+      child = spawn(FFMPEG_BIN, fullArgs);
     } catch (err) {
       reject(err);
       return;
     }
 
     const startedAt = Date.now();
-    let lastProgress = null;       // most recent parsed stats line
-    let lastProgressAt = startedAt; // when we last actually heard from ffmpeg
+    let lastProgress = null;        // most recently completed -progress block
+    let lastProgressAt = startedAt; // when we last received a COMPLETE, parsed progress block
     let stalledLogged = false;
     let stderrTail = '';
-    let stdoutTail = '';
+    let stdoutBytesReceived = 0;
+    let parsedBlockCount = 0;
+    const progressParser = createProgressLineParser();
+    // Rolling CPU-tick samples (state + cpuTicks from /proc), one push per
+    // 5s tick, capped to the last ~24 samples (~2 minutes of history) —
+    // enough to answer "is CPU time still increasing" at a 60s stall.
+    const cpuSamples = [];
 
-    // Requirement: "every 5 seconds log elapsed time, current frame, fps,
-    // speed, output file size" — independent of whatever cadence ffmpeg
-    // itself happens to print stats at, and independent of whether
-    // parsing them succeeds, so this keeps producing signal even if a
-    // future ffmpeg build changes its stats line format.
+    const handleCompletedBlock = (parsed) => {
+      parsedBlockCount++;
+      lastProgress = parsed;
+      lastProgressAt = Date.now();
+      if (onProgress) {
+        // STEP 6 — percent is derived ONLY from the video's own encoded
+        // timeline (parsed.seconds, i.e. out_time_us/out_time_ms from
+        // FFmpeg) against the real FFprobe-measured source duration
+        // (totalDurationSeconds, passed in by the caller) — NEVER from
+        // total_size/output file size, which is a poor proxy for
+        // progress (CRF output size is not linear in time, and a
+        // stream-copy remux's size is basically random noise relative to
+        // elapsed time). When totalDurationSeconds is unknown (<=0), this
+        // deliberately stays `null` rather than being coerced to 0 — see
+        // the historical note in analyze() about sources with no reliable
+        // container-level duration.
+        const percent = totalDurationSeconds > 0 && parsed.seconds !== null
+          ? Math.max(0, Math.min(100, Math.round((parsed.seconds / totalDurationSeconds) * 100)))
+          : null;
+        onProgress({
+          timemark: parsed.timemark,
+          seconds: parsed.seconds,
+          frame: parsed.frame,
+          fps: parsed.fps,
+          speed: parsed.speed,
+          outputSizeKB: Number.isFinite(parsed.totalSizeBytes) ? Math.round(parsed.totalSizeBytes / 1024) : null,
+          percent,
+        });
+      }
+    };
+
+    // REQUIREMENT 3 — every 5 seconds, log frame / fps / speed / output
+    // file size / elapsed time, independent of whatever cadence FFmpeg
+    // itself updates at.
     const tickTimer = setInterval(() => {
       const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
       let outputSizeBytes = null;
       if (outputPathForStats) {
         try { outputSizeBytes = fs.statSync(outputPathForStats).size; } catch (_) { /* not created yet — fine */ }
       }
+
+      const procStat = child.pid ? readProcStat(child.pid) : null;
+      if (procStat) cpuSamples.push({ ts: Date.now(), ticks: procStat.cpuTicks, state: procStat.state });
+      while (cpuSamples.length > 24) cpuSamples.shift();
+
       log.info('runFfmpeg', 'Progress tick', {
         elapsedSec,
         frame: lastProgress?.frame ?? null,
         fps: lastProgress?.fps ?? null,
-        speed: lastProgress?.speed ?? null,
-        timemark: lastProgress?.timemark ?? null,
+        speed: lastProgress?.speed !== null && lastProgress?.speed !== undefined ? `${lastProgress.speed}x` : null,
         outputFileSizeBytes: outputSizeBytes,
+        processState: procStat ? (PROC_STATE_LABELS[procStat.state] || procStat.state) : 'unknown (non-Linux or /proc unavailable)',
       });
 
-      // Stall detection: no progress line parsed from stderr for 60s
-      // straight. This is the exact "compression appears stuck" signal
-      // requested — logged once when it first crosses the threshold
-      // (not spammed every 5s afterwards) alongside a full resource
-      // snapshot, since a stall on Render's free tier is very often a
-      // memory-pressure symptom rather than FFmpeg itself hanging.
+      // REQUIREMENT 4 — classify what FFmpeg is currently doing.
       const sinceProgressSec = Math.round((Date.now() - lastProgressAt) / 1000);
+      const stdoutHasBytesButNoParsedBlocks = stdoutBytesReceived > 0 && parsedBlockCount === 0 && elapsedSec >= 15;
+      if (stdoutHasBytesButNoParsedBlocks) {
+        log.warn('runFfmpeg', 'Progress parsing appears broken — receiving bytes on the -progress pipe but none have parsed into a complete key=value block yet', {
+          elapsedSec, stdoutBytesReceived,
+        });
+      }
+
+      // REQUIREMENT 5 — no progress change for 60s: log current state,
+      // latest stderr, and whether CPU time is still climbing.
       if (sinceProgressSec >= 60 && !stalledLogged) {
         stalledLogged = true;
+        const oldestSample = cpuSamples[0];
+        const newestSample = cpuSamples[cpuSamples.length - 1];
+        let cpuTrend = 'unknown (could not read /proc — non-Linux host or permission issue)';
+        if (oldestSample && newestSample && oldestSample !== newestSample
+          && Number.isFinite(oldestSample.ticks) && Number.isFinite(newestSample.ticks)) {
+          cpuTrend = newestSample.ticks > oldestSample.ticks
+            ? `INCREASING (+${newestSample.ticks - oldestSample.ticks} ticks over ${Math.round((newestSample.ts - oldestSample.ts) / 1000)}s) — FFmpeg is still actively using CPU, likely just slow (e.g. CPU-starved host), not hung`
+            : `FLAT (no change over ${Math.round((newestSample.ts - oldestSample.ts) / 1000)}s) — FFmpeg is NOT consuming CPU, consistent with a genuine hang (deadlock, blocked I/O, or a wedged filter/encoder)`;
+        }
+        const state = procStat ? (PROC_STATE_LABELS[procStat.state] || procStat.state) : 'unknown';
         log.warn('runFfmpeg', `Compression appears stalled — no progress for ${sinceProgressSec}s`, {
           elapsedSec, lastProgress, outputFileSizeBytes: outputSizeBytes,
+          processState: state,
+          cpuTimeTrend: cpuTrend,
+          parsedBlockCount, stdoutBytesReceived,
+          latestStderr: stderrTail.slice(-2000),
         });
         logResourceUsage('ffmpeg-stall');
       } else if (sinceProgressSec < 60 && stalledLogged) {
         stalledLogged = false; // progress resumed — allow re-detecting a later stall
+        log.info('runFfmpeg', 'Progress resumed after a stall', { elapsedSec, sinceProgressSec });
       }
     }, 5000);
 
     child.stdout?.on('data', (d) => {
-      // FFmpeg writes almost nothing to stdout for a normal file-output
-      // encode, but the pipe is drained regardless — an unconsumed
-      // stdout pipe can in principle fill its OS buffer and block the
-      // child process, which would look exactly like a random stall.
-      stdoutTail = (stdoutTail + d.toString()).slice(-2000);
+      const text = d.toString();
+      stdoutBytesReceived += d.length;
+      const completedBlocks = progressParser.feed(text);
+      for (const parsed of completedBlocks) handleCompletedBlock(parsed);
     });
 
     child.stderr?.on('data', (d) => {
-      const text = d.toString();
-      stderrTail = (stderrTail + text).slice(-4000);
-      const progress = parseTimemark(text);
-      if (progress) {
-        lastProgress = progress;
-        lastProgressAt = Date.now();
-        if (onProgress) {
-          // `percent` is only ever a real number when we actually know
-          // the source duration. When we don't (see the fallback chain
-          // added to analyze()'s duration calculation), this stays
-          // `null` rather than being silently treated as 0% — callers
-          // must not coerce a null percent to 0, or "hasn't started"
-          // and "duration unknown" become visually indistinguishable
-          // (this was the root cause of progress appearing stuck at 0%
-          // for sources with no reliable container-level duration).
-          const percent = totalDurationSeconds > 0
-            ? Math.max(0, Math.min(100, Math.round((progress.seconds / totalDurationSeconds) * 100)))
-            : null;
-          onProgress({ ...progress, percent });
-        }
-      }
+      // stderr is now diagnostics-only (encoder banners, warnings, the
+      // final per-stream summary) — progress no longer comes from here,
+      // see the block comment above. Still drained and tailed so a real
+      // failure's error text, and the "latest stderr" stall diagnostic in
+      // requirement 5, remain available.
+      stderrTail = (stderrTail + d.toString()).slice(-4000);
     });
 
     child.on('error', (err) => {
@@ -665,7 +840,7 @@ function runFfmpeg(args, onProgress, totalDurationSeconds, outputPathForStats = 
       const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
       log.info('runFfmpeg', 'FFmpeg process exited', {
         code, signal: signal || null, elapsedSec,
-        stdoutTail: stdoutTail || null, stderrTail,
+        parsedBlockCount, stdoutBytesReceived, stderrTail,
       });
 
       // A null exit code with a signal (SIGKILL almost always, sometimes
